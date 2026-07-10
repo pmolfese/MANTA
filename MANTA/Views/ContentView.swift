@@ -9,14 +9,27 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = ScanSessionViewModel()
+    @State private var showSidebar = false
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(viewModel: viewModel)
-                .navigationTitle("MANTA")
-        } detail: {
-            ScanReviewView(viewModel: viewModel)
+        ZStack(alignment: .leading) {
+            ScanReviewView(viewModel: viewModel, showSidebar: $showSidebar)
+
+            if showSidebar {
+                Color.black.opacity(0.3)
+                    .ignoresSafeArea()
+                    .onTapGesture { showSidebar = false }
+                    .transition(.opacity)
+
+                SidebarView(viewModel: viewModel)
+                    .frame(width: 320)
+                    .frame(maxHeight: .infinity)
+                    .background(.regularMaterial)
+                    .overlay(alignment: .trailing) { Divider() }
+                    .transition(.move(edge: .leading))
+            }
         }
+        .animation(.easeInOut(duration: 0.22), value: showSidebar)
     }
 }
 
@@ -25,6 +38,11 @@ private struct SidebarView: View {
 
     var body: some View {
         List {
+            Section {
+                Text("MANTA")
+                    .font(.title2.weight(.bold))
+            }
+
             Section("Capture") {
                 Picker("Mode", selection: $viewModel.session.captureMode) {
                     ForEach(CaptureMode.allCases) { mode in
@@ -78,45 +96,39 @@ private struct SidebarView: View {
 
 private struct ScanReviewView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
+    @Binding var showSidebar: Bool
+    @State private var showExportPreview = false
 
     var body: some View {
         VStack(spacing: 0) {
-            ScanHeaderView(viewModel: viewModel)
+            ScanHeaderView(
+                viewModel: viewModel,
+                showSidebar: $showSidebar,
+                showExportPreview: $showExportPreview
+            )
 
             Divider()
 
             GeometryReader { geometry in
-                if geometry.size.width > 760 {
-                    HStack(spacing: 0) {
-                        VStack(spacing: 0) {
-                            LiveScanPanel(viewModel: viewModel)
-                                .frame(height: min(360, geometry.size.height * 0.48))
-
-                            Divider()
-
-                            DetectionSummaryView(viewModel: viewModel)
-                        }
-                        .frame(width: min(460, geometry.size.width * 0.46))
-
-                        Divider()
-
-                        ExportPreviewView(viewModel: viewModel)
-                    }
-                } else {
+                HStack(spacing: 0) {
                     VStack(spacing: 0) {
                         LiveScanPanel(viewModel: viewModel)
-                            .frame(height: geometry.size.height * 0.46)
+                            .frame(height: min(480, geometry.size.height * 0.58))
 
                         Divider()
 
                         DetectionSummaryView(viewModel: viewModel)
-                            .frame(height: geometry.size.height * 0.28)
+                    }
 
+                    if showExportPreview {
                         Divider()
 
                         ExportPreviewView(viewModel: viewModel)
+                            .frame(width: min(420, geometry.size.width * 0.4))
+                            .transition(.move(edge: .trailing))
                     }
                 }
+                .animation(.easeInOut(duration: 0.22), value: showExportPreview)
             }
         }
         .navigationTitle(viewModel.session.name)
@@ -125,10 +137,20 @@ private struct ScanReviewView: View {
 
 private struct ScanHeaderView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
+    @Binding var showSidebar: Bool
+    @Binding var showExportPreview: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Button {
+                    showSidebar.toggle()
+                } label: {
+                    Image(systemName: "sidebar.left")
+                }
+                .buttonStyle(.bordered)
+                .help("Show settings")
+
                 VStack(alignment: .leading, spacing: 4) {
                     Text("EEG Electrode Triangulation")
                         .font(.title2.weight(.semibold))
@@ -137,6 +159,20 @@ private struct ScanHeaderView: View {
                 }
 
                 Spacer()
+
+                Button {
+                    showExportPreview.toggle()
+                } label: {
+                    Label("Preview", systemImage: "doc.text.magnifyingglass")
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    viewModel.exportDiagnostics()
+                } label: {
+                    Label("Save JSON", systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.bordered)
 
                 Button {
                     Task {
@@ -149,12 +185,14 @@ private struct ScanHeaderView: View {
                 .disabled(viewModel.isDetecting)
             }
 
-            HStack(spacing: 12) {
-                MetricTile(title: "Electrodes", value: "\(viewModel.session.detectedElectrodeCount)", systemImage: "smallcircle.filled.circle")
-                MetricTile(title: "Reviewed", value: "\(viewModel.session.reviewedElectrodeCount)", systemImage: "checkmark.circle")
-                MetricTile(title: "Fiducials", value: viewModel.session.fiducialsReady ? "3/3" : "0/3", systemImage: "scope")
-                MetricTile(title: "AR Samples", value: "\(viewModel.session.captureObservations.count)", systemImage: "camera.metering.matrix")
+            HStack(spacing: 20) {
+                Text("Electrodes: \(viewModel.session.detectedElectrodeCount)")
+                Text("Reviewed: \(viewModel.session.reviewedElectrodeCount)")
+                Text("Fiducials: \(viewModel.session.fiducialsReady ? "3/3" : "0/3")")
+                Text("AR Samples: \(viewModel.session.captureObservations.count)")
             }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
         }
         .padding()
     }
@@ -226,6 +264,7 @@ private struct StatusPill: View {
 private struct ScanControlsView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @ObservedObject var scanViewModel: ARScanViewModel
+    @State private var showRatePopover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -238,11 +277,12 @@ private struct ScanControlsView: View {
                 Spacer()
             }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 16) {
                 Button {
                     viewModel.startLiveScan()
                 } label: {
                     Label("Start", systemImage: "play.fill")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!scanViewModel.status.isSupported || scanViewModel.status.isRunning)
@@ -251,6 +291,7 @@ private struct ScanControlsView: View {
                     viewModel.pauseLiveScan()
                 } label: {
                     Label("Pause", systemImage: "pause.fill")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .disabled(!scanViewModel.status.isRunning)
@@ -260,66 +301,52 @@ private struct ScanControlsView: View {
                         viewModel.stopAutoSampling()
                     } label: {
                         Label("Stop Auto", systemImage: "stop.fill")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!scanViewModel.status.isSupported)
+                    .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
+                    .popover(isPresented: $showRatePopover) { ratePopover }
                 } else {
                     Button {
                         viewModel.startAutoSampling()
                     } label: {
-                        Label("Auto Sample", systemImage: "timer")
+                        Label("Auto Sample", systemImage: "camera.metering.matrix")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .disabled(!scanViewModel.status.isSupported)
+                    .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
+                    .popover(isPresented: $showRatePopover) { ratePopover }
                 }
 
                 Button {
                     viewModel.sampleCurrentARFrame()
                 } label: {
                     Label("Sample Frame", systemImage: "camera.badge.ellipsis")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .disabled(!scanViewModel.status.isRunning)
-
-                Button {
-                    viewModel.exportDiagnostics()
-                } label: {
-                    Label("Save JSON", systemImage: "doc.badge.gearshape")
-                }
-                .buttonStyle(.bordered)
-
-                Spacer()
-
-                Stepper(
-                    "\(viewModel.autoSamplingInterval, specifier: "%.2f")s",
-                    value: $viewModel.autoSamplingInterval,
-                    in: 0.25...3,
-                    step: 0.25
-                )
-                .font(.caption)
-                .frame(width: 132)
             }
         }
         .padding(12)
     }
-}
 
-private struct MetricTile: View {
-    var title: String
-    var value: String
-    var systemImage: String
-
-    var body: some View {
+    private var ratePopover: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(title, systemImage: systemImage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.title3.weight(.semibold))
+            Text("Auto Sample Rate")
+                .font(.headline)
+            Stepper(
+                "\(viewModel.autoSamplingInterval, specifier: "%.2f")s per sample",
+                value: $viewModel.autoSamplingInterval,
+                in: 0.25...3,
+                step: 0.25
+            )
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+        .padding()
+        .frame(minWidth: 240)
+        .presentationCompactAdaptation(.popover)
     }
 }
 
@@ -328,24 +355,23 @@ private struct DetectionSummaryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            NetPopulationView(session: viewModel.session)
-                .frame(height: 230)
-                .padding(12)
+            GeometryReader { geometry in
+                HStack(alignment: .top, spacing: 0) {
+                    NetPopulationView(session: viewModel.session)
+                        .padding(12)
+                        .frame(width: geometry.size.width * 0.75)
+
+                    Divider()
+
+                    FiducialsPanel(session: viewModel.session)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(height: 250)
 
             Divider()
 
             List {
-                Section("Fiducials") {
-                    ForEach(viewModel.session.fiducials) { fiducial in
-                        HStack {
-                            Text(fiducial.kind.rawValue)
-                            Spacer()
-                            Text(fiducial.coordinate == nil ? "Needed" : fiducial.state.rawValue)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
                 Section("Electrodes") {
                     if viewModel.session.electrodes.isEmpty {
                         ContentUnavailableView(
@@ -363,6 +389,32 @@ private struct DetectionSummaryView: View {
                 }
             }
         }
+    }
+}
+
+private struct FiducialsPanel: View {
+    var session: ScanSession
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Fiducials", systemImage: "scope")
+                .font(.headline)
+
+            ForEach(session.fiducials) { fiducial in
+                HStack {
+                    Text(fiducial.kind.rawValue)
+                        .font(.subheadline)
+                    Spacer()
+                    Text(fiducial.coordinate == nil ? "Needed" : fiducial.state.rawValue)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -469,7 +521,7 @@ private struct NetPopulationView: View {
             let normalizedY = (position.y - minY) / rangeY
             let point = CGPoint(
                 x: rect.minX + CGFloat(normalizedX) * rect.width,
-                y: rect.maxY - CGFloat(normalizedY) * rect.height
+                y: rect.minY + CGFloat(normalizedY) * rect.height
             )
             return (electrode.number, point)
         })
