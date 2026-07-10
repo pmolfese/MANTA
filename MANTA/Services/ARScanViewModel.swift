@@ -58,17 +58,41 @@ final class ARScanViewModel: NSObject, ObservableObject {
         status.message = "Scan paused."
     }
 
-    func sampleCurrentFrame() -> CaptureObservation? {
+    func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? {
         guard let frame = arView?.session.currentFrame else {
             status.message = "No AR frame is available yet."
             return nil
         }
 
-        let observation = makeObservation(from: frame)
+        var observation = makeObservation(from: frame)
+        observation.cameraSnapshotFilename = try artifactStore.writeCameraSnapshot(
+            pixelBuffer: frame.capturedImage,
+            observationID: observation.id,
+            for: session
+        )
+
+        if let depthMap = frame.sceneDepth?.depthMap {
+            let depthArtifact = try artifactStore.writeDepthSnapshot(
+                depthMap: depthMap,
+                confidenceMap: frame.sceneDepth?.confidenceMap,
+                observationID: observation.id,
+                for: session
+            )
+            observation.depthSnapshotFilename = depthArtifact.filename
+            observation.rawDepthFilename = depthArtifact.rawDepthFilename
+            observation.rawDepthFormat = depthArtifact.rawDepthFormat
+            observation.rawConfidenceFilename = depthArtifact.rawConfidenceFilename
+            observation.rawConfidenceFormat = depthArtifact.rawConfidenceFormat
+            observation.confidenceSummary = depthArtifact.confidenceSummary
+            observation.depthSummary = depthArtifact.summary
+        }
+
         observations.append(observation)
         status.sampledFrameCount = observations.count
         status.lastSampledAt = observation.capturedAt
-        status.message = "Sampled frame \(observations.count)."
+        status.message = observation.depthSnapshotFilename == nil
+            ? "Sampled frame \(observations.count) with camera snapshot."
+            : "Sampled frame \(observations.count) with camera and depth snapshots."
         return observation
     }
 
@@ -89,7 +113,15 @@ final class ARScanViewModel: NSObject, ObservableObject {
             imageResolution: ImageResolution(width: Int(resolution.width), height: Int(resolution.height)),
             hasSceneDepth: frame.sceneDepth != nil,
             meshAnchorCount: meshAnchorIDs.count,
-            trackingSummary: trackingSummary(frame.camera.trackingState)
+            trackingSummary: trackingSummary(frame.camera.trackingState),
+            cameraSnapshotFilename: nil,
+            depthSnapshotFilename: nil,
+            rawDepthFilename: nil,
+            rawDepthFormat: nil,
+            rawConfidenceFilename: nil,
+            rawConfidenceFormat: nil,
+            confidenceSummary: nil,
+            depthSummary: nil
         )
     }
 
@@ -170,6 +202,6 @@ final class ARScanViewModel: ObservableObject {
 
     func start() {}
     func pause() {}
-    func sampleCurrentFrame() -> CaptureObservation? { nil }
+    func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? { nil }
 }
 #endif

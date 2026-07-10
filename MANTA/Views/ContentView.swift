@@ -54,6 +54,9 @@ private struct SidebarView: View {
             Section("Session") {
                 LabeledContent("Layout", value: viewModel.session.layout.name)
                 LabeledContent("AR Samples", value: "\(viewModel.session.captureObservations.count)")
+                if !viewModel.diagnosticsPath.isEmpty {
+                    LabeledContent("Diagnostics", value: URL(fileURLWithPath: viewModel.diagnosticsPath).lastPathComponent)
+                }
                 LabeledContent("Detected", value: "\(viewModel.session.detectedElectrodeCount)")
                 LabeledContent("Reviewed", value: "\(viewModel.session.reviewedElectrodeCount)")
                 LabeledContent("Fiducials", value: viewModel.session.fiducialsReady ? "Placed" : "Needed")
@@ -252,6 +255,24 @@ private struct ScanControlsView: View {
                 .buttonStyle(.bordered)
                 .disabled(!scanViewModel.status.isRunning)
 
+                if viewModel.isAutoSampling {
+                    Button {
+                        viewModel.stopAutoSampling()
+                    } label: {
+                        Label("Stop Auto", systemImage: "stop.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!scanViewModel.status.isSupported)
+                } else {
+                    Button {
+                        viewModel.startAutoSampling()
+                    } label: {
+                        Label("Auto Sample", systemImage: "timer")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!scanViewModel.status.isSupported)
+                }
+
                 Button {
                     viewModel.sampleCurrentARFrame()
                 } label: {
@@ -260,10 +281,23 @@ private struct ScanControlsView: View {
                 .buttonStyle(.bordered)
                 .disabled(!scanViewModel.status.isRunning)
 
+                Button {
+                    viewModel.exportDiagnostics()
+                } label: {
+                    Label("Save JSON", systemImage: "doc.badge.gearshape")
+                }
+                .buttonStyle(.bordered)
+
                 Spacer()
 
-                LabeledContent("Samples", value: "\(viewModel.session.captureObservations.count)")
-                    .font(.caption)
+                Stepper(
+                    "\(viewModel.autoSamplingInterval, specifier: "%.2f")s",
+                    value: $viewModel.autoSamplingInterval,
+                    in: 0.25...3,
+                    step: 0.25
+                )
+                .font(.caption)
+                .frame(width: 132)
             }
         }
         .padding(12)
@@ -293,33 +327,199 @@ private struct DetectionSummaryView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
 
     var body: some View {
-        List {
-            Section("Fiducials") {
-                ForEach(viewModel.session.fiducials) { fiducial in
-                    HStack {
-                        Text(fiducial.kind.rawValue)
-                        Spacer()
-                        Text(fiducial.coordinate == nil ? "Needed" : fiducial.state.rawValue)
-                            .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            NetPopulationView(session: viewModel.session)
+                .frame(height: 230)
+                .padding(12)
+
+            Divider()
+
+            List {
+                Section("Fiducials") {
+                    ForEach(viewModel.session.fiducials) { fiducial in
+                        HStack {
+                            Text(fiducial.kind.rawValue)
+                            Spacer()
+                            Text(fiducial.coordinate == nil ? "Needed" : fiducial.state.rawValue)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
-            }
 
-            Section("Electrodes") {
-                if viewModel.session.electrodes.isEmpty {
-                    ContentUnavailableView(
-                        "No detections yet",
-                        systemImage: "viewfinder",
-                        description: Text("Run detection to create the first mock triangulation set.")
-                    )
-                } else {
-                    ForEach(viewModel.session.electrodes) { electrode in
-                        ElectrodeRow(electrode: electrode) {
-                            viewModel.markReviewed(electrode)
+                Section("Electrodes") {
+                    if viewModel.session.electrodes.isEmpty {
+                        ContentUnavailableView(
+                            "No detections yet",
+                            systemImage: "viewfinder",
+                            description: Text("Run detection to create the first mock triangulation set.")
+                        )
+                    } else {
+                        ForEach(viewModel.session.electrodes) { electrode in
+                            ElectrodeRow(electrode: electrode) {
+                                viewModel.markReviewed(electrode)
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+private struct NetPopulationView: View {
+    var session: ScanSession
+
+    private var detectedByLabel: [String: ElectrodeAnnotation] {
+        Dictionary(uniqueKeysWithValues: session.electrodes.map { ($0.label, $0) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Net Population", systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.headline)
+                Spacer()
+                Text("\(session.detectedElectrodeCount)/\(session.layout.channelCount)")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            GeometryReader { geometry in
+                Canvas { context, size in
+                    let drawable = CGRect(origin: .zero, size: size).insetBy(dx: 14, dy: 12)
+                    let points = projectedPoints(in: drawable)
+
+                    for electrode in session.layout.electrodes {
+                        guard let start = points[electrode.number] else { continue }
+
+                        for neighbor in electrode.neighbors where electrode.number < neighbor {
+                            guard let end = points[neighbor] else { continue }
+                            var path = Path()
+                            path.move(to: start)
+                            path.addLine(to: end)
+                            context.stroke(path, with: .color(.secondary.opacity(0.22)), lineWidth: 0.7)
+                        }
+                    }
+
+                    for electrode in session.layout.electrodes {
+                        guard let point = points[electrode.number] else { continue }
+                        let annotation = detectedByLabel[electrode.label]
+                        let isDetected = annotation != nil
+                        let isCardinal = electrode.role == .cardinal
+                        let radius: CGFloat = isCardinal ? 5.2 : 3.4
+                        let fillColor = nodeColor(for: annotation, isCardinal: isCardinal)
+                        let rect = CGRect(
+                            x: point.x - radius,
+                            y: point.y - radius,
+                            width: radius * 2,
+                            height: radius * 2
+                        )
+
+                        context.fill(Path(ellipseIn: rect), with: .color(fillColor))
+
+                        if isDetected || isCardinal {
+                            context.stroke(Path(ellipseIn: rect.insetBy(dx: -1.5, dy: -1.5)), with: .color(fillColor.opacity(0.55)), lineWidth: 1)
+                        }
+
+                        if isCardinal, isDetected {
+                            context.draw(
+                                Text(electrode.label)
+                                    .font(.system(size: 8, weight: .semibold))
+                                    .foregroundStyle(.primary),
+                                at: CGPoint(x: point.x, y: point.y - 11)
+                            )
+                        }
+                    }
+                }
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .bottomLeading) {
+                    HStack(spacing: 10) {
+                        LegendItem(title: "Expected", color: .secondary.opacity(0.45))
+                        LegendItem(title: "Detected", color: .teal)
+                        LegendItem(title: "Reviewed", color: .blue)
+                        LegendItem(title: "Cardinal", color: .orange)
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    private func projectedPoints(in rect: CGRect) -> [Int: CGPoint] {
+        let positioned = session.layout.electrodes.compactMap { electrode -> (ElectrodeDefinition, Coordinate2D)? in
+            guard let position = electrode.displayPosition else { return nil }
+            return (electrode, position)
+        }
+
+        guard !positioned.isEmpty else {
+            return fallbackRadialPoints(in: rect)
+        }
+
+        let xs = positioned.map { $0.1.x }
+        let ys = positioned.map { $0.1.y }
+        let minX = xs.min() ?? 0
+        let maxX = xs.max() ?? 1
+        let minY = ys.min() ?? 0
+        let maxY = ys.max() ?? 1
+        let rangeX = max(maxX - minX, 1)
+        let rangeY = max(maxY - minY, 1)
+
+        return Dictionary(uniqueKeysWithValues: positioned.map { electrode, position in
+            let normalizedX = (position.x - minX) / rangeX
+            let normalizedY = (position.y - minY) / rangeY
+            let point = CGPoint(
+                x: rect.minX + CGFloat(normalizedX) * rect.width,
+                y: rect.maxY - CGFloat(normalizedY) * rect.height
+            )
+            return (electrode.number, point)
+        })
+    }
+
+    private func fallbackRadialPoints(in rect: CGRect) -> [Int: CGPoint] {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) * 0.44
+        let count = max(session.layout.electrodes.count, 1)
+
+        return Dictionary(uniqueKeysWithValues: session.layout.electrodes.enumerated().map { index, electrode in
+            let angle = (Double(index) / Double(count)) * 2 * Double.pi - Double.pi / 2
+            return (
+                electrode.number,
+                CGPoint(
+                    x: center.x + CGFloat(cos(angle)) * radius,
+                    y: center.y + CGFloat(sin(angle)) * radius
+                )
+            )
+        })
+    }
+
+    private func nodeColor(for annotation: ElectrodeAnnotation?, isCardinal: Bool) -> Color {
+        guard let annotation else {
+            return isCardinal ? .orange.opacity(0.36) : .secondary.opacity(0.38)
+        }
+
+        switch annotation.state {
+        case .reviewed:
+            return .blue
+        case .detected, .needsReview:
+            return isCardinal ? .orange : .teal
+        case .missing:
+            return .red
+        }
+    }
+}
+
+private struct LegendItem: View {
+    var title: String
+    var color: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 }
