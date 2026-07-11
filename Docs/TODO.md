@@ -135,19 +135,45 @@ verify the back-projection against real depth and tune the OCR in one pass.
       front-only synthetic scan that fills back-of-head disks within ~1 cm.
 - [ ] Upgrade the fit to **affine** (fall back from similarity) if real-head
       residuals are too high — same entry point in `ElectrodeTemplateFitter`.
-- [ ] Estimate cap orientation from fiducials (nasion/LPA/RPA) + cardinal
-      electrode detections (seeds/robustifies the fit; also disambiguates
-      front/back and left/right on sparse scans).
+- [x] Cap orientation + fit-reliability gate: `ElectrodeCapOrientation` fits the
+      template to the confident detections (similarity), reports orientation +
+      scale + residual, checks anchor spread and cardinal consistency, and
+      exposes `isReliable`. `fillMissing` only fills when the fit is reliable, so
+      a sparse/clustered scan doesn't emit garbage predicted labels. Tested on
+      128 and 256 (well-spread → reliable & recovers transform; clustered →
+      unreliable → fill declined). NB: OCR-first means orientation is a
+      robustness/validation aid, not needed to assign labels.
+- [ ] Surface orientation/reliability in the UI (e.g. warn when the fit is
+      unreliable and fills were skipped) and use placed fiducials (nasion/LPA/
+      RPA) as additional anchors once §3 wires world-frame fiducial placement.
 - [ ] Flag ambiguous/missing electrodes (occluded by hair, low confidence)
       for the manual review flow; target ≥240/256 auto-labeled on a good scan.
       (Filled electrodes are already surfaced as needs-review.)
 
 ## 3. Fiducial workflow
 
-- [ ] In-app placement of nasion/LPA/RPA on the live scan (ray-cast tap on
-      the mesh) in addition to the existing model-space picker.
-- [ ] Convert exports into a fiducial-anchored head coordinate system (RAS or
-      ALS per format convention); decide mm vs m per format and document it.
+- [x] Head coordinate frame: `HeadCoordinateFrame` builds a right-handed RAS
+      frame from nasion/LPA/RPA (origin = LPA/RPA midpoint, +x→RPA, +y→nasion,
+      +z up) and converts a session's electrodes + fiducials into it, scaled to
+      **millimeters**. Unit-tested incl. the key invariance-to-world-pose
+      property and degenerate rejection.
+- [x] Exports use the head frame: `ScanSessionViewModel.exportSession` applies
+      the conversion when all three fiducials are placed (else falls back to raw
+      world coords). Low-level `ElectrodeExporters` stay frame-agnostic. UI shows
+      a "Head frame" badge when active.
+- [x] In-app live-scan placement: `ARScanViewModel.raycastToWorld` +
+      `LiveARScanView` tap gesture + `armFiducialPlacement`/`handleScanTap`;
+      `FiducialControlsView` arms Nasion/LPA/RPA and tapping the scan places the
+      world-frame landmark. Removed the old template-frame placeholder seeding
+      that would otherwise corrupt the head-frame conversion.
+- [ ] **Not yet exercised on device** — the raycast/tap placement and the
+      head-frame badge compile and are wired, but need a real LiDAR device to
+      verify (simulator has no AR raycast).
+- [ ] Per-format units/axes: currently mm + RAS for all formats. Confirm each
+      consumer (MNE `.sfp`, BESA `.elp`, BIDS) wants mm vs m and the axis order;
+      ship a BIDS `_coordsystem.json` declaring units + the fiducial RAS frame.
+- [ ] Keep the model-space fiducial picker (`ModelFiducialPickerView`, used for
+      photogrammetry alignment) consistent with live placement.
 
 ## 4. Validation (needed before lab use)
 
@@ -178,28 +204,44 @@ browser.
   decoupled and re-runnable on old data.
 
 **To build:**
-- [ ] Add subject identity to `ScanSession`: `subjectID` (+ optional notes /
-      session label). Needed to group "by subject".
-- [ ] Persist the full `ScanSession` (already `Codable`) as `session.json` next
-      to the assets; save on capture/edit. Currently only `diagnostics.json` +
-      raw assets are written, so labels/fiducials/alignment/review state are
-      lost between launches.
-- [ ] Load path: the view model boots `ScanSession.newSession()` every launch —
-      add "open existing session" that rehydrates from `session.json`.
-- [ ] Session library UI: browse subjects → sessions by date/time; open,
-      rename, delete. (Supersedes the "session management" bullet under §6.)
-- [ ] Re-run detection / reconstruction on a loaded session (pipeline already
-      supports it — just wire the action).
+- [x] Subject identity on `ScanSession`: editable `subjectLabel` (name/MRN)
+      paired with the immutable `createdAt`. Naming is structural — `timestampName`
+      (`yyyy-MM-dd_HHmmss`) is always derived from `createdAt`; `displayName`
+      pairs label + timestamp; `fileSafeName` keeps the timestamp at the end.
+      The timestamp can't be stripped by renaming. Unit-tested.
+- [x] Persist the full `ScanSession` (Codable) as `session.json` next to the
+      assets (`CaptureArtifactStore.writeSession/loadSession`, exact numeric-date
+      round trip). Saved after sampling, detection, review, alignment, rename.
+- [x] Load path: `ScanSessionViewModel.openSession(id:)` rehydrates a saved
+      session; `startNewSession(subjectLabel:)` begins a fresh (unsaved-until-
+      first-action) one.
+- [x] Session library UI (`SessionLibraryView`): browse subjects sorted by
+      date/time (newest first), each row leading with the capture date/time and
+      subject label; open, rename (timestamp preserved), delete; "Subjects"
+      button in the header. Backed by `listSessionSummaries()`. Supersedes the
+      old "session management" bullet.
+- [ ] Re-run detection / reconstruction on a loaded session — the pipeline reads
+      persisted artifacts, so wire explicit "Re-detect" / "Re-reconstruct"
+      actions (currently detection re-runs via the existing button on whatever
+      session is open).
 - [ ] Stamp each detection/reconstruction run with a pipeline **version** so
       reprocessing keeps history instead of silently overwriting; lets you
       compare an old scan under old vs improved models.
-- [ ] In-app **export session bundle** (zip the folder) for off-device archival
-      and hand-off, so it doesn't require the Xcode container route (§1). Pairs
-      with adding `UIFileSharingEnabled` (already noted in §1).
+- [x] In-app **export session bundle**: `CaptureArtifactStore.exportSessionBundle`
+      zips the whole session folder (via `NSFileCoordinator .forUploading`, no
+      dependency) to `<fileSafeName>.zip`; the library exposes Export (swipe +
+      context menu) and presents a share sheet (AirDrop/Files/Mail). Store logic
+      unit-tested. Still pair with `UIFileSharingEnabled` (§1) for Files-app
+      access without sharing.
 - [ ] Storage view + archival policy: raw depth + RGB run tens of MB per
       session; surface per-subject usage and allow offloading raw frames while
       keeping results. Keep raw frames whenever possible — they are what makes
       reprocessing under better models possible.
+- [ ] Decide whether to auto-present the library on launch (currently opened via
+      the header "Subjects" button; app still boots into a fresh session).
+
+**Note:** the model + persistence layer is unit-tested; the SwiftUI library flow
+compiles and is wired but has not been exercised on-device/simulator yet.
 
 ## 6. Capture UX hardening
 

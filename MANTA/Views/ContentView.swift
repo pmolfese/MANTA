@@ -10,10 +10,11 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel = ScanSessionViewModel()
     @State private var showSidebar = false
+    @State private var showLibrary = false
 
     var body: some View {
         ZStack(alignment: .leading) {
-            ScanReviewView(viewModel: viewModel, showSidebar: $showSidebar)
+            ScanReviewView(viewModel: viewModel, showSidebar: $showSidebar, showLibrary: $showLibrary)
 
             if showSidebar {
                 Color.black.opacity(0.3)
@@ -32,6 +33,9 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.22), value: showSidebar)
         .sheet(isPresented: $viewModel.promptForModelFiducials) {
             ModelFiducialPickerView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $showLibrary) {
+            SessionLibraryView(viewModel: viewModel)
         }
     }
 }
@@ -175,6 +179,7 @@ private struct SidebarView: View {
 private struct ScanReviewView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
+    @Binding var showLibrary: Bool
     @State private var showExportPreview = false
 
     var body: some View {
@@ -182,6 +187,7 @@ private struct ScanReviewView: View {
             ScanHeaderView(
                 viewModel: viewModel,
                 showSidebar: $showSidebar,
+                showLibrary: $showLibrary,
                 showExportPreview: $showExportPreview
             )
 
@@ -216,6 +222,7 @@ private struct ScanReviewView: View {
 private struct ScanHeaderView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
+    @Binding var showLibrary: Bool
     @Binding var showExportPreview: Bool
 
     var body: some View {
@@ -229,8 +236,16 @@ private struct ScanHeaderView: View {
                 .buttonStyle(.bordered)
                 .help("Show settings")
 
+                Button {
+                    showLibrary = true
+                } label: {
+                    Label("Subjects", systemImage: "person.crop.rectangle.stack")
+                }
+                .buttonStyle(.bordered)
+                .help("Subject library")
+
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("EEG Electrode Triangulation")
+                    Text(viewModel.session.displayName)
                         .font(.title2.weight(.semibold))
                     Text(viewModel.statusMessage)
                         .foregroundStyle(.secondary)
@@ -282,7 +297,9 @@ private struct LiveScanPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .bottom) {
-                LiveARScanView(scanViewModel: viewModel.scanViewModel)
+                LiveARScanView(scanViewModel: viewModel.scanViewModel) { point in
+                    viewModel.handleScanTap(viewPoint: point)
+                }
 
                 ScanStatusOverlay(scanViewModel: viewModel.scanViewModel)
                     .padding(12)
@@ -290,8 +307,51 @@ private struct LiveScanPanel: View {
 
             Divider()
 
+            FiducialControlsView(viewModel: viewModel)
+
+            Divider()
+
             ScanControlsView(viewModel: viewModel, scanViewModel: viewModel.scanViewModel)
         }
+    }
+}
+
+private struct FiducialControlsView: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Fiducials")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ForEach(FiducialKind.allCases) { kind in
+                let isPlaced = viewModel.session.fiducials.first { $0.kind == kind }?.coordinate != nil
+                let isArmed = viewModel.fiducialPlacementKind == kind
+
+                Button {
+                    viewModel.armFiducialPlacement(kind)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isPlaced ? "checkmark.circle.fill" : "circle")
+                        Text(kind.rawValue)
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .tint(isArmed ? .orange : (isPlaced ? .green : .secondary))
+            }
+
+            Spacer()
+
+            if viewModel.isExportHeadFramed {
+                Label("Head frame", systemImage: "scale.3d")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 }
 

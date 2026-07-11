@@ -57,6 +57,103 @@ struct CaptureArtifactStore {
             .appendingPathComponent("diagnostics.json")
     }
 
+    func sessionMetadataURL(for id: UUID) -> URL {
+        rootDirectory
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("session.json")
+    }
+
+    // MARK: - Session persistence
+
+    /// Persists the full session (labels, fiducials, alignment, review state) so
+    /// it can be reopened later and reprocessed. Numeric date encoding keeps the
+    /// round trip exact. Sessions live on disk keyed by UUID; the subject
+    /// label/timestamp are metadata inside the JSON.
+    @discardableResult
+    func writeSession(_ session: ScanSession) throws -> URL {
+        _ = try sessionDirectory(for: session)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(session)
+        let url = sessionMetadataURL(for: session.id)
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    func loadSession(id: UUID) throws -> ScanSession {
+        let data = try Data(contentsOf: sessionMetadataURL(for: id))
+        return try JSONDecoder().decode(ScanSession.self, from: data)
+    }
+
+    func deleteSession(id: UUID) throws {
+        let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        if fileManager.fileExists(atPath: directory.path) {
+            try fileManager.removeItem(at: directory)
+        }
+    }
+
+    /// Zips a session's whole folder (RGB, depth, confidence, diagnostics,
+    /// session.json, reconstruction) into a single archive for off-device
+    /// hand-off/archival. Named from the session's `fileSafeName` (subject +
+    /// timestamp). Returns a URL in the temporary directory.
+    func exportSessionBundle(id: UUID) throws -> URL {
+        let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        guard fileManager.fileExists(atPath: directory.path) else {
+            throw CaptureArtifactStoreError.sessionNotFound
+        }
+
+        let baseName = (try? loadSession(id: id))?.fileSafeName ?? id.uuidString
+        let destination = fileManager.temporaryDirectory.appendingPathComponent("\(baseName).zip")
+        try? fileManager.removeItem(at: destination)
+
+        // NSFileCoordinator's `.forUploading` produces a zip of the directory in
+        // a system temp location that is reclaimed once the accessor returns, so
+        // copy it out to a stable URL with the name we want.
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var copyError: Error?
+        coordinator.coordinate(readingItemAt: directory, options: [.forUploading], error: &coordinationError) { zipURL in
+            do {
+                try fileManager.copyItem(at: zipURL, to: destination)
+            } catch {
+                copyError = error
+            }
+        }
+
+        if let coordinationError { throw coordinationError }
+        if let copyError { throw copyError }
+        guard fileManager.fileExists(atPath: destination.path) else {
+            throw CaptureArtifactStoreError.exportFailed
+        }
+        return destination
+    }
+
+    /// Lightweight summaries of all persisted sessions, newest first. Sorting is
+    /// always by capture time so the library stays date-ordered regardless of
+    /// subject labels.
+    func listSessionSummaries() -> [SessionSummary] {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: rootDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let decoder = JSONDecoder()
+        let summaries: [SessionSummary] = entries.compactMap { directory in
+            guard let id = UUID(uuidString: directory.lastPathComponent) else { return nil }
+            let metadata = directory.appendingPathComponent("session.json")
+            guard let data = try? Data(contentsOf: metadata),
+                  let session = try? decoder.decode(ScanSession.self, from: data) else {
+                return nil
+            }
+            return SessionSummary(session: session)
+        }
+
+        return summaries.sorted { $0.createdAt > $1.createdAt }
+    }
+
     func reconstructionDirectory(for session: ScanSession) -> URL {
         rootDirectory
             .appendingPathComponent(session.id.uuidString, isDirectory: true)
@@ -419,6 +516,8 @@ enum CaptureArtifactStoreError: LocalizedError {
     case rawDepthEncodingFailed
     case rawConfidenceEncodingFailed
     case compressionFailed
+    case sessionNotFound
+    case exportFailed
 
     var errorDescription: String? {
         switch self {
@@ -432,7 +531,34 @@ enum CaptureArtifactStoreError: LocalizedError {
             return "Raw confidence data could not be encoded."
         case .compressionFailed:
             return "Capture data could not be compressed."
+        case .sessionNotFound:
+            return "That session could not be found on disk."
+        case .exportFailed:
+            return "The session bundle could not be created."
         }
+    }
+}
+
+/// Lightweight, list-friendly view of a persisted session (no observation array).
+struct SessionSummary: Identifiable, Equatable {
+    var id: UUID
+    var subjectLabel: String?
+    var createdAt: Date
+    var displayName: String
+    var timestampName: String
+    var observationCount: Int
+    var detectedElectrodeCount: Int
+    var hasReconstructedModel: Bool
+
+    init(session: ScanSession) {
+        id = session.id
+        subjectLabel = session.subjectLabel
+        createdAt = session.createdAt
+        displayName = session.displayName
+        timestampName = session.timestampName
+        observationCount = session.captureObservations.count
+        detectedElectrodeCount = session.detectedElectrodeCount
+        hasReconstructedModel = session.hasReconstructedModel
     }
 }
 

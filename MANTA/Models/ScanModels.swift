@@ -149,6 +149,10 @@ struct ScanSession: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
     var createdAt: Date
+    /// Editable subject identifier (name / MRN). The immutable `createdAt`
+    /// timestamp is always kept paired with it, so a session can never lose its
+    /// date/time no matter how it is renamed.
+    var subjectLabel: String? = nil
     var captureMode: CaptureMode
     var layout: ElectrodeLayout
     var fiducials: [FiducialAnnotation]
@@ -197,9 +201,45 @@ struct ScanSession: Identifiable, Codable, Equatable {
         fiducials.allSatisfy { $0.coordinate != nil }
     }
 
+    /// Sortable/default identifier derived from the capture time, e.g.
+    /// `2026-07-11_143022`. Always present; independent of any renaming.
+    var timestampName: String {
+        ScanSession.timestampFormatter.string(from: createdAt)
+    }
+
+    /// Human-facing title: the subject label paired with the timestamp, or just
+    /// the timestamp when unlabeled. The timestamp is always included.
+    var displayName: String {
+        if let label = trimmedSubjectLabel {
+            return "\(label) · \(timestampName)"
+        }
+        return timestampName
+    }
+
+    /// Filesystem-safe name with the timestamp kept at the end, for export
+    /// bundles: `MRN123_2026-07-11_143022`.
+    var fileSafeName: String {
+        guard let label = trimmedSubjectLabel else { return timestampName }
+        let sanitized = label.map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        return "\(String(sanitized))_\(timestampName)"
+    }
+
+    private var trimmedSubjectLabel: String? {
+        guard let label = subjectLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !label.isEmpty else { return nil }
+        return label
+    }
+
+    static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        return formatter
+    }()
+
     static func newSession(layout: ElectrodeLayout = .fallback128) -> ScanSession {
-        ScanSession(
-            name: "New EEG scan",
+        var session = ScanSession(
+            name: "",
             createdAt: Date(),
             captureMode: .both,
             layout: layout,
@@ -209,5 +249,7 @@ struct ScanSession: Identifiable, Codable, Equatable {
             electrodes: [],
             captureObservations: []
         )
+        session.name = session.displayName
+        return session
     }
 }

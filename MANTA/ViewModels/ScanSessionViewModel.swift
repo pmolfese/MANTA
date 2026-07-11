@@ -9,6 +9,13 @@ import Foundation
 import Combine
 import simd
 
+/// A prepared export archive, wrapped so SwiftUI can present a share sheet via
+/// `.sheet(item:)`.
+struct ExportedBundle: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 @MainActor
 final class ScanSessionViewModel: ObservableObject {
     @Published var session = ScanSession.newSession()
@@ -25,6 +32,10 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var isReconstructing = false
     @Published var reconstructionProgress: Double?
     @Published var promptForModelFiducials = false
+    @Published var sessionSummaries: [SessionSummary] = []
+    @Published var exportedBundle: ExportedBundle?
+    /// When set, the next tap on the live scan places this fiducial.
+    @Published var fiducialPlacementKind: FiducialKind?
 
     private var pendingSourceCloud: [SIMD3<Float>] = []
     private var pendingTargetCloud: [SIMD3<Float>] = []
@@ -104,6 +115,103 @@ final class ScanSessionViewModel: ObservableObject {
         }
 
         refreshExportPreview()
+        refreshSessions()
+    }
+
+    // MARK: - Subject library
+
+    /// Reloads the list of persisted sessions, newest first.
+    func refreshSessions() {
+        sessionSummaries = artifactStore?.listSessionSummaries() ?? []
+    }
+
+    /// Starts a fresh, unsaved session. It is written to disk on the first
+    /// meaningful action (sampling a frame, detecting, or renaming), so empty
+    /// sessions don't clutter the library.
+    func startNewSession(subjectLabel: String? = nil) {
+        stopAutoSampling()
+        let layout = availableLayouts.first(where: { $0.name == selectedLayoutName }) ?? session.layout
+        var newSession = ScanSession.newSession(layout: layout)
+        newSession.subjectLabel = subjectLabel
+        newSession.name = newSession.displayName
+        session = newSession
+        statusMessage = "New session \(session.displayName)."
+        refreshExportPreview()
+    }
+
+    /// Reopens a persisted session for review or reprocessing.
+    func openSession(id: UUID) {
+        guard let artifactStore else {
+            statusMessage = "Could not access the app Documents folder."
+            return
+        }
+        do {
+            stopAutoSampling()
+            let loaded = try artifactStore.loadSession(id: id)
+            session = loaded
+            if availableLayouts.contains(where: { $0.name == loaded.layout.name }) {
+                selectedLayoutName = loaded.layout.name
+            }
+            statusMessage = "Opened \(loaded.displayName)."
+            refreshExportPreview()
+        } catch {
+            statusMessage = "Could not open session: \(error.localizedDescription)"
+        }
+    }
+
+    /// Renames the current subject; the capture timestamp is untouched.
+    func renameSubject(_ label: String?) {
+        let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.subjectLabel = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        session.name = session.displayName
+        persistSession()
+        refreshSessions()
+        statusMessage = "Renamed to \(session.displayName)."
+    }
+
+    /// Renames any persisted session (or the current one) by id.
+    func renameSession(id: UUID, label: String?) {
+        if id == session.id {
+            renameSubject(label)
+            return
+        }
+        guard let artifactStore, var target = try? artifactStore.loadSession(id: id) else { return }
+        let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        target.subjectLabel = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        target.name = target.displayName
+        try? artifactStore.writeSession(target)
+        refreshSessions()
+    }
+
+    func deleteSession(id: UUID) {
+        try? artifactStore?.deleteSession(id: id)
+        if id == session.id {
+            startNewSession()
+        }
+        refreshSessions()
+    }
+
+    /// Builds a shareable zip of the session's folder and publishes it so the UI
+    /// can present a share sheet.
+    func exportSession(id: UUID) {
+        guard let artifactStore else {
+            statusMessage = "Could not access the app Documents folder."
+            return
+        }
+        if id == session.id { persistSession() }
+        statusMessage = "Preparing session bundle…"
+        do {
+            let url = try artifactStore.exportSessionBundle(id: id)
+            exportedBundle = ExportedBundle(url: url)
+            statusMessage = "Bundle ready: \(url.lastPathComponent)"
+        } catch {
+            statusMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Writes the current session to disk. Called after meaningful mutations.
+    private func persistSession() {
+        try? artifactStore?.writeSession(session)
     }
 
     func runInitialDetection() async {
@@ -118,7 +226,6 @@ final class ScanSessionViewModel: ObservableObject {
 
         do {
             session.electrodes = try await detectionPipeline.detectElectrodes(in: context)
-            seedFiducialsForPrototype()
             if session.electrodes.isEmpty {
                 statusMessage = session.captureObservations.isEmpty
                     ? "No captured frames yet. Start a scan and sample frames, then detect."
@@ -132,6 +239,8 @@ final class ScanSessionViewModel: ObservableObject {
 
         isDetecting = false
         refreshExportPreview()
+        persistSession()
+        refreshSessions()
     }
 
     /// Frame source for detection: artifact-backed on device, empty otherwise.
@@ -151,6 +260,7 @@ final class ScanSessionViewModel: ObservableObject {
 
         session.electrodes[index].state = session.electrodes[index].state == .reviewed ? .detected : .reviewed
         refreshExportPreview()
+        persistSession()
     }
 
     func updateFormat(_ format: ElectrodeExportFormat) {
@@ -274,12 +384,50 @@ final class ScanSessionViewModel: ObservableObject {
             statusMessage = "Alignment needs landmark/mesh geometry for \(session.alignmentStrategy.rawValue)."
         }
         refreshExportPreview()
+        persistSession()
+        refreshSessions()
     }
 
     /// Called when the user finishes (or skips) marking model fiducials.
     func finishModelFiducials(skipped: Bool) {
         promptForModelFiducials = false
         computeAlignment(allowPrompt: !skipped)
+    }
+
+    // MARK: - Fiducial placement (live scan)
+
+    /// Arms placement of a fiducial; the next tap on the live scan sets it. Tap
+    /// the same control again to disarm.
+    func armFiducialPlacement(_ kind: FiducialKind) {
+        if fiducialPlacementKind == kind {
+            fiducialPlacementKind = nil
+            statusMessage = "Fiducial placement cancelled."
+        } else {
+            fiducialPlacementKind = kind
+            statusMessage = "Tap \(kind.rawValue) on the scan to place it."
+        }
+    }
+
+    /// Handles a tap on the live AR view while a fiducial is armed: ray-casts to
+    /// the scanned surface and stores the world-frame landmark.
+    func handleScanTap(viewPoint: CGPoint) {
+        guard let kind = fiducialPlacementKind else { return }
+        guard let world = scanViewModel.raycastToWorld(viewPoint: viewPoint) else {
+            statusMessage = "Couldn't hit the surface there — aim at the head and retry."
+            return
+        }
+
+        if let index = session.fiducials.firstIndex(where: { $0.kind == kind }) {
+            session.fiducials[index].coordinate = Coordinate3D(x: Double(world.x), y: Double(world.y), z: Double(world.z))
+            session.fiducials[index].state = .reviewed
+        }
+        fiducialPlacementKind = nil
+        persistSession()
+        let placed = session.fiducials.filter { $0.coordinate != nil }.count
+        statusMessage = session.fiducialsReady
+            ? "All fiducials placed — exports now use the head coordinate frame."
+            : "Placed \(kind.rawValue) (\(placed)/3)."
+        refreshExportPreview()
     }
 
     func pauseLiveScan() {
@@ -344,6 +492,8 @@ final class ScanSessionViewModel: ObservableObject {
             session.captureObservations.append(observation)
             let diagnosticsURL = try artifactStore.writeDiagnostics(for: session, scanStatus: scanViewModel.status)
             diagnosticsPath = diagnosticsURL.path
+            persistSession()
+            if !isAutoSampling { refreshSessions() }
             statusMessage = isAutoSampling
                 ? "Auto-saved sample \(session.captureObservations.count)."
                 : "Saved sample \(session.captureObservations.count) and diagnostics JSON."
@@ -402,8 +552,20 @@ final class ScanSessionViewModel: ObservableObject {
         return result
     }
 
+    /// Session as exported: electrodes/fiducials converted into the fiducial-
+    /// anchored head frame (mm) when all three fiducials are placed, otherwise the
+    /// raw world-frame session.
+    var exportSession: ScanSession {
+        HeadCoordinateFrame.apply(to: session) ?? session
+    }
+
+    /// Whether the export coordinates are in the head frame (vs raw world).
+    var isExportHeadFramed: Bool {
+        session.fiducialsReady && HeadCoordinateFrame.apply(to: session) != nil
+    }
+
     private func refreshExportPreview() {
-        exportPreview = ElectrodeExporters.export(session, as: selectedFormat)
+        exportPreview = ElectrodeExporters.export(exportSession, as: selectedFormat)
     }
 
     private var canAutoSample: Bool {
@@ -415,20 +577,6 @@ final class ScanSessionViewModel: ObservableObject {
         return session.captureMode.usesLiDAR ? scanViewModel.status.hasSceneDepth : true
     }
 
-    private func seedFiducialsForPrototype() {
-        for index in session.fiducials.indices {
-            switch session.fiducials[index].kind {
-            case .nasion:
-                session.fiducials[index].coordinate = session.layout.fiducialCoordinatePriors[.nasion] ?? Coordinate3D(x: 0, y: 95, z: 20)
-            case .leftPreauricular:
-                session.fiducials[index].coordinate = session.layout.fiducialCoordinatePriors[.leftPreauricular] ?? Coordinate3D(x: -78, y: 0, z: 0)
-            case .rightPreauricular:
-                session.fiducials[index].coordinate = session.layout.fiducialCoordinatePriors[.rightPreauricular] ?? Coordinate3D(x: 78, y: 0, z: 0)
-            }
-
-            session.fiducials[index].state = .needsReview
-        }
-    }
 }
 
 private extension simd_float4x4 {

@@ -84,6 +84,11 @@ enum ElectrodeTemplateFitter {
     /// `annotations`. Anchors are the confidently-`.detected` annotations; filled
     /// electrodes are added as low-confidence `.needsReview` so the reviewer
     /// confirms or nudges them. Detected annotations are returned unchanged.
+    ///
+    /// Uses `ElectrodeCapOrientation` so the fit is only applied when it is
+    /// well-conditioned (enough well-spread anchors, low residual, cardinals
+    /// consistent). If the fit is unreliable, nothing is filled — better to leave
+    /// gaps for review than emit predicted labels from a bad extrapolation.
     static func fillMissing(
         annotations: [ElectrodeAnnotation],
         layout: ElectrodeLayout,
@@ -99,20 +104,25 @@ enum ElectrodeTemplateFitter {
                 )
             }
 
-        guard let result = fit(detected: anchors, layout: layout, minAnchors: minAnchors) else {
+        guard let orientation = ElectrodeCapOrientation.estimate(detected: anchors, layout: layout, minAnchors: minAnchors),
+              orientation.isReliable else {
             return annotations
         }
 
+        let templateByLabel = layout.electrodes.reduce(into: [String: (position: SIMD3<Float>, role: ElectrodeRole)]()) { result, electrode in
+            let c = electrode.coordinatePrior
+            result[electrode.label] = (SIMD3<Float>(Float(c.x), Float(c.y), Float(c.z)), electrode.role)
+        }
         let existingLabels = Set(annotations.map(\.label))
-        let rolesByLabel = Dictionary(uniqueKeysWithValues: layout.electrodes.map { ($0.label, $0.role) })
 
         var output = annotations
-        for (label, position) in result.filled where !existingLabels.contains(label) {
+        for (label, template) in templateByLabel where !existingLabels.contains(label) {
+            let predicted = orientation.transform * SIMD4<Float>(template.position, 1)
             output.append(
                 ElectrodeAnnotation(
                     label: label,
-                    role: rolesByLabel[label] ?? .regular,
-                    coordinate: Coordinate3D(x: Double(position.x), y: Double(position.y), z: Double(position.z)),
+                    role: template.role,
+                    coordinate: Coordinate3D(x: Double(predicted.x), y: Double(predicted.y), z: Double(predicted.z)),
                     confidence: 0,
                     state: .needsReview
                 )

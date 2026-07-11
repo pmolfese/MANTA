@@ -13,18 +13,41 @@ import RealityKit
 
 struct LiveARScanView: UIViewRepresentable {
     @ObservedObject var scanViewModel: ARScanViewModel
+    var onTap: (CGPoint) -> Void = { _ in }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onTap: onTap)
+    }
 
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
         arView.automaticallyConfigureSession = false
         scanViewModel.attach(arView)
+
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        arView.addGestureRecognizer(tap)
         return arView
     }
 
-    func updateUIView(_ uiView: ARView, context: Context) {}
+    func updateUIView(_ uiView: ARView, context: Context) {
+        context.coordinator.onTap = onTap
+    }
 
-    static func dismantleUIView(_ uiView: ARView, coordinator: ()) {
+    static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
         uiView.session.pause()
+    }
+
+    final class Coordinator {
+        var onTap: (CGPoint) -> Void
+
+        init(onTap: @escaping (CGPoint) -> Void) {
+            self.onTap = onTap
+        }
+
+        @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            onTap(recognizer.location(in: view))
+        }
     }
 }
 #else

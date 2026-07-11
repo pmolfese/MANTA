@@ -7,6 +7,7 @@
 
 import Foundation
 import Combine
+import CoreGraphics
 import simd
 
 #if canImport(ARKit) && canImport(RealityKit)
@@ -100,6 +101,23 @@ final class ARScanViewModel: NSObject, ObservableObject {
             ? "Sampled frame \(observations.count) with camera snapshot."
             : "Sampled frame \(observations.count) with camera and depth snapshots."
         return observation
+    }
+
+    /// Ray-casts a point in the AR view (view coordinates) against the scanned
+    /// mesh/estimated surface and returns the hit in world coordinates. Used to
+    /// place nasion/LPA/RPA fiducials by tapping the live scan.
+    func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? {
+        guard let arView else { return nil }
+
+        let alignments: [ARRaycastQuery.TargetAlignment] = [.any]
+        for alignment in alignments {
+            if let query = arView.makeRaycastQuery(from: viewPoint, allowing: .estimatedPlane, alignment: alignment),
+               let result = arView.session.raycast(query).first {
+                let t = result.worldTransform.columns.3
+                return SIMD3<Float>(t.x, t.y, t.z)
+            }
+        }
+        return nil
     }
 
     /// World-space point cloud of the accumulated LiDAR reconstruction mesh.
@@ -254,5 +272,6 @@ final class ARScanViewModel: ObservableObject {
     func pause() {}
     func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? { nil }
     func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
+    func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? { nil }
 }
 #endif
