@@ -35,10 +35,18 @@ rather than solving anonymous point-cloud correspondence, and use the template
 - [x] Wire the real pipeline into `ScanSessionViewModel.runInitialDetection`
       (default is `ElectrodeDetectionFactory.makeDefaultPipeline()`); review/
       export UI unchanged.
+- [x] Synthetic scan harness: `SyntheticScanGenerator` projects the real
+      templates through orbiting cameras, emits noisy/dropout/misread reads, and
+      runs them through the real pipeline; `SyntheticScanHarnessTests` measures
+      recovered-vs-truth error. Runs for **both 128 and 256 nets**
+      (parametrized). Regression bed + threshold-tuning tool that needs no
+      device. (Zero-noise: <1 mm, all read labels recovered. Realistic noise:
+      mean <5 mm, >85% of channels recovered. Misreads rejected by fusion.)
 - [ ] **Tune on a real capture (device work).** Confirm ARKit sign
       conventions in `PinholeCamera` against a real scan; tune
       `minimumTextHeight`, recognition orientation, and depth confidence
-      threshold; measure how many of 256 disks read per scan.
+      threshold; measure how many of 256 disks read per scan. Use the
+      synthetic harness to set aggregator thresholds before then.
 - [ ] Associate each read with the disk *center* via contour/circle detection
       (currently uses the text bounding-box center as a proxy).
 - [ ] Validate/repair reads with the `sensorLayout_256.xml` neighbor graph
