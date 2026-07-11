@@ -1,5 +1,10 @@
 # MANTA Thin Vertical Slice
 
+> Historical design snapshot. This document describes the initial application
+> slice and is no longer the current implementation status. See the repository
+> [README](../README.md), [Architecture](ARCHITECTURE.md), and
+> [Roadmap](TODO.md) for current information.
+
 ## Goal
 
 Build an iPhone Pro and iPad Pro LiDAR workflow that detects dark or reflective EEG electrodes on a visible cap, anchors them to nasion/LPA/RPA fiducials, allows relabeling and review, and exports electrode labels plus 3D coordinates.
