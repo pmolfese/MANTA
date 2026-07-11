@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manta.local/schemas/bundle-manifest-1.0.0.json",
+  "title": "MANTA Capture Bundle Manifest 1.0.0",
+  "type": "object",
+  "required": ["$schema", "format", "schemaVersion", "bundleID", "sessionID", "createdAt", "finalizedAt", "producer", "content", "files"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "format": { "const": "org.nih.manta.capture-bundle" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "bundleID": { "type": "string", "format": "uuid" },
+    "parentBundleID": { "type": "string", "format": "uuid" },
+    "sessionID": { "type": "string", "format": "uuid" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "finalizedAt": { "type": "string", "format": "date-time" },
+    "producer": {
+      "type": "object",
+      "required": ["application", "version", "build", "platform", "operatingSystemVersion", "deviceModel"],
+      "properties": {
+        "application": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "build": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "operatingSystemVersion": { "type": "string", "minLength": 1 },
+        "deviceModel": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "content": {
+      "type": "object",
+      "required": ["capture"],
+      "properties": {
+        "capture": { "$ref": "#/$defs/path" },
+        "subject": { "$ref": "#/$defs/path" },
+        "layout": { "$ref": "#/$defs/path" },
+        "changeLog": { "$ref": "#/$defs/path" }
+      },
+      "additionalProperties": true
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "mediaType", "role", "size", "sha256"],
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "mediaType": { "type": "string", "minLength": 1 },
+          "role": { "type": "string", "minLength": 1 },
+          "size": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["parentBundleID"] },
+      "then": {
+        "properties": {
+          "content": { "required": ["changeLog"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "content": { "required": ["changeLog"] }, "parentBundleID": false },
+        "required": ["content"]
+      },
+      "then": { "required": ["parentBundleID"] }
+    }
+  ],
+  "additionalProperties": true
+}
+

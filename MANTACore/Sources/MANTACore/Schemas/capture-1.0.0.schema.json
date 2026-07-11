@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://manta.local/schemas/capture-1.0.0.json",
+  "title": "MANTA Capture Metadata 1.0.0",
+  "type": "object",
+  "required": ["$schema", "schemaVersion", "sessionID", "captureMode", "layoutID", "coordinateSystems", "observations"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "sessionID": { "type": "string", "format": "uuid" },
+    "captureMode": { "enum": ["lidar", "photogrammetry", "both"] },
+    "layoutID": { "type": "string", "minLength": 1 },
+    "coordinateSystems": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "handedness", "units", "description"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "handedness": { "enum": ["right", "left"] },
+          "units": { "enum": ["meters", "millimeters"] },
+          "description": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "capturedAt", "imageDimensions", "imageOrigin", "imageOrientation", "intrinsics", "cameraToWorld", "worldCoordinateSystem", "trackingState"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "capturedAt": { "type": "string", "format": "date-time" },
+          "imagePath": { "type": "string", "minLength": 1 },
+          "imageDimensions": { "$ref": "#/$defs/dimensions" },
+          "imageOrigin": { "const": "top-left" },
+          "imageOrientation": { "type": "string", "minLength": 1 },
+          "intrinsics": { "type": "array", "minItems": 9, "maxItems": 9, "items": { "type": "number" } },
+          "cameraToWorld": { "type": "array", "minItems": 16, "maxItems": 16, "items": { "type": "number" } },
+          "worldCoordinateSystem": { "type": "string", "minLength": 1 },
+          "trackingState": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "$defs": {
+    "dimensions": {
+      "type": "object",
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}
+

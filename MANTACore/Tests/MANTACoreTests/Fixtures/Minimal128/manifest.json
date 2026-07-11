@@ -1,0 +1,27 @@
+{
+  "$schema" : "https://manta.local/schemas/bundle-manifest-1.0.0.json",
+  "bundleID" : "86b20bb6-f31e-4b0b-b423-cf93ae2742bc",
+  "content" : { "capture" : "capture.json" },
+  "createdAt" : "2026-07-11T13:30:22Z",
+  "files" : [
+    {
+      "mediaType" : "application/json",
+      "path" : "capture.json",
+      "role" : "capture-metadata",
+      "sha256" : "dd3ca3a5b095675fce0521183696a7f9a3012285793dbd4ecca9e6cdf4cee606",
+      "size" : 1364
+    }
+  ],
+  "finalizedAt" : "2026-07-11T13:32:51Z",
+  "format" : "org.nih.manta.capture-bundle",
+  "producer" : {
+    "application" : "MANTA",
+    "build" : "1",
+    "deviceModel" : "fixture",
+    "operatingSystemVersion" : "26.0",
+    "platform" : "iPadOS",
+    "version" : "0.1.0"
+  },
+  "schemaVersion" : "1.0.0",
+  "sessionID" : "c75cf330-8751-46f3-bcd4-7bef70b28ee8"
+}

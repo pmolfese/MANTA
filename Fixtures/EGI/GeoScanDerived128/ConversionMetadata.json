@@ -1,0 +1,86 @@
+{
+  "id": "geoscan-derived-hydrocel-128-20240821",
+  "description": "Provenance and empirically reconstructed conversion from a GeoScan point export to EGI coordinates_mff XML and derived SFP. The source GeoScan text is intentionally not included as a fixture.",
+  "layout": {
+    "id": "hydrocel-128",
+    "name": "HydroCel GSN 128 1.0",
+    "electrodeCount": 128,
+    "referenceSensor": 129,
+    "referenceLabel": "VREF"
+  },
+  "artifacts": {
+    "egiCoordinatesXML": {
+      "path": "coordinates.xml",
+      "sha256": "1e0c76b0639254c7d5e45df8f9f04f014734bc821f01f168271b44243a36d081",
+      "namespace": "http://www.egi.com/coordinates_mff",
+      "acquisitionTime": "2024-08-21T19:06:31.000000-04:00",
+      "acquisitionMethod": "Photogrammetry"
+    },
+    "derivedSFP": {
+      "path": "coordinates.sfp",
+      "sha256": "76ddcee813c1ac7385b9d115eda0dd532d3bfa80c1039a102bb3d18595ebc614"
+    },
+    "sourceGeoScan": {
+      "includedAsFixture": false,
+      "sha256ForProvenanceOnly": "bfb08fa9731bbf7432824554775d8901292e8188baf3eb527886dec573db52b8",
+      "formatDescription": "ElectrodeName X Y Z Estimated",
+      "units": "centimeters",
+      "coordinateCount": 132,
+      "measuredElectrodes": 126,
+      "estimatedElectrodes": [83, 88],
+      "fiducials": ["FidNz", "FidT9", "FidT10"],
+      "referenceLabel": "Cz"
+    }
+  },
+  "coordinateConversion": {
+    "status": "empirically reconstructed from paired source/output coordinates",
+    "sourceUnits": "centimeters",
+    "targetUnits": "centimeters",
+    "fiducialLabelMapping": {
+      "FidNz": "Nasion",
+      "FidT9": "Left periauricular point",
+      "FidT10": "Right periauricular point",
+      "Cz": "Vertex Reference"
+    },
+    "fiducialNumberMapping": {
+      "Nasion": 2002,
+      "Left periauricular point": 2011,
+      "Right periauricular point": 2010,
+      "Vertex Reference": 1001
+    },
+    "rigidTransform": {
+      "formula": "target = rotation * source + translation",
+      "matrixStorage": "nested row-major",
+      "rotation": [
+        [0.16065299001138214, -0.9580385835261439, 0.23738721379978056],
+        [0.9652651656572554, 0.2027094776195385, 0.1648393995739009],
+        [-0.20604314297999157, 0.2026596658401315, 0.9573271557166302]
+      ],
+      "translation": [-2.207974061323038, -1.5934816376464247, -0.6175906323422504],
+      "fitAnchors": ["FidNz", "FidT9", "FidT10"],
+      "maximumAnchorResidualCentimeters": 0.000000164
+    },
+    "markerToSensorCorrection": {
+      "observation": "After the fiducial-derived rigid transform, every XML electrode/reference point is displaced inward from its GeoScan reflective-marker position by one of two effectively exact distances.",
+      "defaultDistanceCentimeters": 0.95,
+      "defaultElectrodeCount": 117,
+      "overrideDistanceCentimeters": 1.25,
+      "overrideElectrodes": [64, 68, 69, 73, 74, 81, 82, 88, 89, 94, 95],
+      "referenceDistanceCentimeters": 0.95,
+      "direction": "local inward surface normal",
+      "directionStatus": "inferred from paired coordinates; not recoverable from the point-only GeoScan text",
+      "reproducibilityLimit": "The exact corrected coordinates require the GeoScan surface mesh/normals, the paired XML target coordinates, or equivalent saved normal vectors. The omitted GeoScan point text and this metadata alone cannot reproduce the correction directions. coordinates.xml is the authoritative fixture."
+    }
+  },
+  "sfpDerivation": {
+    "operation": "Direct coordinate copy from EGI XML with label mapping and decimal rounding; no geometric transform.",
+    "maximumAbsoluteRoundingDifference": 0.000005,
+    "outputOrder": ["FidNz", "FidT9", "FidT10", "E1...E128", "Cz"],
+    "labelMapping": {
+      "Nasion": "FidNz",
+      "Left periauricular point": "FidT9",
+      "Right periauricular point": "FidT10",
+      "Vertex Reference": "Cz"
+    }
+  }
+}

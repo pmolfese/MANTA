@@ -85,10 +85,22 @@ unit or frame.
    observations, fuses positions, validates geometry, and optionally predicts
    unobserved electrodes.
 5. Results, parameters, metrics, and software versions are stored as an
-   immutable processing run.
+   immutable processing run in a working copy.
 6. Manual review is layered over a run so reprocessing never destroys prior
    results or corrections.
-7. Export converts reviewed data into the requested frame and format.
+7. Export converts reviewed data into the requested frame and format. On iOS,
+   **Export** creates an immutable `.manta` snapshot even when newly applied
+   models are included. On macOS, **Save As…** creates a derived immutable
+   `.manta` snapshot with a new bundle ID, the same session ID, its parent bundle
+   ID, and `log_manta.json`; neither operation modifies an earlier snapshot.
+
+The platform terminology is intentional:
+
+- iPhone/iPad captures and edits a live working session, then exports snapshots.
+- macOS imports a finalized snapshot read-only, performs work in a separate
+  working representation, and must use Save As… to persist another `.manta`.
+- CSV, BESA ELP, MNE SFP, BIDS, and EGI electrode-coordinate XML are terminal
+  scientific exports and do not modify or replace the source `.manta`.
 
 Measured and inferred electrode positions are distinct scientific data. A
 template-filled electrode must never be reported as directly observed or be
@@ -123,4 +135,3 @@ PHI and identifiable head imagery.
 
 The transport carries the bundle unchanged. It must not define a second session
 serialization.
-

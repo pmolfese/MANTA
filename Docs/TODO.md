@@ -13,12 +13,21 @@ in the root [README](../README.md).
 - [ ] Confirm real-device RGB orientation, camera transform, intrinsics, and
   depth registration conventions before freezing schema 1.0.0.
 - [ ] Resolve the open version-1 decisions listed in `CAPTURE_FORMAT.md`.
-- [ ] Define shared coordinate-frame, unit, identifier, and persisted capture
-  types in `MANTACore`; keep `LiveScanStatus` app-side.
-- [ ] Add JSON Schemas for manifest, capture, subject, layout, run, and review.
-- [ ] Add minimal 128/256 fixtures plus invalid/corrupt/malicious fixtures.
-- [ ] Implement read-only bundle loading and validation in `MANTACore`.
+- [~] Define shared coordinate-frame, unit, identifier, and persisted capture
+  types in `MANTACore`; initial manifest/capture types are in place and
+  `LiveScanStatus` remains app-side.
+- [~] Add JSON Schemas for manifest, capture, subject, layout, run, and review;
+  manifest, capture, and change-log schemas are in place.
+- [~] Add minimal 128/256 fixtures plus invalid/corrupt/malicious fixtures;
+  the minimal 128 fixture and programmatic corruption cases are in place.
+- [x] Implement read-only logical-directory bundle loading and validation in
+  `MANTACore` (archive extraction remains separate).
+- [x] Define immutable snapshot lineage, required `log_manta.json` validation,
+  and PHI-free UTC `yyyyMMdd_HHmmss.manta` filenames.
 - [ ] Implement deterministic encoding, hashing, and bundle finalization.
+- [ ] Make iOS **Export** finalize the current working session as `.manta`; keep
+  the most recently exported bundle ID so subsequent exports form a logged
+  lineage without exposing Save As in the iOS UI.
 - [ ] Add a legacy importer for the current `session.json` folder/ZIP format.
 - [ ] Switch iOS export to versioned `.manta` bundles.
 - [ ] Add immutable processing-run provenance and separate user reviews.
@@ -53,6 +62,8 @@ in the root [README](../README.md).
 
 - [ ] Add a separate empty SwiftUI macOS target to `MANTA.xcodeproj`.
 - [ ] Import, validate, and inspect local `.manta` files before adding networking.
+- [ ] Keep imported `.manta` snapshots read-only on macOS and expose **Save As…**
+  for derived MANTA snapshots.
 - [ ] Run offline detection, reconstruction, comparison, review, and export using
   `MANTACore`.
 - [ ] Add point-to-point USB-C Ethernet receipt using Network.framework.
@@ -81,6 +92,9 @@ in the root [README](../README.md).
 - [ ] Test lighting, hair, glare/gel, motion, operator, and device conditions.
 - [ ] Confirm units/axes for CSV, MNE SFP, BESA ELP, and BIDS; add BIDS
   `_coordsystem.json`.
+- [~] Add EGI electrode-coordinate XML export. A real `coordinates_mff` XML/SFP
+  pair, conversion metadata, label mappings, centimeter convention, and
+  regression tests are in place; exporter implementation remains.
 - [ ] Decide the MRI/scanner transform source before the first lab pilot.
 
 ## Deferred product decisions

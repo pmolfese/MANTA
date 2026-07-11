@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 // MANTACore: the pure, platform-agnostic detection/export core shared by the
@@ -8,14 +8,21 @@ import PackageDescription
 let package = Package(
     name: "MANTACore",
     platforms: [
-        .iOS(.v17),
+        .iOS(.v26),
         .macOS(.v13)
     ],
     products: [
         .library(name: "MANTACore", targets: ["MANTACore"])
     ],
     targets: [
-        .target(name: "MANTACore"),
-        .testTarget(name: "MANTACoreTests", dependencies: ["MANTACore"])
+        .target(
+            name: "MANTACore",
+            resources: [.copy("Schemas")]
+        ),
+        .testTarget(
+            name: "MANTACoreTests",
+            dependencies: ["MANTACore"],
+            resources: [.copy("Fixtures")]
+        )
     ]
 )

@@ -114,9 +114,15 @@ against each consumer:
 
 - MNE SFP
 - BESA ELP
+- EGI electrode-coordinate XML
 - BIDS `electrodes.tsv` plus `_coordsystem.json`
 - Generic CSV
 
 Round-trip representative exports through an independent parser where the
 format permits it.
 
+The EGI XML exporter must be checked against
+`Fixtures/EGI/GeoScanDerived128/coordinates.xml`. Its coordinates must be
+converted explicitly from MANTA head-frame millimeters to the fixture's
+centimeter convention, and its derived SFP coordinates must agree within the
+fixture's observed 0.000005 rounding tolerance.

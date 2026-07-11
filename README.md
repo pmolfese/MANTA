@@ -47,9 +47,8 @@ See [Architecture](Docs/ARCHITECTURE.md), [Capture format](Docs/CAPTURE_FORMAT.m
 - A LiDAR-equipped iPhone Pro or iPad Pro for real capture.
 - The simulator can exercise the library, review, persistence, detection, and
   export flows, but cannot validate LiDAR, camera, or AR raycasting.
-- `MANTACore` declares iOS 17+ and macOS 13+. The application project currently
-  has an iOS 26.5 deployment target and should be reconciled with the intended
-  deployment policy before distribution.
+- iOS/iPadOS 26+ and macOS 13+ for `MANTACore`. Real capture requires a
+  LiDAR-equipped device supported by the application.
 
 ## Build and test
 
@@ -74,4 +73,3 @@ xcodebuild test \
 
 For a real capture, build the `MANTA` scheme to a LiDAR device. Capture guidance
 and fixture hand-off instructions are in [Validation](Docs/VALIDATION.md).
-

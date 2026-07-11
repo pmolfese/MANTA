@@ -1,6 +1,9 @@
 # MANTA Capture Bundle Format
 
-Status: proposed version 1 design, not yet implemented.
+Status: version 1 implementation in progress. `MANTACore` includes initial
+manifest/capture types, JSON Schemas, a minimal fixture, and strict validation
+of an already-extracted logical bundle. Archive extraction and production
+encoding are not yet implemented.
 
 ## Goals
 
@@ -51,9 +54,10 @@ Archive readers must reject:
 ## Proposed version 1 layout
 
 ```text
-<session-uuid>.manta/
+<yyyyMMdd_HHmmss>.manta/
 ├─ manifest.json
 ├─ capture.json
+├─ log_manta.json                  required for a derived "Save As" bundle
 ├─ subject.json                    optional; PHI-bearing
 ├─ layouts/
 │  ├─ layout.json                  normalized layout snapshot
@@ -76,9 +80,21 @@ Archive readers must reject:
    └─ <review-uuid>.json
 ```
 
-Raw capture files and capture metadata are immutable after finalization.
-Processing runs and reviews may be appended, but a new finalized manifest and
-bundle identity must be produced whenever bundle contents change.
+Every finalized `.manta` archive is immutable. Editing, reprocessing, or review
+happens in a working representation. On macOS, persisting those changes requires
+**Save As…** to a new `.manta` snapshot with a new `bundleID`, the same
+`sessionID`, a `parentBundleID`, and a hashed `log_manta.json`. The parent archive
+is never modified.
+
+The iPhone/iPad UI uses **Export**, not Save As. Export finalizes the current
+working session as a new immutable `.manta`, including any newly applied model
+results. The first exported snapshot has no parent. After an export, the app
+records that bundle ID; a later export from the same evolving session is a
+derived snapshot referencing the most recently exported bundle and documenting
+changes in `log_manta.json`.
+
+Exporting CSV, BESA ELP, MNE SFP, BIDS, EGI electrode-coordinate XML, or another
+terminal format does not create a new MANTA bundle or alter lineage.
 
 ## Manifest
 
@@ -131,6 +147,33 @@ Rules:
 - JSON writers emit finite numbers only. NaN and infinity are invalid.
 - Readers ignore unknown object properties for minor-version compatibility but
   preserve them when performing a lossless rewrite where practical.
+
+An original capture omits both `parentBundleID` and `content.changeLog`. A
+derived bundle includes both; they must agree with the IDs inside
+`log_manta.json`.
+
+## Immutability and `log_manta.json`
+
+`log_manta.json` documents the direct transition from one immutable snapshot to
+the next. It contains:
+
+- Its own schema version.
+- The new bundle ID and direct parent bundle ID.
+- UTC creation time and producing application/build/device.
+- One or more uniquely identified change records.
+- For each change: UTC time, category, human-readable summary, and stable
+  targets such as `electrodes/E17`, a processing-run ID, or a review ID.
+
+The manifest lists and hashes the change log like every other content file. A
+derived bundle without a change log, a change log without a parent ID, an empty
+change list, or mismatched lineage IDs is invalid. Following `parentBundleID`
+values reconstructs provenance when earlier snapshots remain available.
+
+Bundle filenames are PHI-free UTC timestamps using `yyyyMMdd_HHmmss.manta`, for
+example `20260711_133022.manta`. If a file with the same timestamp already
+exists, the application must ask the user to choose another destination or
+replace explicitly; it must not silently mutate or overwrite an existing
+snapshot.
 
 ## Capture metadata
 
@@ -195,6 +238,37 @@ This makes old captures reproducible even if bundled application resources
 change. Original EGI XML may be retained under `layouts/source/` and hashed in
 the manifest.
 
+## EGI coordinate XML and SFP reference fixture
+
+`Fixtures/EGI/GeoScanDerived128/` contains a paired real-world EGI
+`coordinates_mff` XML file and its derived SFP file. The source GeoScan point
+export is deliberately excluded. `ConversionMetadata.json` records its SHA-256
+for provenance without storing the source capture.
+
+The paired artifacts establish:
+
+- EGI XML namespace: `http://www.egi.com/coordinates_mff`.
+- Sensor type `0`: numbered electrodes; type `1`: vertex reference; type `2`:
+  fiducials.
+- EGI names/numbers for nasion, left/right periauricular points, and VREF.
+- SFP mappings `Nasion -> FidNz`, `Left periauricular point -> FidT9`,
+  `Right periauricular point -> FidT10`, and `Vertex Reference -> Cz`.
+- XML-to-SFP is a direct coordinate copy plus decimal rounding; all 132 paired
+  coordinates differ by at most 0.000005.
+- The example coordinates are in centimeters according to the GeoScan source
+  provenance. The XML itself has no explicit units field, so the future exporter
+  must perform an explicit head-frame millimeter-to-centimeter conversion and
+  record units outside the XML where possible.
+
+The reconstructed GeoScan conversion is more than a rigid frame change. Three
+fiducials determine an effectively exact rigid transform. Electrode/reference
+marker positions are then moved inward along local surface normals by 0.95 cm,
+except E64, E68, E69, E73, E74, E81, E82, E88, E89, E94, and E95, which move
+1.25 cm. Those normal directions are not present in the point-only GeoScan text;
+the exact conversion therefore also required GeoScan's surface geometry or
+equivalent normals. The metadata states this reproducibility limit and treats
+the included XML as authoritative.
+
 ## Subject metadata and PHI
 
 `subject.json` is optional and contains the subject label/MRN or future study
@@ -202,9 +276,8 @@ identifiers. Keeping it separate allows de-identification without rewriting
 capture geometry. The manifest indicates whether subject metadata is present
 but must not duplicate PHI into filenames or general audit messages.
 
-The current subject-derived ZIP filename should be replaced by a configurable
-policy. The safe default for clinical transfer is the bundle/session UUID plus
-capture timestamp, with human-readable PHI shown only after authorized import.
+Bundle filenames use the UTC timestamp policy above. Human-readable PHI is
+shown only after authorized import and is never copied into the filename.
 
 ## Processing runs
 
@@ -244,8 +317,8 @@ A reader:
 - Must never guess units, frames, matrix direction, or binary encoding.
 
 Migrations are pure, separately tested transformations. Imported bundles remain
-unchanged; a migrated working representation or newly exported bundle records
-its source bundle ID and original schema version.
+unchanged; saving a migrated representation creates a new immutable bundle with
+lineage and a change-log entry describing the migration.
 
 ## Integrity versus authenticity
 
@@ -258,7 +331,8 @@ describe an unsigned hash list as tamper-proof.
 
 Before schema 1.0.0 is frozen, add:
 
-1. JSON Schemas for manifest, capture, layout, run, review, and subject files.
+1. JSON Schemas for manifest, capture, change log, layout, run, review, and
+   subject files.
 2. A minimal valid 128-channel fixture with two observations.
 3. A minimal valid 256-channel fixture.
 4. A sanitized real-device fixture with manually verified camera/depth
@@ -282,19 +356,19 @@ Before schema 1.0.0 is frozen, add:
 6. Add a legacy importer for the current `session.json` directory/ZIP format.
 7. Switch iOS export to the new bundle while retaining legacy import tests.
 8. Build macOS local-file import and inspection against the same validator.
-9. Add processing runs and reviews.
+9. Add processing runs, reviews, iOS Export/macOS Save As finalization, and
+   lineage UI.
 10. Add authenticated/resumable network transfer after file import is stable.
 
 ## Decisions still required before 1.0.0
 
 - Public schema identifier/namespace and where schemas will be published.
-- Whether bundle identity changes when derived runs/reviews are appended, or
-  whether capture and analysis are separate linked bundles.
-- PHI filename policy and encryption-at-rest requirements.
+- Encryption-at-rest requirements for PHI-bearing bundles.
 - Maximum asset sizes/counts and archive expansion limits.
 - Whether Float64 metadata is required throughout or Float32 values are retained
   exactly from ARKit with an explicit numeric type.
 - Whether XML output is required by a named downstream consumer.
 - Long-term representation of image/depth calibration beyond simple resolution
   scaling.
-
+- Whether downstream EGI tools impose additional requirements beyond the
+  captured `coordinates_mff` dialect and fixture.
