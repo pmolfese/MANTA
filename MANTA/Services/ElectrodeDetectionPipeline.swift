@@ -8,12 +8,14 @@
 import Foundation
 
 protocol ElectrodeDetectionPipeline {
-    func detectElectrodes(for layout: ElectrodeLayout) async throws -> [ElectrodeAnnotation]
+    func detectElectrodes(in context: DetectionContext) async throws -> [ElectrodeAnnotation]
 }
 
+/// Synthetic detections for previews and workflow development. Ignores the
+/// captured frames and lays electrodes out in rings from the layout definition.
 struct MockElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
-    func detectElectrodes(for layout: ElectrodeLayout) async throws -> [ElectrodeAnnotation] {
-        layout.electrodes.enumerated().map { index, electrodeDefinition in
+    func detectElectrodes(in context: DetectionContext) async throws -> [ElectrodeAnnotation] {
+        context.layout.electrodes.enumerated().map { index, electrodeDefinition in
             let label = electrodeDefinition.label
             let ring = Double(index / 8)
             let angle = Double(index % 8) / 8.0 * .pi * 2.0

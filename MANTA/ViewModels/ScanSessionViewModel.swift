@@ -85,7 +85,7 @@ final class ScanSessionViewModel: ObservableObject {
         detectionPipeline: ElectrodeDetectionPipeline? = nil,
         photogrammetryService: PhotogrammetryReconstructing? = nil
     ) {
-        self.detectionPipeline = detectionPipeline ?? MockElectrodeDetectionPipeline()
+        self.detectionPipeline = detectionPipeline ?? ElectrodeDetectionFactory.makeDefaultPipeline()
         self.photogrammetryService = photogrammetryService ?? PhotogrammetryReconstructionService()
         artifactStore = try? CaptureArtifactStore()
 
@@ -108,18 +108,40 @@ final class ScanSessionViewModel: ObservableObject {
 
     func runInitialDetection() async {
         isDetecting = true
-        statusMessage = "Detecting reflective electrodes..."
+        statusMessage = "Reading electrode labels from captured frames..."
+
+        let context = DetectionContext(
+            layout: session.layout,
+            observations: session.captureObservations,
+            frameProvider: makeFrameProvider()
+        )
 
         do {
-            session.electrodes = try await detectionPipeline.detectElectrodes(for: session.layout)
+            session.electrodes = try await detectionPipeline.detectElectrodes(in: context)
             seedFiducialsForPrototype()
-            statusMessage = "Detected \(session.detectedElectrodeCount) electrodes. Review labels and landmarks next."
+            if session.electrodes.isEmpty {
+                statusMessage = session.captureObservations.isEmpty
+                    ? "No captured frames yet. Start a scan and sample frames, then detect."
+                    : "No electrode labels were read. Capture more, closer, sharper frames and retry."
+            } else {
+                statusMessage = "Detected \(session.detectedElectrodeCount) electrodes. Review labels and landmarks next."
+            }
         } catch {
             statusMessage = "Detection failed: \(error.localizedDescription)"
         }
 
         isDetecting = false
         refreshExportPreview()
+    }
+
+    /// Frame source for detection: artifact-backed on device, empty otherwise.
+    private func makeFrameProvider() -> DetectionFrameProvider {
+        #if canImport(ImageIO) && canImport(Compression)
+        if let artifactStore {
+            return CaptureArtifactFrameProvider(store: artifactStore, session: session)
+        }
+        #endif
+        return EmptyDetectionFrameProvider()
     }
 
     func toggleReviewed(_ electrode: ElectrodeAnnotation) {
