@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import simd
 
 #if canImport(CoreImage) && canImport(UIKit)
 import Compression
@@ -54,6 +55,77 @@ struct CaptureArtifactStore {
         rootDirectory
             .appendingPathComponent(session.id.uuidString, isDirectory: true)
             .appendingPathComponent("diagnostics.json")
+    }
+
+    func reconstructionDirectory(for session: ScanSession) -> URL {
+        rootDirectory
+            .appendingPathComponent(session.id.uuidString, isDirectory: true)
+            .appendingPathComponent("reconstruction", isDirectory: true)
+    }
+
+    /// Relative path (from the session directory) of the reconstructed model.
+    var reconstructionModelRelativePath: String { "reconstruction/model.usdz" }
+
+    func reconstructionModelURL(for session: ScanSession) -> URL {
+        reconstructionDirectory(for: session).appendingPathComponent("model.usdz")
+    }
+
+    /// Persists a world-space LiDAR mesh point cloud as little-endian Float32 XYZ triples.
+    /// Returns the path relative to the session directory.
+    @discardableResult
+    func writeLiDARMesh(_ points: [SIMD3<Float>], for session: ScanSession) throws -> String {
+        _ = try sessionDirectory(for: session)
+        let reconstruction = reconstructionDirectory(for: session)
+        try fileManager.createDirectory(at: reconstruction, withIntermediateDirectories: true)
+
+        var floats = [Float]()
+        floats.reserveCapacity(points.count * 3)
+        for point in points {
+            floats.append(point.x)
+            floats.append(point.y)
+            floats.append(point.z)
+        }
+
+        let data = floats.withUnsafeBufferPointer { Data(buffer: $0) }
+        let filename = "lidar_mesh.f32"
+        try data.write(to: reconstruction.appendingPathComponent(filename), options: .atomic)
+        return "reconstruction/\(filename)"
+    }
+
+    /// Collects the captured RGB frames into a dedicated input folder and writes the pose manifest.
+    /// Returns the folder to feed to photogrammetry plus the manifest of ARKit camera poses.
+    func prepareReconstructionInput(for session: ScanSession) throws -> (imagesDirectory: URL, manifest: ReconstructionManifest) {
+        _ = try sessionDirectory(for: session)
+        let reconstruction = reconstructionDirectory(for: session)
+        let inputDirectory = reconstruction.appendingPathComponent("input", isDirectory: true)
+
+        // Start clean so stale frames don't leak into a new run.
+        if fileManager.fileExists(atPath: inputDirectory.path) {
+            try fileManager.removeItem(at: inputDirectory)
+        }
+        try fileManager.createDirectory(at: inputDirectory, withIntermediateDirectories: true)
+
+        let sessionDir = rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
+        var poses: [ReconstructionPose] = []
+
+        for observation in session.captureObservations {
+            guard let relativePath = observation.cameraSnapshotFilename else { continue }
+            let source = sessionDir.appendingPathComponent(relativePath)
+            guard fileManager.fileExists(atPath: source.path) else { continue }
+            let filename = source.lastPathComponent
+            let destination = inputDirectory.appendingPathComponent(filename)
+            try? fileManager.removeItem(at: destination)
+            try fileManager.copyItem(at: source, to: destination)
+            poses.append(ReconstructionPose(imageFilename: filename, cameraTransform: observation.cameraTransform))
+        }
+
+        let manifest = ReconstructionManifest(poses: poses)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let manifestData = try encoder.encode(manifest)
+        try manifestData.write(to: reconstruction.appendingPathComponent("poses.json"), options: .atomic)
+
+        return (inputDirectory, manifest)
     }
 
     @discardableResult

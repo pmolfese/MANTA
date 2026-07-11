@@ -47,8 +47,21 @@ struct ElectrodeExporters {
         return ([header] + rows).joined(separator: "\n")
     }
 
+    /// EGI-style .sfp, readable by `mne.channels.read_custom_montage`.
+    /// Fiducials are emitted first using the labels MNE recognizes (FidNz/FidT9/FidT10)
+    /// so it can construct the head coordinate frame; electrodes follow.
     static func sfp(_ session: ScanSession) -> String {
-        session.electrodes.map { electrode in
+        let fiducialRows = session.fiducials.compactMap { fiducial -> String? in
+            guard let coordinate = fiducial.coordinate else { return nil }
+            return [
+                sfpFiducialLabel(fiducial.kind),
+                coordinateString(coordinate.x),
+                coordinateString(coordinate.y),
+                coordinateString(coordinate.z)
+            ].joined(separator: "\t")
+        }
+
+        let electrodeRows = session.electrodes.map { electrode in
             [
                 electrode.label,
                 coordinateString(electrode.coordinate.x),
@@ -56,7 +69,20 @@ struct ElectrodeExporters {
                 coordinateString(electrode.coordinate.z)
             ].joined(separator: "\t")
         }
-        .joined(separator: "\n")
+
+        return (fiducialRows + electrodeRows).joined(separator: "\n")
+    }
+
+    /// Standard EGI/MNE fiducial labels.
+    private static func sfpFiducialLabel(_ kind: FiducialKind) -> String {
+        switch kind {
+        case .nasion:
+            return "FidNz"
+        case .leftPreauricular:
+            return "FidT9"
+        case .rightPreauricular:
+            return "FidT10"
+        }
     }
 
     static func elp(_ session: ScanSession) -> String {

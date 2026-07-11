@@ -74,10 +74,31 @@ struct ElectrodeDefinition: Identifiable, Codable, Equatable, Hashable {
 }
 
 enum CaptureMode: String, CaseIterable, Codable, Equatable, Identifiable {
-    case liveLiDAR = "Live LiDAR"
-    case importCapture = "Import"
+    case lidar = "LiDAR"
+    case photogrammetry = "Photogrammetry"
+    case both = "Both"
 
     var id: String { rawValue }
+
+    /// Whether this mode records LiDAR scene depth and reconstructs a mesh in real time.
+    var usesLiDAR: Bool {
+        switch self {
+        case .lidar, .both:
+            return true
+        case .photogrammetry:
+            return false
+        }
+    }
+
+    /// Whether this mode collects the RGB frame set needed for offline photogrammetry.
+    var usesPhotogrammetry: Bool {
+        switch self {
+        case .photogrammetry, .both:
+            return true
+        case .lidar:
+            return false
+        }
+    }
 }
 
 struct ElectrodeLayout: Identifiable, Codable, Equatable, Hashable {
@@ -134,6 +155,36 @@ struct ScanSession: Identifiable, Codable, Equatable {
     var electrodes: [ElectrodeAnnotation]
     var captureObservations: [CaptureObservation]
 
+    /// Relative path (inside the session directory) of the reconstructed photogrammetry model, once available.
+    var photogrammetryModelFilename: String? = nil
+
+    /// Rigid transform (column-major 4x4) mapping the photogrammetry model's frame into the ARKit world frame.
+    /// Identity means the model is already expressed in ARKit world coordinates.
+    var worldAlignmentTransform: [Float]? = nil
+
+    /// Strategy used to register the photogrammetry model into the ARKit world frame.
+    var alignmentStrategy: WorldAlignmentStrategy = .icp
+
+    /// How ICP is seeded before iterating.
+    var alignmentSeed: AlignmentSeed = .coarsePCA
+
+    /// Fiducials marked on the reconstructed model (source frame). Coordinates are nil until placed.
+    var modelFiducials: [FiducialAnnotation] = FiducialKind.allCases.map {
+        FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview)
+    }
+
+    /// True once all model-frame fiducials have been placed.
+    var modelFiducialsReady: Bool {
+        !modelFiducials.isEmpty && modelFiducials.allSatisfy { $0.coordinate != nil }
+    }
+
+    /// Relative path of the persisted LiDAR mesh point cloud (world-space Float32 XYZ), when captured.
+    var lidarMeshFilename: String? = nil
+
+    var hasReconstructedModel: Bool {
+        photogrammetryModelFilename != nil
+    }
+
     var reviewedElectrodeCount: Int {
         electrodes.filter { $0.state == .reviewed }.count
     }
@@ -150,7 +201,7 @@ struct ScanSession: Identifiable, Codable, Equatable {
         ScanSession(
             name: "New EEG scan",
             createdAt: Date(),
-            captureMode: .liveLiDAR,
+            captureMode: .both,
             layout: layout,
             fiducials: FiducialKind.allCases.map {
                 FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview)

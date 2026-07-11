@@ -19,7 +19,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
     @Published var observations: [CaptureObservation] = []
 
     private weak var arView: ARView?
-    private var meshAnchorIDs = Set<UUID>()
+    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
 
     func attach(_ arView: ARView) {
         self.arView = arView
@@ -27,7 +27,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
         status.isSupported = ARWorldTrackingConfiguration.isSupported
     }
 
-    func start() {
+    func start(captureMode: CaptureMode = .both) {
         guard ARWorldTrackingConfiguration.isSupported else {
             status.message = "AR world tracking is not available on this device."
             status.isSupported = false
@@ -38,18 +38,24 @@ final class ARScanViewModel: NSObject, ObservableObject {
         configuration.worldAlignment = .gravity
         configuration.environmentTexturing = .automatic
 
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
+        // LiDAR depth + mesh are only enabled for modes that use them. Photogrammetry-only
+        // capture still runs world tracking so every RGB frame carries an ARKit pose.
+        if captureMode.usesLiDAR {
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                configuration.frameSemantics.insert(.sceneDepth)
+            }
+
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                configuration.sceneReconstruction = .mesh
+            }
         }
 
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            configuration.sceneReconstruction = .mesh
-        }
-
-        meshAnchorIDs.removeAll()
+        meshAnchors.removeAll()
         arView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         status.isRunning = true
-        status.message = "Move around the cap slowly; keep electrodes in view and avoid motion blur."
+        status.message = captureMode.usesLiDAR
+            ? "Move around the cap slowly; keep electrodes in view and avoid motion blur."
+            : "Circle the head, keeping frames sharp and well-lit for photogrammetry."
     }
 
     func pause() {
@@ -71,7 +77,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
             for: session
         )
 
-        if let depthMap = frame.sceneDepth?.depthMap {
+        if session.captureMode.usesLiDAR, let depthMap = frame.sceneDepth?.depthMap {
             let depthArtifact = try artifactStore.writeDepthSnapshot(
                 depthMap: depthMap,
                 confidenceMap: frame.sceneDepth?.confidenceMap,
@@ -96,11 +102,47 @@ final class ARScanViewModel: NSObject, ObservableObject {
         return observation
     }
 
+    /// World-space point cloud of the accumulated LiDAR reconstruction mesh.
+    /// Vertices are transformed by each anchor's pose and roughly capped to `maxPoints`
+    /// by subsampling so downstream ICP stays tractable.
+    func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] {
+        let anchors = Array(meshAnchors.values)
+        guard !anchors.isEmpty else { return [] }
+
+        let totalVertices = anchors.reduce(0) { $0 + $1.geometry.vertices.count }
+        guard totalVertices > 0 else { return [] }
+        let stride = max(1, totalVertices / max(1, maxPoints))
+
+        var points: [SIMD3<Float>] = []
+        points.reserveCapacity(min(totalVertices, maxPoints) + anchors.count)
+
+        var globalIndex = 0
+        for anchor in anchors {
+            let vertices = anchor.geometry.vertices
+            let buffer = vertices.buffer.contents()
+            let transform = anchor.transform
+
+            for i in 0..<vertices.count {
+                defer { globalIndex += 1 }
+                guard globalIndex % stride == 0 else { continue }
+
+                let pointer = buffer
+                    .advanced(by: vertices.offset + i * vertices.stride)
+                    .assumingMemoryBound(to: (Float, Float, Float).self)
+                let local = pointer.pointee
+                let world = transform * SIMD4<Float>(local.0, local.1, local.2, 1)
+                points.append(SIMD3<Float>(world.x, world.y, world.z))
+            }
+        }
+
+        return points
+    }
+
     private func updateStatus(from frame: ARFrame) {
         status.frameCount += 1
         status.trackingSummary = trackingSummary(frame.camera.trackingState)
         status.hasSceneDepth = frame.sceneDepth != nil
-        status.meshAnchorCount = meshAnchorIDs.count
+        status.meshAnchorCount = meshAnchors.count
     }
 
     private func makeObservation(from frame: ARFrame) -> CaptureObservation {
@@ -112,7 +154,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
             cameraIntrinsics: frame.camera.intrinsics.flattened,
             imageResolution: ImageResolution(width: Int(resolution.width), height: Int(resolution.height)),
             hasSceneDepth: frame.sceneDepth != nil,
-            meshAnchorCount: meshAnchorIDs.count,
+            meshAnchorCount: meshAnchors.count,
             trackingSummary: trackingSummary(frame.camera.trackingState),
             cameraSnapshotFilename: nil,
             depthSnapshotFilename: nil,
@@ -157,19 +199,27 @@ extension ARScanViewModel: ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         Task { @MainActor in
-            for anchor in anchors where anchor is ARMeshAnchor {
-                self.meshAnchorIDs.insert(anchor.identifier)
+            for case let anchor as ARMeshAnchor in anchors {
+                self.meshAnchors[anchor.identifier] = anchor
             }
-            self.status.meshAnchorCount = self.meshAnchorIDs.count
+            self.status.meshAnchorCount = self.meshAnchors.count
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        Task { @MainActor in
+            for case let anchor as ARMeshAnchor in anchors {
+                self.meshAnchors[anchor.identifier] = anchor
+            }
         }
     }
 
     nonisolated func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         Task { @MainActor in
             for anchor in anchors {
-                self.meshAnchorIDs.remove(anchor.identifier)
+                self.meshAnchors.removeValue(forKey: anchor.identifier)
             }
-            self.status.meshAnchorCount = self.meshAnchorIDs.count
+            self.status.meshAnchorCount = self.meshAnchors.count
         }
     }
 }
@@ -200,8 +250,9 @@ final class ARScanViewModel: ObservableObject {
     @Published var status = LiveScanStatus(message: "ARKit is unavailable in this build.")
     @Published var observations: [CaptureObservation] = []
 
-    func start() {}
+    func start(captureMode: CaptureMode = .both) {}
     func pause() {}
     func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? { nil }
+    func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
 }
 #endif

@@ -30,6 +30,9 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.22), value: showSidebar)
+        .sheet(isPresented: $viewModel.promptForModelFiducials) {
+            ModelFiducialPickerView(viewModel: viewModel)
+        }
     }
 }
 
@@ -50,6 +53,12 @@ private struct SidebarView: View {
                     }
                 }
 
+                if viewModel.session.captureMode.usesPhotogrammetry && !viewModel.isPhotogrammetrySupported {
+                    Label("Photogrammetry isn't supported on this device.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Picker("Layout", selection: $viewModel.selectedLayoutName) {
                     ForEach(viewModel.availableLayouts, id: \.name) { layout in
                         Text("\(layout.channelCount)").tag(layout.name)
@@ -67,6 +76,75 @@ private struct SidebarView: View {
                     Label("Detect Electrodes", systemImage: "viewfinder")
                 }
                 .disabled(viewModel.isDetecting)
+            }
+
+            if viewModel.session.captureMode.usesPhotogrammetry {
+                Section("Photogrammetry") {
+                    Picker("Alignment", selection: $viewModel.session.alignmentStrategy) {
+                        ForEach(WorldAlignmentStrategy.allCases) { strategy in
+                            Text(strategy.rawValue).tag(strategy)
+                        }
+                    }
+
+                    Text(viewModel.session.alignmentStrategy.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Picker("ICP Seed", selection: $viewModel.session.alignmentSeed) {
+                        ForEach(AlignmentSeed.allCases) { seed in
+                            Text(seed.rawValue).tag(seed)
+                        }
+                    }
+
+                    Text(viewModel.session.alignmentSeed.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if viewModel.requiresSourceLandmarks {
+                        LabeledContent(
+                            "Model fiducials",
+                            value: viewModel.session.modelFiducialsReady ? "Placed" : "Needed"
+                        )
+                        Button {
+                            viewModel.promptForModelFiducials = true
+                        } label: {
+                            Label("Mark Model Fiducials", systemImage: "hand.point.up.left")
+                        }
+                        .disabled(!viewModel.session.hasReconstructedModel)
+                    }
+
+                    LabeledContent("Frames captured", value: "\(viewModel.session.captureObservations.count)")
+
+                    Button {
+                        Task {
+                            await viewModel.runReconstruction()
+                        }
+                    } label: {
+                        Label("Reconstruct & Fuse", systemImage: "cube.transparent")
+                    }
+                    .disabled(!viewModel.canReconstruct)
+
+                    if let blocker = viewModel.reconstructionBlocker {
+                        Label(blocker, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if let hint = viewModel.reconstructionHint {
+                        Label(hint, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if viewModel.isReconstructing {
+                        HStack {
+                            ProgressView(value: viewModel.reconstructionProgress ?? 0)
+                            Text("\(Int((viewModel.reconstructionProgress ?? 0) * 100))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    LabeledContent("Model", value: viewModel.session.hasReconstructedModel ? "Ready" : "Not built")
+                }
             }
 
             Section("Session") {
@@ -354,20 +432,10 @@ private struct DetectionSummaryView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            GeometryReader { geometry in
-                HStack(alignment: .top, spacing: 0) {
-                    NetPopulationView(session: viewModel.session)
-                        .padding(12)
-                        .frame(width: geometry.size.width * 0.75)
-
-                    Divider()
-
-                    FiducialsPanel(session: viewModel.session)
-                        .frame(maxWidth: .infinity)
-                }
-            }
-            .frame(height: 250)
+        HStack(spacing: 0) {
+            NetPopulationView(session: viewModel.session)
+                .padding(12)
+                .frame(maxWidth: .infinity)
 
             Divider()
 
@@ -382,39 +450,14 @@ private struct DetectionSummaryView: View {
                     } else {
                         ForEach(viewModel.session.electrodes) { electrode in
                             ElectrodeRow(electrode: electrode) {
-                                viewModel.markReviewed(electrode)
+                                viewModel.toggleReviewed(electrode)
                             }
                         }
                     }
                 }
             }
+            .frame(maxWidth: .infinity)
         }
-    }
-}
-
-private struct FiducialsPanel: View {
-    var session: ScanSession
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Fiducials", systemImage: "scope")
-                .font(.headline)
-
-            ForEach(session.fiducials) { fiducial in
-                HStack {
-                    Text(fiducial.kind.rawValue)
-                        .font(.subheadline)
-                    Spacer()
-                    Text(fiducial.coordinate == nil ? "Needed" : fiducial.state.rawValue)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -578,7 +621,9 @@ private struct LegendItem: View {
 
 private struct ElectrodeRow: View {
     var electrode: ElectrodeAnnotation
-    var markReviewed: () -> Void
+    var toggleReviewed: () -> Void
+
+    private var isReviewed: Bool { electrode.state == .reviewed }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -605,13 +650,13 @@ private struct ElectrodeRow: View {
             }
 
             Button {
-                markReviewed()
+                toggleReviewed()
             } label: {
-                Image(systemName: "checkmark")
+                Image(systemName: isReviewed ? "checkmark.circle.fill" : "checkmark.circle")
+                    .foregroundStyle(isReviewed ? Color.blue : Color.secondary)
             }
             .buttonStyle(.borderless)
-            .disabled(electrode.state == .reviewed)
-            .help("Mark reviewed")
+            .help(isReviewed ? "Mark as detected (undo review)" : "Mark reviewed")
         }
     }
 
