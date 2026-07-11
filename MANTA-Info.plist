@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Keys that Xcode's INFOPLIST_KEY_* build settings don't cover. Merged with
+	  the generated Info.plist (GENERATE_INFOPLIST_FILE stays YES). Together these
+	  expose the app's Documents folder (MANTA Sessions/) in the Files app and
+	  Finder file sharing, so captured sessions are browsable without Xcode.
+	-->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+</dict>
+</plist>
