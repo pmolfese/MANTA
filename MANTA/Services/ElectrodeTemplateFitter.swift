@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import MANTACore
 import simd
 
 enum ElectrodeTemplateFitter {

@@ -15,6 +15,7 @@
 
 import CoreGraphics
 import Foundation
+import MANTACore
 import simd
 
 #if canImport(Vision)

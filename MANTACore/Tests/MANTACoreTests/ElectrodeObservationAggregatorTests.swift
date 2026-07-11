@@ -9,7 +9,7 @@
 import Foundation
 import Testing
 import simd
-@testable import MANTA
+import MANTACore
 
 struct ElectrodeObservationAggregatorTests {
     private func jitter(_ base: SIMD3<Float>, _ offset: SIMD3<Float>) -> SIMD3<Float> {

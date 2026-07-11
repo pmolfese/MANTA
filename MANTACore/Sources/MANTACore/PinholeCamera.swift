@@ -25,17 +25,17 @@
 import Foundation
 import simd
 
-struct PinholeCamera: Equatable {
+public struct PinholeCamera: Equatable {
     /// Focal lengths in pixels.
-    var fx: Float
-    var fy: Float
+    public var fx: Float
+    public var fy: Float
     /// Principal point in pixels.
-    var cx: Float
-    var cy: Float
+    public var cx: Float
+    public var cy: Float
     /// Camera-to-world transform (ARKit `camera.transform`).
-    var cameraToWorld: simd_float4x4
+    public var cameraToWorld: simd_float4x4
 
-    init(fx: Float, fy: Float, cx: Float, cy: Float, cameraToWorld: simd_float4x4) {
+    public init(fx: Float, fy: Float, cx: Float, cy: Float, cameraToWorld: simd_float4x4) {
         self.fx = fx
         self.fy = fy
         self.cx = cx
@@ -47,7 +47,7 @@ struct PinholeCamera: Equatable {
     /// camera transform (column-major 4x4) stored on a `CaptureObservation`.
     /// Returns nil if either array is the wrong length or the focal length is
     /// degenerate.
-    init?(intrinsics: [Float], transform: [Float]) {
+    public init?(intrinsics: [Float], transform: [Float]) {
         guard intrinsics.count == 9, transform.count == 16 else { return nil }
 
         // Column-major 3x3: columns are [0,1,2], [3,4,5], [6,7,8].
@@ -70,7 +70,7 @@ struct PinholeCamera: Equatable {
     /// Projects a world point to a pixel plus its metric depth (distance along
     /// the viewing axis). Returns nil when the point is on or behind the image
     /// plane.
-    func project(_ worldPoint: SIMD3<Float>) -> (pixel: SIMD2<Float>, depth: Float)? {
+    public func project(_ worldPoint: SIMD3<Float>) -> (pixel: SIMD2<Float>, depth: Float)? {
         let camera = cameraToWorld.inverse * SIMD4<Float>(worldPoint, 1)
 
         // ARKit camera space -> vision pinhole frame (flip y and z).
@@ -83,7 +83,7 @@ struct PinholeCamera: Equatable {
     }
 
     /// Unprojects a pixel at the given metric depth back to an ARKit world point.
-    func unproject(pixel: SIMD2<Float>, depth: Float) -> SIMD3<Float> {
+    public func unproject(pixel: SIMD2<Float>, depth: Float) -> SIMD3<Float> {
         // Pixel -> normalized ray in the vision pinhole frame.
         let nx = (pixel.x - cx) / fx
         let ny = (pixel.y - cy) / fy

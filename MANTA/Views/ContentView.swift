@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import MANTACore
 
 struct ContentView: View {
     @StateObject private var viewModel = ScanSessionViewModel()

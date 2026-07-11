@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import MANTACore
 
 struct Coordinate3D: Codable, Equatable, Hashable {
     var x: Double

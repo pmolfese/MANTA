@@ -18,6 +18,7 @@
 import CoreGraphics
 import Foundation
 import simd
+import MANTACore
 @testable import MANTA
 
 /// Reproducible RNG (SplitMix64) so synthetic scans are deterministic.

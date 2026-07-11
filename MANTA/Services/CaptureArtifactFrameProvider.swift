@@ -10,6 +10,7 @@
 
 import CoreGraphics
 import Foundation
+import MANTACore
 import simd
 
 #if canImport(ImageIO) && canImport(Compression)

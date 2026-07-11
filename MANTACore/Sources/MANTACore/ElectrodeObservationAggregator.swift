@@ -17,15 +17,15 @@ import Foundation
 import simd
 
 /// One back-projected detection of a labeled electrode in a single frame.
-struct LabeledDetection: Equatable {
+public struct LabeledDetection: Equatable {
     /// Channel label as read from the disk, e.g. "E31" or "31".
-    var label: String
+    public var label: String
     /// Back-projected position in the ARKit world frame (meters).
-    var world: SIMD3<Float>
+    public var world: SIMD3<Float>
     /// Per-observation quality in 0...1 (e.g. OCR confidence × depth confidence).
-    var quality: Float
+    public var quality: Float
 
-    init(label: String, world: SIMD3<Float>, quality: Float = 1) {
+    public init(label: String, world: SIMD3<Float>, quality: Float = 1) {
         self.label = label
         self.world = world
         self.quality = quality
@@ -33,19 +33,27 @@ struct LabeledDetection: Equatable {
 }
 
 /// A fused electrode position with a quality estimate.
-struct AggregatedElectrode: Equatable {
-    var label: String
+public struct AggregatedElectrode: Equatable {
+    public var label: String
     /// Robust center of the inlier observations, in the ARKit world frame.
-    var position: SIMD3<Float>
+    public var position: SIMD3<Float>
     /// Number of inlier observations that contributed to `position`.
-    var observationCount: Int
+    public var observationCount: Int
     /// RMS distance of inliers from `position`, in meters.
-    var spread: Float
+    public var spread: Float
     /// Fused confidence in 0...1.
-    var confidence: Float
+    public var confidence: Float
+
+    public init(label: String, position: SIMD3<Float>, observationCount: Int, spread: Float, confidence: Float) {
+        self.label = label
+        self.position = position
+        self.observationCount = observationCount
+        self.spread = spread
+        self.confidence = confidence
+    }
 }
 
-enum ElectrodeObservationAggregator {
+public enum ElectrodeObservationAggregator {
     /// Fuses detections per channel label.
     ///
     /// - Parameters:
@@ -56,7 +64,7 @@ enum ElectrodeObservationAggregator {
     ///   - saturationCount: observation count at which the count contribution to
     ///     confidence saturates.
     /// - Returns: one entry per distinct label, sorted by label.
-    static func aggregate(
+    public static func aggregate(
         _ detections: [LabeledDetection],
         outlierThreshold: Float = 0.02,
         saturationCount: Int = 5

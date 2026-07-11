@@ -9,7 +9,7 @@
 import Foundation
 import Testing
 import simd
-@testable import MANTA
+import MANTACore
 
 struct PinholeCameraTests {
     /// A representative iPad-class intrinsics/pose, flattened as stored on a

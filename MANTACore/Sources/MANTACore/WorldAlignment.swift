@@ -19,14 +19,14 @@
 import Foundation
 import simd
 
-enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable {
+public enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable {
     case icp = "ICP"
     case fiducial = "Fiducial"
     case depthAssisted = "Depth-Assisted"
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
-    var explanation: String {
+    public var explanation: String {
         switch self {
         case .icp:
             return "Iterative closest point between the LiDAR and photogrammetry surfaces."
@@ -39,17 +39,17 @@ enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable {
 }
 
 /// How ICP is initialized before iterating. Exposed so the different seeds can be compared.
-enum AlignmentSeed: String, CaseIterable, Codable, Identifiable {
+public enum AlignmentSeed: String, CaseIterable, Codable, Identifiable {
     case identity = "None"
     case coarsePCA = "Coarse (PCA)"
     case landmarks = "Source Landmarks"
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
     /// Whether this seed needs fiducials marked on the reconstructed model.
-    var requiresSourceLandmarks: Bool { self == .landmarks }
+    public var requiresSourceLandmarks: Bool { self == .landmarks }
 
-    var explanation: String {
+    public var explanation: String {
         switch self {
         case .identity:
             return "Start ICP from the identity transform."
@@ -62,35 +62,43 @@ enum AlignmentSeed: String, CaseIterable, Codable, Identifiable {
 }
 
 /// Everything the solvers might need. Each strategy uses the subset relevant to it.
-struct WorldAlignmentInput {
+public struct WorldAlignmentInput {
     /// How ICP is initialized.
-    var seed: AlignmentSeed = .coarsePCA
+    public var seed: AlignmentSeed = .coarsePCA
     /// Landmarks in the photogrammetry model frame (source).
-    var sourceLandmarks: [SIMD3<Float>] = []
+    public var sourceLandmarks: [SIMD3<Float>] = []
     /// Corresponding landmarks in the ARKit world frame (target).
-    var targetLandmarks: [SIMD3<Float>] = []
+    public var targetLandmarks: [SIMD3<Float>] = []
     /// Dense point cloud of the photogrammetry surface (source), for ICP.
-    var sourceCloud: [SIMD3<Float>] = []
+    public var sourceCloud: [SIMD3<Float>] = []
     /// Dense point cloud of the LiDAR surface (target), for ICP.
-    var targetCloud: [SIMD3<Float>] = []
+    public var targetCloud: [SIMD3<Float>] = []
     /// Metric scale (target units per source unit) measured from LiDAR depth, for depth-assisted.
-    var metricScaleHint: Float?
-    var icpMaxIterations: Int = 30
-    var icpTolerance: Float = 1e-5
+    public var metricScaleHint: Float?
+    public var icpMaxIterations: Int = 30
+    public var icpTolerance: Float = 1e-5
+
+    public init() {}
 }
 
-struct WorldAlignmentResult: Equatable {
+public struct WorldAlignmentResult: Equatable, Sendable {
     /// Column-major rigid/similarity transform mapping source (model) points into the target (world) frame.
-    var transform: simd_float4x4
+    public var transform: simd_float4x4
     /// RMS residual of the fit in target units, when computable.
-    var rmsError: Float
-    var iterations: Int
+    public var rmsError: Float
+    public var iterations: Int
 
-    static let identity = WorldAlignmentResult(transform: matrix_identity_float4x4, rmsError: .nan, iterations: 0)
+    public init(transform: simd_float4x4, rmsError: Float, iterations: Int) {
+        self.transform = transform
+        self.rmsError = rmsError
+        self.iterations = iterations
+    }
+
+    public static let identity = WorldAlignmentResult(transform: matrix_identity_float4x4, rmsError: .nan, iterations: 0)
 }
 
-enum WorldAlignmentSolver {
-    static func solve(strategy: WorldAlignmentStrategy, input: WorldAlignmentInput) -> WorldAlignmentResult {
+public enum WorldAlignmentSolver {
+    public static func solve(strategy: WorldAlignmentStrategy, input: WorldAlignmentInput) -> WorldAlignmentResult {
         switch strategy {
         case .fiducial:
             return AbsoluteOrientation.fit(
@@ -253,8 +261,8 @@ enum CoarseAlignment {
 
 // MARK: - Horn's absolute orientation (closed-form similarity fit)
 
-enum AbsoluteOrientation {
-    enum ScaleMode {
+public enum AbsoluteOrientation {
+    public enum ScaleMode {
         case rigid          // scale fixed at 1
         case estimate       // solve scale from correspondences
         case fixed(Float)   // externally supplied scale
@@ -262,7 +270,7 @@ enum AbsoluteOrientation {
 
     /// Least-squares similarity transform mapping `source` onto `target`.
     /// Needs at least 3 non-degenerate correspondences. Returns nil if under-determined.
-    static func fit(source: [SIMD3<Float>], target: [SIMD3<Float>], scale: ScaleMode) -> WorldAlignmentResult? {
+    public static func fit(source: [SIMD3<Float>], target: [SIMD3<Float>], scale: ScaleMode) -> WorldAlignmentResult? {
         guard source.count == target.count, source.count >= 3 else { return nil }
         let n = source.count
 

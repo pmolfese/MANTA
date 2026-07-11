@@ -323,6 +323,102 @@ bundles (the `<subject>_<timestamp>.zip` from §5) without AirDrop/cloud.
       detection/export on the Mac** — directly serving the §5 "reprocess old
       captures under better models" goal.
 
+### Project structure: one project, shared package, macOS target
+
+Decision: keep **one repo / one `MANTA.xcodeproj`** and add the receiver as a
+**second app target**, not a separate project — because the shared-core goal
+above makes a cross-project package reference (workspace/submodule) needless
+friction. Not a Multiplatform single target: the receiver is a *different* app,
+not the iOS app on macOS.
+
+Target structure:
+```
+MANTA.xcodeproj
+├─ MANTACore  (local Swift Package)   ← pure, platform-agnostic core
+├─ MANTA          target  (iOS app)   → depends on MANTACore
+└─ MANTA Receiver target  (macOS app) → depends on MANTACore
+```
+
+Why a package (not shared target file-membership): clean module boundary, and its
+tests run on the **Mac host directly (`swift test`)** — much faster than the
+current xcodebuild-on-simulator loop. App-specific code (ARKit/RealityKit
+capture, SwiftUI views) stays in the app targets; Foundation-only IO like
+`CaptureArtifactStore` can move into the package so the Receiver reuses the same
+session layout.
+
+Trade-offs accepted: bigger pbxproj + more schemes, and a bad shared change can
+touch both apps — worth it for zero-friction code sharing. (A separate project
+would only win if the receiver were owned/released independently.)
+
+Incremental migration (each step compiles on its own):
+- [x] Create the `MANTACore` local Swift package and wire the iOS app + test
+      targets to depend on it (hand-edited pbxproj:
+      `XCLocalSwiftPackageReference` + `XCSwiftPackageProductDependency`). Done
+      entirely outside Xcode; `xcodebuild` resolves it as `MANTACore @ local`.
+- [~] Move the pure files one cluster at a time.
+      **Cluster 1 done:** `PinholeCamera`, `ElectrodeObservationAggregator`
+      (+ `LabeledDetection`, `AggregatedElectrode`).
+      **Cluster 2 done:** `WorldAlignment` (`AbsoluteOrientation`, ICP,
+      `WorldAlignmentSolver`/`Input`/`Result`, `WorldAlignmentStrategy`,
+      `AlignmentSeed`) — self-contained simd math; `CoarseAlignment`/`ICP`/
+      `JacobiEigen` kept internal (package tests use `@testable import
+      MANTACore`); made `WorldAlignmentResult: Sendable` for Swift 6 strict
+      concurrency. Full app build + `MANTATests` green; package `swift test` = 18.
+      **Cluster 3 done:** `ModelPointCloudLoader` (ModelIO + simd, no model
+      types); its only consumer already imported `MANTACore`.
+      **Everything else is blocked on the models pass — see Cluster 4 below.**
+- [ ] **Cluster 4: the models pass** (next session — the big one).
+- [x] Migrate the moved cluster's tests into the package test target
+      (`import MANTACore`) — they run on the **Mac host via `swift test`** in
+      ~1 ms each, no simulator.
+- [ ] Add the macOS **MANTA Receiver** app target (empty SwiftUI app) to the
+      existing project.
+- [ ] Build the Receiver against `MANTACore` so it can reprocess captures.
+- [ ] Ensure ARKit/RealityKit are linked only by the iOS target (the package
+      split enforces this naturally; `MANTACore` is already ARKit/UIKit-free).
+
+macOS target needs its own bundle ID, App Sandbox entitlements (incoming network
+connections + local-network usage description for Bonjour), and notarization —
+independent of the iOS app.
+
+### Cluster 4 plan: the models pass (do this next)
+
+Goal: move the foundational model types into `MANTACore` so the remaining
+algorithm files can follow. This is the widely-referenced, higher-risk step —
+**start with a git commit checkpoint** so it's easy to revert.
+
+Move into `MANTACore`:
+- `MANTA/Models/ScanModels.swift` — `Coordinate3D`, `Coordinate2D`,
+  `ElectrodeRole`, `AnnotationState`, `ElectrodeAnnotation`, `FiducialKind`,
+  `FiducialAnnotation`, `ElectrodeDefinition`, `CaptureMode`, `ElectrodeLayout`,
+  `ScanSession`.
+- `MANTA/Models/CaptureModels.swift` — `ImageResolution`, depth/confidence
+  format+summary structs, `CaptureObservation`. (`LiveScanStatus` is used by the
+  ARKit view models — consider leaving it app-side or moving it too; it's plain
+  data.)
+
+Then, in the same pass, move the now-unblocked algorithm files:
+`ElectrodeDetectionContext` (parser/builder/pipeline), `ElectrodeNeighborValidator`,
+`ElectrodeTemplateFitter`, `ElectrodeCapOrientation`, `HeadCoordinateFrame`,
+`HydroCelLayoutLoader` (ships the layout XML/JSON — either add them as package
+resources via `.copy`, or keep `Bundle.main` loading and leave the loader
+app-side for now), and `ElectrodeExporters`.
+
+Mechanics per type (same recipe as Clusters 1–3):
+- Make the type + the members used across the module `public`; add `public init`s
+  where app code constructs them (memberwise inits are internal by default).
+- Mark value types used in `static let`/globals `Sendable` (Swift 6 strict
+  concurrency in the package — this bit us with `WorldAlignmentResult`).
+- Add `import MANTACore` to every app/test file that references a moved type
+  (expect this to touch most of `MANTA/` and `MANTATests/`).
+- Move each type's tests into `Tests/MANTACoreTests` (`import MANTACore`, or
+  `@testable import MANTACore` if they reach internals); keep app-only tests in
+  `MANTATests`.
+
+Verify: `cd MANTACore && swift test`, then the full app
+`xcodebuild test … -only-testing:MANTATests`. `ScanSession` already depends on the
+moved `WorldAlignmentStrategy`/`AlignmentSeed`, so that edge is ready.
+
 ### Effort / notes
 
 - Receiver v1 (HTTP + Bonjour + PIN + save-to-folder): a few hundred lines,

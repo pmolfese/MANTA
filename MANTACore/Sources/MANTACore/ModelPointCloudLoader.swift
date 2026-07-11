@@ -13,10 +13,10 @@ import simd
 #if canImport(ModelIO)
 import ModelIO
 
-enum ModelPointCloudLoader {
+public enum ModelPointCloudLoader {
     /// Loads mesh vertices from a model file, transformed by each mesh's object transform,
     /// and subsampled to roughly `maxPoints`. Returns an empty array on any failure.
-    static func load(url: URL, maxPoints: Int = 6000) -> [SIMD3<Float>] {
+    public static func load(url: URL, maxPoints: Int = 6000) -> [SIMD3<Float>] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
 
         let asset = MDLAsset(url: url)
@@ -58,7 +58,7 @@ enum ModelPointCloudLoader {
     }
 }
 #else
-enum ModelPointCloudLoader {
-    static func load(url: URL, maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
+public enum ModelPointCloudLoader {
+    public static func load(url: URL, maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
 }
 #endif

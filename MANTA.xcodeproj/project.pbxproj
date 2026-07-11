@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C0FFEE0000000000000000A4 /* MANTACore in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000A2 /* MANTACore */; };
+		C0FFEE0000000000000000A5 /* MANTACore in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000A3 /* MANTACore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		770D1DA5300172010036B8E4 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0FFEE0000000000000000A4 /* MANTACore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -59,6 +65,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0FFEE0000000000000000A5 /* MANTACore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +119,7 @@
 			);
 			name = MANTA;
 			packageProductDependencies = (
+				C0FFEE0000000000000000A2 /* MANTACore */,
 			);
 			productName = MANTA;
 			productReference = 770D1D97300171FF0036B8E4 /* MANTA.app */;
@@ -135,6 +143,7 @@
 			);
 			name = MANTATests;
 			packageProductDependencies = (
+				C0FFEE0000000000000000A3 /* MANTACore */,
 			);
 			productName = MANTATests;
 			productReference = 770D1DA4300172010036B8E4 /* MANTATests.xctest */;
@@ -195,6 +204,9 @@
 			);
 			mainGroup = 770D1D8E300171FF0036B8E4;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				C0FFEE0000000000000000A1 /* XCLocalSwiftPackageReference "MANTACore" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 770D1D98300171FF0036B8E4 /* Products */;
 			projectDirPath = "";
@@ -398,8 +410,8 @@
 				DEVELOPMENT_TEAM = 7V8RRF84QH;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_FILE = "MANTA-Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -432,8 +444,8 @@
 				DEVELOPMENT_TEAM = 7V8RRF84QH;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_FILE = "MANTA-Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -576,6 +588,24 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		C0FFEE0000000000000000A1 /* XCLocalSwiftPackageReference "MANTACore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = MANTACore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C0FFEE0000000000000000A2 /* MANTACore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MANTACore;
+		};
+		C0FFEE0000000000000000A3 /* MANTACore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MANTACore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 770D1D8F300171FF0036B8E4 /* Project object */;
 }

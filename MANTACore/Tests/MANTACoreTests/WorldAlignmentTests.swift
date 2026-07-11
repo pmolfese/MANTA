@@ -8,7 +8,7 @@
 import Foundation
 import Testing
 import simd
-@testable import MANTA
+@testable import MANTACore
 
 struct WorldAlignmentTests {
     /// Applies a similarity transform (rotation, scale, translation) to a point.

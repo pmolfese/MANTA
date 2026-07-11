@@ -7,6 +7,7 @@
 
 import Foundation
 import Combine
+import MANTACore
 import simd
 
 /// A prepared export archive, wrapped so SwiftUI can present a share sheet via

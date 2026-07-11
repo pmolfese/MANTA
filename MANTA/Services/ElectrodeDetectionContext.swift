@@ -18,6 +18,7 @@
 
 import CoreGraphics
 import Foundation
+import MANTACore
 import simd
 
 /// Everything a detection pipeline consumes for one session.

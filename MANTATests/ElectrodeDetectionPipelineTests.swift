@@ -11,6 +11,7 @@ import CoreGraphics
 import Foundation
 import Testing
 import simd
+import MANTACore
 @testable import MANTA
 
 struct ElectrodeDetectionPipelineTests {
