@@ -53,6 +53,9 @@ struct SyntheticScanConfig {
     var seed: UInt64 = 42
     /// Camera orbit.
     var azimuthStepDegrees: Float = 30
+    /// Azimuth sweep of the orbit; narrow it to simulate a partial (e.g.
+    /// front-only) scan that leaves some disks never seen.
+    var azimuthRangeDegrees: ClosedRange<Float> = 0...360
     var elevationsDegrees: [Float] = [-10, 20, 50]
     var cameraDistance: Float = 0.30 // meters from head center
     /// Facing test: cos of the max angle between a disk's outward normal and the
@@ -195,8 +198,8 @@ enum SyntheticScanGenerator {
 
     private static func cameraPoses(config: SyntheticScanConfig) -> [simd_float4x4] {
         var poses: [simd_float4x4] = []
-        var azimuth: Float = 0
-        while azimuth < 360 {
+        var azimuth: Float = config.azimuthRangeDegrees.lowerBound
+        while azimuth < config.azimuthRangeDegrees.upperBound {
             for elevation in config.elevationsDegrees {
                 let az = azimuth * .pi / 180
                 let el = elevation * .pi / 180
@@ -289,6 +292,9 @@ struct DetectionAccuracy {
     /// Recovered electrodes whose position error exceeds a gross threshold
     /// (e.g. a surviving misread), count.
     var grossErrorCount: Int
+    /// Gross-error electrodes still marked `.detected` — i.e. missed by both
+    /// fusion and neighbor validation.
+    var grossErrorAmongDetectedCount: Int
 
     static func compare(
         annotations: [ElectrodeAnnotation],
@@ -297,6 +303,7 @@ struct DetectionAccuracy {
     ) -> DetectionAccuracy {
         var errors: [Float] = []
         var gross = 0
+        var grossAmongDetected = 0
 
         for annotation in annotations {
             guard annotation.label.hasPrefix("E"), let number = Int(annotation.label.dropFirst()),
@@ -308,7 +315,10 @@ struct DetectionAccuracy {
             )
             let error = simd_distance(recovered, truePosition)
             errors.append(error)
-            if error > grossThresholdMeters { gross += 1 }
+            if error > grossThresholdMeters {
+                gross += 1
+                if annotation.state == .detected { grossAmongDetected += 1 }
+            }
         }
 
         let sorted = errors.sorted()
@@ -321,7 +331,8 @@ struct DetectionAccuracy {
             meanErrorMeters: mean,
             medianErrorMeters: median,
             maxErrorMeters: sorted.last ?? 0,
-            grossErrorCount: gross
+            grossErrorCount: gross,
+            grossErrorAmongDetectedCount: grossAmongDetected
         )
     }
 }

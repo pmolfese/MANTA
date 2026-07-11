@@ -105,13 +105,17 @@ enum ElectrodeAnnotationBuilder {
     ///   - layout: active layout, providing role and the valid label set.
     ///   - confidenceThreshold: at/above this a detection is `.detected`,
     ///     below it is `.needsReview` so the reviewer looks at it.
+    ///   - suspectLabels: labels flagged as geometrically inconsistent by the
+    ///     neighbor validator; these are forced to `.needsReview` regardless of
+    ///     confidence.
     ///
     /// Positions are in the ARKit world frame (meters). Conversion into the
     /// fiducial-anchored head frame used for export happens separately (TODO §3).
     static func build(
         from aggregated: [AggregatedElectrode],
         layout: ElectrodeLayout,
-        confidenceThreshold: Double = 0.6
+        confidenceThreshold: Double = 0.6,
+        suspectLabels: Set<String> = []
     ) -> [ElectrodeAnnotation] {
         let definitionsByLabel = Dictionary(
             uniqueKeysWithValues: layout.electrodes.map { ($0.label, $0) }
@@ -120,6 +124,8 @@ enum ElectrodeAnnotationBuilder {
         return aggregated.compactMap { electrode in
             guard let definition = definitionsByLabel[electrode.label] else { return nil }
             let confidence = Double(electrode.confidence)
+            let passesConfidence = confidence >= confidenceThreshold
+            let isSuspect = suspectLabels.contains(electrode.label)
 
             return ElectrodeAnnotation(
                 label: electrode.label,
@@ -130,7 +136,7 @@ enum ElectrodeAnnotationBuilder {
                     z: Double(electrode.position.z)
                 ),
                 confidence: confidence,
-                state: confidence >= confidenceThreshold ? .detected : .needsReview
+                state: (passesConfidence && !isSuspect) ? .detected : .needsReview
             )
         }
     }
@@ -142,6 +148,12 @@ enum ElectrodeAnnotationBuilder {
 struct OCRElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
     var recognizer: TextRecognizing
     var confidenceThreshold: Double = 0.6
+    /// When true, flags geometrically inconsistent reads (likely misreads) as
+    /// needs-review via the neighbor graph.
+    var validatesNeighbors: Bool = true
+    /// When true, fills electrodes OCR could not read by fitting the coordinate
+    /// template to the confident detections (added as needs-review).
+    var fillsMissingFromTemplate: Bool = true
 
     func detectElectrodes(in context: DetectionContext) async throws -> [ElectrodeAnnotation] {
         let validNumbers = Set(context.layout.electrodes.map(\.number))
@@ -167,10 +179,21 @@ struct OCRElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
         }
 
         let fused = ElectrodeObservationAggregator.aggregate(detections)
-        return ElectrodeAnnotationBuilder.build(
+
+        var suspects: Set<String> = []
+        if validatesNeighbors {
+            let positions = Dictionary(uniqueKeysWithValues: fused.map { ($0.label, $0.position) })
+            suspects = ElectrodeNeighborValidator.validate(positions: positions, layout: context.layout).suspectLabels
+        }
+
+        let annotations = ElectrodeAnnotationBuilder.build(
             from: fused,
             layout: context.layout,
-            confidenceThreshold: confidenceThreshold
+            confidenceThreshold: confidenceThreshold,
+            suspectLabels: suspects
         )
+
+        guard fillsMissingFromTemplate else { return annotations }
+        return ElectrodeTemplateFitter.fillMissing(annotations: annotations, layout: context.layout)
     }
 }

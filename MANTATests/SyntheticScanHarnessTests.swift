@@ -25,10 +25,12 @@ struct SyntheticScanHarnessTests {
         return try #require(layouts.first { $0.channelCount == channelCount })
     }
 
+    /// Runs detection only (template fill off) so these measure OCR + fusion +
+    /// validation accuracy. Template fill is covered by its own test.
     private func run(_ scan: SyntheticScan, layout: ElectrodeLayout) async throws -> [ElectrodeAnnotation] {
         let context = DetectionContext(layout: layout, observations: scan.observations, frameProvider: scan.source)
         // Recognizer and provider are the same synthetic object.
-        let pipeline = OCRElectrodeDetectionPipeline(recognizer: scan.source)
+        let pipeline = OCRElectrodeDetectionPipeline(recognizer: scan.source, fillsMissingFromTemplate: false)
         return try await pipeline.detectElectrodes(in: context)
     }
 
@@ -79,6 +81,50 @@ struct SyntheticScanHarnessTests {
         // rare relative to the number of recovered electrodes.
         #expect(accuracy.recoveredCount > Int(Double(channelCount) * 0.8))
         #expect(Float(accuracy.grossErrorCount) < Float(accuracy.recoveredCount) * 0.1)
+        // Whatever gross errors survive fusion should be caught by neighbor-graph
+        // validation and marked needs-review, not left as confident detections.
+        #expect(accuracy.grossErrorAmongDetectedCount == 0)
+    }
+
+    @Test(arguments: channelCounts)
+    func templateFillCoversUnscannedElectrodes(channelCount: Int) async throws {
+        let layout = try loadLayout(channelCount: channelCount)
+        // Front-only orbit: back-of-head disks are never seen, so OCR can't read
+        // them; template fitting must fill them in.
+        var config = SyntheticScanConfig()
+        config.pixelNoise = 1.0
+        config.depthNoise = 0.002
+        config.azimuthRangeDegrees = -80...80
+        let scan = SyntheticScanGenerator.generate(layout: layout, config: config)
+
+        let context = DetectionContext(layout: layout, observations: scan.observations, frameProvider: scan.source)
+
+        let withoutFill = OCRElectrodeDetectionPipeline(recognizer: scan.source, fillsMissingFromTemplate: false)
+        let withFill = OCRElectrodeDetectionPipeline(recognizer: scan.source, fillsMissingFromTemplate: true)
+
+        let detectedOnly = try await withoutFill.detectElectrodes(in: context)
+        let filledResult = try await withFill.detectElectrodes(in: context)
+
+        // Some electrodes really were unseen.
+        #expect(detectedOnly.count < channelCount)
+        // Fill adds coverage toward the full net.
+        #expect(filledResult.count > detectedOnly.count)
+
+        // Filled electrodes (needs-review, weren't detected) land near truth.
+        let detectedLabels = Set(detectedOnly.map(\.label))
+        var filledErrors: [Float] = []
+        for annotation in filledResult where !detectedLabels.contains(annotation.label) {
+            guard let number = Int(annotation.label.dropFirst()), let truth = scan.truth[number] else { continue }
+            let predicted = SIMD3<Float>(
+                Float(annotation.coordinate.x), Float(annotation.coordinate.y), Float(annotation.coordinate.z)
+            )
+            filledErrors.append(simd_distance(predicted, truth))
+        }
+        #expect(!filledErrors.isEmpty)
+        // Similarity fit against the idealized template: predictions land within
+        // ~1 cm of truth here (synthetic head == template shape).
+        let meanFillError = filledErrors.reduce(0, +) / Float(filledErrors.count)
+        #expect(meanFillError < 0.01)
     }
 
     @Test(arguments: channelCounts)

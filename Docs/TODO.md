@@ -49,8 +49,17 @@ rather than solving anonymous point-cloud correspondence, and use the template
       synthetic harness to set aggregator thresholds before then.
 - [ ] Associate each read with the disk *center* via contour/circle detection
       (currently uses the text bounding-box center as a proxy).
-- [ ] Validate/repair reads with the `sensorLayout_256.xml` neighbor graph
-      (catch OCR misreads); flag or interpolate occluded disks.
+- [x] Validate reads with the neighbor graph: `ElectrodeNeighborValidator`
+      compares detected inter-electrode distances to the coordinate template
+      (rigid-invariant; only a global scale is estimated), flags geometrically
+      inconsistent labels, and the builder marks them `.needsReview`. Wired into
+      `OCRElectrodeDetectionPipeline` (`validatesNeighbors`). Works for 128 and
+      256 (reads the active layout's graph/priors); unit-tested on both, and the
+      synthetic harness confirms misreads surviving fusion are caught (zero
+      gross errors left as confident detections).
+- [ ] *Repair* (not just flag) validated misreads by reassigning to the correct
+      label from neighbor context; interpolate fully-occluded disks. (Overlaps
+      §2 template fit.)
 - [ ] Fall back to ray-cast against the scene mesh where per-pixel depth is
       missing.
 - [ ] Convert fused world positions into the fiducial-anchored head frame for
@@ -117,16 +126,21 @@ verify the back-projection against real depth and tune the OCR in one pass.
 
 ## 2. Label assignment for the 256-channel net
 
+- [x] Template fit (fill-missing): `ElectrodeTemplateFitter` fits the coordinate
+      template to the confident detections via a **similarity** transform
+      (rigid + uniform scale, Horn's method reusing `AbsoluteOrientation`) and
+      predicts unread electrodes' positions, added as needs-review. Detected
+      positions are never moved. Wired into `OCRElectrodeDetectionPipeline`
+      (`fillsMissingFromTemplate`). Works for 128 and 256; unit-tested plus a
+      front-only synthetic scan that fills back-of-head disks within ~1 cm.
+- [ ] Upgrade the fit to **affine** (fall back from similarity) if real-head
+      residuals are too high — same entry point in `ElectrodeTemplateFitter`.
 - [ ] Estimate cap orientation from fiducials (nasion/LPA/RPA) + cardinal
-      electrode detections.
-- [ ] Non-rigid or affine fit of the EGI 256 coordinate prior
-      (`coordinates_256.xml`) to the detected cloud; assign labels by nearest
-      correspondence (Hungarian/greedy with neighbor-graph consistency from
-      `sensorLayout_256.xml`).
+      electrode detections (seeds/robustifies the fit; also disambiguates
+      front/back and left/right on sparse scans).
 - [ ] Flag ambiguous/missing electrodes (occluded by hair, low confidence)
       for the manual review flow; target ≥240/256 auto-labeled on a good scan.
-- [ ] Unit-test label assignment against synthetic perturbations of the
-      256 template (jitter, dropout, partial coverage).
+      (Filled electrodes are already surfaced as needs-review.)
 
 ## 3. Fiducial workflow
 
@@ -147,17 +161,55 @@ verify the back-projection against real depth and tune the OCR in one pass.
 - [ ] Test across conditions: hair color/volume, lighting, gel sheen, subject
       motion, iPad vs iPhone LiDAR.
 
-## 5. Capture UX hardening
+## 5. Capture & subject library (defer processing / reprocess later)
+
+Goal: capture with the patient in the room, then run detection/reconstruction
+later — and re-run improved models on old captures. The raw capture already
+supports this; what's missing is subject identity, reloadable sessions, and a
+browser.
+
+**Already true (no work needed):**
+- Every frame is persisted per session to `MANTA Sessions/<UUID>/`: RGB
+  (`camera_*.jpg`), lossless metric depth (`depth_*.f32.zlib`), depth
+  confidence (`confidence_*.u8.zlib`), and per-frame intrinsics + world pose
+  (`diagnostics.json`). Sessions are UUID-keyed and timestamped (`createdAt`).
+- Detection reads from these persisted artifacts (`CaptureArtifactFrameProvider`),
+  not the live AR session, so capture and detection/reconstruction are already
+  decoupled and re-runnable on old data.
+
+**To build:**
+- [ ] Add subject identity to `ScanSession`: `subjectID` (+ optional notes /
+      session label). Needed to group "by subject".
+- [ ] Persist the full `ScanSession` (already `Codable`) as `session.json` next
+      to the assets; save on capture/edit. Currently only `diagnostics.json` +
+      raw assets are written, so labels/fiducials/alignment/review state are
+      lost between launches.
+- [ ] Load path: the view model boots `ScanSession.newSession()` every launch —
+      add "open existing session" that rehydrates from `session.json`.
+- [ ] Session library UI: browse subjects → sessions by date/time; open,
+      rename, delete. (Supersedes the "session management" bullet under §6.)
+- [ ] Re-run detection / reconstruction on a loaded session (pipeline already
+      supports it — just wire the action).
+- [ ] Stamp each detection/reconstruction run with a pipeline **version** so
+      reprocessing keeps history instead of silently overwriting; lets you
+      compare an old scan under old vs improved models.
+- [ ] In-app **export session bundle** (zip the folder) for off-device archival
+      and hand-off, so it doesn't require the Xcode container route (§1). Pairs
+      with adding `UIFileSharingEnabled` (already noted in §1).
+- [ ] Storage view + archival policy: raw depth + RGB run tens of MB per
+      session; surface per-subject usage and allow offloading raw frames while
+      keeping results. Keep raw frames whenever possible — they are what makes
+      reprocessing under better models possible.
+
+## 6. Capture UX hardening
 
 - [ ] Guided capture: coverage feedback (which head regions still need
       frames), motion-blur/tracking-quality gating before a frame is sampled,
       auto-sampling cadence instead of manual taps.
-- [ ] Session management: resume, delete, storage budget for artifacts
-      (raw depth + snapshots grow quickly at 256 channels).
 - [ ] Progress/failure UI for the (slow) on-device photogrammetry step;
       consider the open decision of offloading dense reconstruction to a Mac.
 
-## 6. Housekeeping
+## 7. Housekeeping
 
 - [ ] Add a CLAUDE.md / README covering build, test, and device requirements
       (LiDAR-equipped iPad/iPhone Pro, iOS 17+ for Object Capture).
