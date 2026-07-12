@@ -9,6 +9,7 @@
 //
 
 import SwiftUI
+import MANTACore
 #if canImport(UIKit)
 import UIKit
 #endif

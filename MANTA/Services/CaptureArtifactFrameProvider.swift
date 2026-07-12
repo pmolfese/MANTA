@@ -17,11 +17,15 @@ import simd
 import Compression
 import ImageIO
 
-struct CaptureArtifactFrameProvider: DetectionFrameProvider {
+nonisolated struct CaptureArtifactFrameProvider: DetectionFrameProvider {
     let sessionDirectory: URL
 
     init(store: CaptureArtifactStore, session: ScanSession) {
         sessionDirectory = store.rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
+    }
+
+    nonisolated init(sessionDirectory: URL) {
+        self.sessionDirectory = sessionDirectory
     }
 
     func frame(for observation: CaptureObservation) -> DetectionFrame? {
@@ -102,7 +106,7 @@ struct CaptureArtifactFrameProvider: DetectionFrameProvider {
 
 /// Nearest-neighbor metric depth lookup that maps RGB-image pixels into the
 /// lower-resolution depth grid and rejects low-confidence / invalid samples.
-struct DepthGridSampler: DepthSampler {
+nonisolated struct DepthGridSampler: DepthSampler {
     var depth: [Float32]
     var depthWidth: Int
     var depthHeight: Int

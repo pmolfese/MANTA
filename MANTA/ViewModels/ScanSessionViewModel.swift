@@ -26,6 +26,10 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var selectedFormat: ElectrodeExportFormat = .csv
     @Published var exportPreview = ""
     @Published var isDetecting = false
+    @Published var liveDetectionEnabled = true
+    @Published var isLiveDetecting = false
+    @Published var liveElectrodes: [ElectrodeAnnotation] = []
+    @Published var liveDetectionStatus = "Waiting for a saved frame."
     @Published var isAutoSampling = false
     @Published var autoSamplingInterval = 0.75
     @Published var statusMessage = "Ready to start a LiDAR + photogrammetry scan."
@@ -37,6 +41,13 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var exportedBundle: ExportedBundle?
     /// When set, the next tap on the live scan places this fiducial.
     @Published var fiducialPlacementKind: FiducialKind?
+
+    var isGuidedFiducialPlacementActive: Bool { fiducialPlacementKind != nil }
+
+    var fiducialPlacementPrompt: String? {
+        guard let kind = fiducialPlacementKind else { return nil }
+        return "Find the \(kind.rawValue), then tap it in the camera view."
+    }
 
     private var pendingSourceCloud: [SIMD3<Float>] = []
     private var pendingTargetCloud: [SIMD3<Float>] = []
@@ -77,6 +88,42 @@ final class ScanSessionViewModel: ObservableObject {
     private let artifactStore: CaptureArtifactStore?
     private let photogrammetryService: PhotogrammetryReconstructing
     private var autoSamplingTask: Task<Void, Never>?
+    private var liveDetectionTask: Task<Void, Never>?
+    private var pendingLiveObservation: CaptureObservation?
+    private var liveRawDetections: [LabeledDetection] = []
+    private var liveProcessedFrameIDs: [UUID] = []
+    private var liveDetectionStartedAt: Date?
+    private var liveDetectionGeneration = UUID()
+
+    /// Finalized results take precedence; provisional live-only labels and
+    /// template predictions remain visible until finalization resolves them.
+    var visualizedElectrodes: [ElectrodeAnnotation] {
+        var byLabel = Dictionary(uniqueKeysWithValues: liveElectrodes.map { ($0.label, $0) })
+        for electrode in session.electrodes { byLabel[electrode.label] = electrode }
+        return byLabel.values.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+    }
+
+    var liveDirectElectrodeCount: Int {
+        liveElectrodes.filter { $0.confidence > 0 }.count
+    }
+
+    var finalizedDirectElectrodeCount: Int {
+        session.electrodes.filter { $0.confidence > 0 }.count
+    }
+
+    var detectionComparisonMeanDistanceMM: Double? {
+        let live = Dictionary(uniqueKeysWithValues: liveElectrodes
+            .filter { $0.confidence > 0 }.map { ($0.label, $0.coordinate) })
+        let distances = session.electrodes.compactMap { final -> Double? in
+            guard final.confidence > 0, let provisional = live[final.label] else { return nil }
+            let dx = final.coordinate.x - provisional.x
+            let dy = final.coordinate.y - provisional.y
+            let dz = final.coordinate.z - provisional.z
+            return sqrt(dx * dx + dy * dy + dz * dz) * 1000
+        }
+        guard !distances.isEmpty else { return nil }
+        return distances.reduce(0, +) / Double(distances.count)
+    }
 
     var isPhotogrammetrySupported: Bool { photogrammetryService.isSupported }
 
@@ -131,6 +178,8 @@ final class ScanSessionViewModel: ObservableObject {
     /// sessions don't clutter the library.
     func startNewSession(subjectLabel: String? = nil) {
         stopAutoSampling()
+        resetLiveDetection()
+        fiducialPlacementKind = nil
         let layout = availableLayouts.first(where: { $0.name == selectedLayoutName }) ?? session.layout
         var newSession = ScanSession.newSession(layout: layout)
         newSession.subjectLabel = subjectLabel
@@ -148,6 +197,8 @@ final class ScanSessionViewModel: ObservableObject {
         }
         do {
             stopAutoSampling()
+            resetLiveDetection()
+            fiducialPlacementKind = nil
             let loaded = try artifactStore.loadSession(id: id)
             session = loaded
             if availableLayouts.contains(where: { $0.name == loaded.layout.name }) {
@@ -180,7 +231,7 @@ final class ScanSessionViewModel: ObservableObject {
         let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines)
         target.subjectLabel = (trimmed?.isEmpty ?? true) ? nil : trimmed
         target.name = target.displayName
-        try? artifactStore.writeSession(target)
+        _ = try? artifactStore.writeSession(target)
         refreshSessions()
     }
 
@@ -192,19 +243,29 @@ final class ScanSessionViewModel: ObservableObject {
         refreshSessions()
     }
 
-    /// Builds a shareable zip of the session's folder and publishes it so the UI
-    /// can present a share sheet.
+    /// Finalizes an immutable `.manta` snapshot and presents it in the share sheet.
     func exportSession(id: UUID) {
         guard let artifactStore else {
             statusMessage = "Could not access the app Documents folder."
             return
         }
-        if id == session.id { persistSession() }
+        if id == session.id {
+            persistCurrentLiDARMesh()
+            persistSession()
+        }
         statusMessage = "Preparing session bundle…"
         do {
-            let url = try artifactStore.exportSessionBundle(id: id)
-            exportedBundle = ExportedBundle(url: url)
-            statusMessage = "Bundle ready: \(url.lastPathComponent)"
+            let result = try artifactStore.exportSessionBundle(id: id)
+            if id == session.id {
+                session.lastExportedBundleID = result.bundleID
+                try artifactStore.writeSession(session)
+            } else {
+                var exportedSession = try artifactStore.loadSession(id: id)
+                exportedSession.lastExportedBundleID = result.bundleID
+                try artifactStore.writeSession(exportedSession)
+            }
+            exportedBundle = ExportedBundle(url: result.url)
+            statusMessage = "Bundle ready: \(result.url.lastPathComponent)"
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -212,12 +273,13 @@ final class ScanSessionViewModel: ObservableObject {
 
     /// Writes the current session to disk. Called after meaningful mutations.
     private func persistSession() {
-        try? artifactStore?.writeSession(session)
+        _ = try? artifactStore?.writeSession(session)
     }
 
-    func runInitialDetection() async {
+    func finalizeElectrodeDetection() async {
         isDetecting = true
-        statusMessage = "Reading electrode labels from captured frames..."
+        statusMessage = "Finalizing electrode detection across all captured frames..."
+        let startedAt = Date()
 
         let context = DetectionContext(
             layout: session.layout,
@@ -232,8 +294,9 @@ final class ScanSessionViewModel: ObservableObject {
                     ? "No captured frames yet. Start a scan and sample frames, then detect."
                     : "No electrode labels were read. Capture more, closer, sharper frames and retry."
             } else {
-                statusMessage = "Detected \(session.detectedElectrodeCount) electrodes. Review labels and landmarks next."
+                statusMessage = "Finalized \(session.detectedElectrodeCount) electrodes. Review labels and landmarks next."
             }
+            writeFinalDetectionDiagnostics(startedAt: startedAt)
         } catch {
             statusMessage = "Detection failed: \(error.localizedDescription)"
         }
@@ -242,6 +305,20 @@ final class ScanSessionViewModel: ObservableObject {
         refreshExportPreview()
         persistSession()
         refreshSessions()
+    }
+
+    func setLiveDetectionEnabled(_ enabled: Bool) {
+        liveDetectionEnabled = enabled
+        if enabled {
+            liveDetectionStatus = "Waiting for the next saved frame."
+        } else {
+            pendingLiveObservation = nil
+            liveDetectionGeneration = UUID()
+            liveDetectionTask?.cancel()
+            liveDetectionTask = nil
+            isLiveDetecting = false
+            liveDetectionStatus = "Live detection is off."
+        }
     }
 
     /// Frame source for detection: artifact-backed on device, empty otherwise.
@@ -275,6 +352,7 @@ final class ScanSessionViewModel: ObservableObject {
         }
 
         stopAutoSampling()
+        resetLiveDetection()
         selectedLayoutName = name
         session = ScanSession.newSession(layout: layout)
         statusMessage = "Ready to scan with \(layout.name)."
@@ -333,13 +411,11 @@ final class ScanSessionViewModel: ObservableObject {
             }
 
             session.photogrammetryModelFilename = artifactStore.reconstructionModelRelativePath
-            _ = result
+            _ = try artifactStore.writeReconstructionDiagnostics(result.diagnostics, for: session)
 
             // Snapshot the accumulated LiDAR mesh for ICP and persist it alongside the model.
             let meshCloud = scanViewModel.meshWorldPoints()
-            if !meshCloud.isEmpty {
-                session.lidarMeshFilename = try? artifactStore.writeLiDARMesh(meshCloud, for: session)
-            }
+            persistCurrentLiDARMesh()
 
             // Load the reconstructed model's vertices (ICP source) off the main actor.
             let sourceCloud = await Task.detached { ModelPointCloudLoader.load(url: outputURL) }.value
@@ -409,6 +485,23 @@ final class ScanSessionViewModel: ObservableObject {
         }
     }
 
+    /// Enters a guided Nasion -> LPA -> RPA workflow. Frame sampling stops so
+    /// the operator can concentrate on a stable raycast, while AR/LiDAR stays live.
+    func startGuidedFiducialPlacement() {
+        guard scanViewModel.status.isRunning else {
+            statusMessage = "Start the scan before marking fiducials."
+            return
+        }
+        stopAutoSampling()
+        fiducialPlacementKind = FiducialKind.allCases.first
+        statusMessage = fiducialPlacementPrompt ?? "Mark the live fiducials."
+    }
+
+    func cancelGuidedFiducialPlacement() {
+        fiducialPlacementKind = nil
+        statusMessage = "Fiducial placement cancelled. AR tracking is still running."
+    }
+
     /// Handles a tap on the live AR view while a fiducial is armed: ray-casts to
     /// the scanned surface and stores the world-frame landmark.
     func handleScanTap(viewPoint: CGPoint) {
@@ -422,19 +515,92 @@ final class ScanSessionViewModel: ObservableObject {
             session.fiducials[index].coordinate = Coordinate3D(x: Double(world.x), y: Double(world.y), z: Double(world.z))
             session.fiducials[index].state = .reviewed
         }
-        fiducialPlacementKind = nil
         persistSession()
         let placed = session.fiducials.filter { $0.coordinate != nil }.count
-        statusMessage = session.fiducialsReady
-            ? "All fiducials placed — exports now use the head coordinate frame."
-            : "Placed \(kind.rawValue) (\(placed)/3)."
+        let kinds = FiducialKind.allCases
+        if let currentIndex = kinds.firstIndex(of: kind), currentIndex + 1 < kinds.count {
+            fiducialPlacementKind = kinds[currentIndex + 1]
+            statusMessage = "Placed \(kind.rawValue) (\(placed)/3). \(fiducialPlacementPrompt ?? "")"
+        } else {
+            fiducialPlacementKind = nil
+            statusMessage = "All fiducials placed — exports now use the head coordinate frame."
+        }
         refreshExportPreview()
     }
 
     func pauseLiveScan() {
         stopAutoSampling()
+        fiducialPlacementKind = nil
         scanViewModel.pause()
-        statusMessage = "Live scan paused."
+        persistCurrentLiDARMesh()
+        persistSession()
+        let issues = captureReadinessIssues
+        statusMessage = issues.isEmpty
+            ? "Capture paused. Raw capture completeness checks passed."
+            : "Capture paused · \(issues.count) advisory issue(s): \(issues.prefix(2).joined(separator: "; "))."
+    }
+
+    var captureCoverageSectorCount: Int {
+        Set(session.captureObservations.compactMap { $0.quality?.coverageSector }).count
+    }
+
+    var captureReadinessIssues: [String] {
+        var issues = [String]()
+        if session.captureObservations.count < 40 {
+            issues.append("fewer than 40 frames")
+        }
+        if captureCoverageSectorCount < 10 {
+            issues.append("limited view coverage (\(captureCoverageSectorCount) sectors)")
+        }
+        if session.captureMode.usesLiDAR {
+            let withDepth = session.captureObservations.filter { $0.rawDepthFilename != nil }.count
+            if !session.captureObservations.isEmpty,
+               Double(withDepth) / Double(session.captureObservations.count) < 0.8 {
+                issues.append("depth present on less than 80% of frames")
+            }
+            if session.lidarMeshFilename == nil {
+                issues.append("LiDAR mesh has not been persisted")
+            }
+        }
+        let sharpFrames = session.captureObservations.filter {
+            ($0.quality?.warnings.contains("possible-motion-blur") == false)
+        }.count
+        if !session.captureObservations.isEmpty,
+           Double(sharpFrames) / Double(session.captureObservations.count) < 0.7 {
+            issues.append("many frames may be blurred")
+        }
+        if !session.fiducialsReady { issues.append("fiducials are incomplete") }
+        return issues
+    }
+
+    var capturePreflightIssues: [String] {
+        var issues = [String]()
+        if !scanViewModel.status.isSupported { issues.append("AR tracking unsupported") }
+        if scanViewModel.status.isRunning,
+           scanViewModel.status.trackingSummary != "Normal" {
+            issues.append("tracking is not normal")
+        }
+        if session.captureMode.usesLiDAR, scanViewModel.status.isRunning,
+           !scanViewModel.status.hasSceneDepth {
+            issues.append("scene depth is unavailable")
+        }
+        if let bytes = artifactStore?.availableCapacityBytes, bytes < 2_000_000_000 {
+            issues.append("less than 2 GB free storage")
+        }
+        return issues
+    }
+
+    private func sampleStatus(_ observation: CaptureObservation) -> String {
+        let warnings = observation.quality?.warnings ?? []
+        let base = "Auto-saved sample \(session.captureObservations.count) · coverage \(captureCoverageSectorCount)."
+        return warnings.isEmpty ? base : "\(base) Advisory: \(warnings.joined(separator: ", "))."
+    }
+
+    private func persistCurrentLiDARMesh() {
+        guard session.captureMode.usesLiDAR, let artifactStore else { return }
+        let snapshot = scanViewModel.fullMeshSnapshot()
+        guard !snapshot.vertices.isEmpty, !snapshot.triangleIndices.isEmpty else { return }
+        session.lidarMeshFilename = try? artifactStore.writeLiDARMeshSnapshot(snapshot, for: session)
     }
 
     func startAutoSampling() {
@@ -454,7 +620,10 @@ final class ScanSessionViewModel: ObservableObject {
 
         autoSamplingTask?.cancel()
         isAutoSampling = true
-        statusMessage = "Auto-sampling started."
+        let preflight = capturePreflightIssues
+        statusMessage = preflight.isEmpty
+            ? "Auto-sampling started."
+            : "Auto-sampling started with advisory: \(preflight.joined(separator: "; "))."
 
         autoSamplingTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -491,16 +660,159 @@ final class ScanSessionViewModel: ObservableObject {
             }
 
             session.captureObservations.append(observation)
+            enqueueLiveDetection(observation)
             let diagnosticsURL = try artifactStore.writeDiagnostics(for: session, scanStatus: scanViewModel.status)
             diagnosticsPath = diagnosticsURL.path
             persistSession()
             if !isAutoSampling { refreshSessions() }
             statusMessage = isAutoSampling
-                ? "Auto-saved sample \(session.captureObservations.count)."
+                ? sampleStatus(observation)
                 : "Saved sample \(session.captureObservations.count) and diagnostics JSON."
         } catch {
             statusMessage = "Could not save AR sample: \(error.localizedDescription)"
         }
+    }
+
+    private func enqueueLiveDetection(_ observation: CaptureObservation) {
+        guard liveDetectionEnabled,
+              observation.cameraSnapshotFilename != nil,
+              observation.rawDepthFilename != nil else { return }
+        if observation.quality?.warnings.contains("possible-motion-blur") == true {
+            liveDetectionStatus = "Skipped a blurred sample; capture continues."
+            return
+        }
+        if liveDetectionTask != nil {
+            // Coalesce under load: raw capture keeps every sample, while live OCR
+            // catches up using the newest view. Finalization processes them all.
+            pendingLiveObservation = observation
+            liveDetectionStatus = "Live OCR is catching up; newest frame queued."
+            return
+        }
+        processLiveObservation(observation)
+    }
+
+    private func processLiveObservation(_ observation: CaptureObservation) {
+        guard let artifactStore else { return }
+        let sessionSnapshot = session
+        let sessionDirectory = artifactStore.rootDirectory.appendingPathComponent(
+            session.id.uuidString, isDirectory: true)
+        let generation = liveDetectionGeneration
+        if liveDetectionStartedAt == nil { liveDetectionStartedAt = Date() }
+        isLiveDetecting = true
+        liveDetectionStatus = "Reading electrode labels from saved sample \(session.captureObservations.count)…"
+
+        liveDetectionTask = Task { [weak self] in
+            let outcome = await Task.detached(priority: .utility) {
+                do {
+                    return (try LiveElectrodeDetectionWorker.detect(
+                        observation: observation, session: sessionSnapshot,
+                        sessionDirectory: sessionDirectory), nil as String?)
+                } catch {
+                    return ([LabeledDetection](), error.localizedDescription)
+                }
+            }.value
+
+            guard let self, self.liveDetectionGeneration == generation,
+                  self.session.id == sessionSnapshot.id else { return }
+            self.liveDetectionTask = nil
+            self.isLiveDetecting = false
+            if let error = outcome.1 {
+                self.liveDetectionStatus = "Live OCR skipped a frame: \(error)"
+            } else {
+                self.liveRawDetections.append(contentsOf: outcome.0)
+                self.liveProcessedFrameIDs.append(observation.id)
+                self.rebuildLiveElectrodes()
+            }
+
+            if let pending = self.pendingLiveObservation {
+                self.pendingLiveObservation = nil
+                self.processLiveObservation(pending)
+            }
+        }
+    }
+
+    private func rebuildLiveElectrodes() {
+        let fused = ElectrodeObservationAggregator.aggregate(liveRawDetections)
+        let positions = Dictionary(uniqueKeysWithValues: fused.map { ($0.label, $0.position) })
+        let suspects = ElectrodeNeighborValidator.validate(
+            positions: positions, layout: session.layout).suspectLabels
+        let directlyObserved = ElectrodeAnnotationBuilder.build(
+            from: fused, layout: session.layout, confidenceThreshold: 0.55,
+            suspectLabels: suspects)
+        liveElectrodes = ElectrodeTemplateFitter.fillMissing(
+            annotations: directlyObserved, layout: session.layout)
+
+        let directCount = directlyObserved.count
+        let predictedCount = liveElectrodes.count - directCount
+        liveDetectionStatus = predictedCount > 0
+            ? "Live: \(directCount) observed · \(predictedCount) provisional from template."
+            : "Live: \(directCount) labels localized from \(liveProcessedFrameIDs.count) frames."
+        writeLiveDetectionDiagnostics(suspects: suspects, directCount: directCount)
+    }
+
+    private func writeLiveDetectionDiagnostics(suspects: Set<String>, directCount: Int) {
+        guard let artifactStore, let startedAt = liveDetectionStartedAt else { return }
+        let directPositions = Dictionary(uniqueKeysWithValues: liveElectrodes
+            .filter { $0.confidence > 0 }.map {
+                ($0.label, SIMD3<Float>(
+                    Float($0.coordinate.x), Float($0.coordinate.y), Float($0.coordinate.z)))
+            })
+        let templateFit = ElectrodeCapOrientation.estimate(
+            detected: directPositions, layout: session.layout)
+        let diagnostics = DetectionRunDiagnostics(
+            id: session.id,
+            mode: .live,
+            startedAt: startedAt,
+            completedAt: Date(),
+            engine: "manta-vision-ocr-depth",
+            engineVersion: "1",
+            processedFrameIDs: liveProcessedFrameIDs,
+            rawDetectionCount: liveRawDetections.count,
+            directlyLocalizedElectrodeCount: directCount,
+            templatePredictedElectrodeCount: liveElectrodes.filter { $0.confidence == 0 }.count,
+            suspectLabels: suspects.sorted(),
+            templateFitRMSMillimeters: templateFit.map { Double($0.rmsError * 1000) },
+            templateAnchorCount: templateFit?.anchorCount,
+            electrodes: liveElectrodes)
+        _ = try? artifactStore.writeDetectionDiagnostics(diagnostics, for: session)
+    }
+
+    private func writeFinalDetectionDiagnostics(startedAt: Date) {
+        guard let artifactStore else { return }
+        let direct = session.electrodes.filter { $0.confidence > 0 }
+        let positions = Dictionary(uniqueKeysWithValues: direct.map {
+            ($0.label, SIMD3<Float>(Float($0.coordinate.x), Float($0.coordinate.y), Float($0.coordinate.z)))
+        })
+        let suspects = ElectrodeNeighborValidator.validate(
+            positions: positions, layout: session.layout).suspectLabels
+        let templateFit = ElectrodeCapOrientation.estimate(
+            detected: positions, layout: session.layout)
+        let diagnostics = DetectionRunDiagnostics(
+            id: UUID(), mode: .finalized, startedAt: startedAt, completedAt: Date(),
+            engine: "manta-vision-ocr-depth-full-session", engineVersion: "1",
+            processedFrameIDs: session.captureObservations.map(\.id),
+            rawDetectionCount: nil,
+            directlyLocalizedElectrodeCount: direct.count,
+            templatePredictedElectrodeCount: session.electrodes.filter { $0.confidence == 0 }.count,
+            suspectLabels: suspects.sorted(),
+            templateFitRMSMillimeters: templateFit.map { Double($0.rmsError * 1000) },
+            templateAnchorCount: templateFit?.anchorCount,
+            electrodes: session.electrodes)
+        _ = try? artifactStore.writeDetectionDiagnostics(diagnostics, for: session)
+    }
+
+    private func resetLiveDetection() {
+        liveDetectionGeneration = UUID()
+        liveDetectionTask?.cancel()
+        liveDetectionTask = nil
+        pendingLiveObservation = nil
+        liveRawDetections = []
+        liveProcessedFrameIDs = []
+        liveDetectionStartedAt = nil
+        liveElectrodes = []
+        isLiveDetecting = false
+        liveDetectionStatus = liveDetectionEnabled
+            ? "Waiting for a saved frame." : "Live detection is off."
     }
 
     func exportDiagnostics() {

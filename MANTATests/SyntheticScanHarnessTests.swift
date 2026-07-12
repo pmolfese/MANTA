@@ -10,6 +10,7 @@
 //
 
 import Foundation
+import MANTACore
 import Testing
 import simd
 @testable import MANTA
@@ -19,9 +20,7 @@ struct SyntheticScanHarnessTests {
     static let channelCounts = [128, 256]
 
     private func loadLayout(channelCount: Int) throws -> ElectrodeLayout {
-        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("MANTA/Resources/Layouts")
-        let layouts = try HydroCelLayoutLoader(resourceDirectory: url).loadLayouts()
+        let layouts = try HydroCelLayoutLoader().loadLayouts()
         return try #require(layouts.first { $0.channelCount == channelCount })
     }
 

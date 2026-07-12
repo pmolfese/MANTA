@@ -19,7 +19,7 @@
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "handedness": { "enum": ["right", "left"] },
-          "units": { "enum": ["meters", "millimeters"] },
+          "units": { "enum": ["meters", "centimeters", "millimeters"] },
           "description": { "type": "string" }
         },
         "additionalProperties": true
@@ -40,7 +40,8 @@
           "intrinsics": { "type": "array", "minItems": 9, "maxItems": 9, "items": { "type": "number" } },
           "cameraToWorld": { "type": "array", "minItems": 16, "maxItems": 16, "items": { "type": "number" } },
           "worldCoordinateSystem": { "type": "string", "minLength": 1 },
-          "trackingState": { "type": "string", "minLength": 1 }
+          "trackingState": { "type": "string", "minLength": 1 },
+          "quality": { "$ref": "#/$defs/quality" }
         },
         "additionalProperties": true
       }
@@ -55,8 +56,28 @@
         "height": { "type": "integer", "minimum": 1 }
       },
       "additionalProperties": false
+    },
+    "quality": {
+      "type": "object",
+      "required": ["arFrameTimestamp", "worldMappingStatus", "meanLuminance", "darkPixelFraction", "brightPixelFraction", "sharpnessScore", "coverageSector", "warnings"],
+      "properties": {
+        "arFrameTimestamp": { "type": "number" },
+        "worldMappingStatus": { "type": "string", "minLength": 1 },
+        "ambientIntensity": { "type": "number" },
+        "ambientColorTemperature": { "type": "number" },
+        "meanLuminance": { "type": "number", "minimum": 0, "maximum": 1 },
+        "darkPixelFraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "brightPixelFraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "sharpnessScore": { "type": "number", "minimum": 0 },
+        "translationFromPreviousSampleMeters": { "type": "number", "minimum": 0 },
+        "rotationFromPreviousSampleDegrees": { "type": "number", "minimum": 0 },
+        "coverageSector": { "type": "string", "minLength": 1 },
+        "validDepthFraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "highConfidenceDepthFraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true
 }
-

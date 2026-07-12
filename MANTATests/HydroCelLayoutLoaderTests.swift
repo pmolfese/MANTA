@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import MANTACore
 import Testing
 @testable import MANTA
 
@@ -16,6 +17,8 @@ struct HydroCelLayoutLoaderTests {
         let layout = try #require(layouts.first { $0.channelCount == 128 })
 
         #expect(layout.name == "HydroCel GSN 128 1.0")
+        #expect(layout.id == "hydrocel-128")
+        #expect(layout.coordinateSpace == .egiLayoutCentimeters)
         #expect(layout.electrodes.count == 128)
         #expect(layout.referenceSensor == 129)
         #expect(layout.referenceLabel == "VREF")
@@ -34,6 +37,8 @@ struct HydroCelLayoutLoaderTests {
         let layout = try #require(layouts.first { $0.channelCount == 256 })
 
         #expect(layout.name == "HydroCel GSN 256 1.0")
+        #expect(layout.id == "hydrocel-256")
+        #expect(layout.coordinateSpace == .egiLayoutCentimeters)
         #expect(layout.electrodes.count == 256)
         #expect(layout.referenceSensor == 257)
         #expect(layout.referenceLabel == "VREF")
@@ -47,8 +52,6 @@ struct HydroCelLayoutLoaderTests {
     }
 
     private func makeLoader() -> HydroCelLayoutLoader {
-        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("MANTA/Resources/Layouts")
-        return HydroCelLayoutLoader(resourceDirectory: url)
+        HydroCelLayoutLoader()
     }
 }

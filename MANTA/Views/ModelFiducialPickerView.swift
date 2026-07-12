@@ -8,6 +8,7 @@
 //
 
 import SwiftUI
+import MANTACore
 
 struct ModelFiducialPickerView: View {
     @ObservedObject var viewModel: ScanSessionViewModel

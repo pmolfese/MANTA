@@ -1,9 +1,9 @@
 # MANTA Capture Bundle Format
 
-Status: version 1 implementation in progress. `MANTACore` includes initial
-manifest/capture types, JSON Schemas, a minimal fixture, and strict validation
-of an already-extracted logical bundle. Archive extraction and production
-encoding are not yet implemented.
+Status: version 1 implementation in progress. `MANTACore` includes typed
+manifest/capture models, JSON Schemas, deterministic archive finalization,
+hardened archive extraction, a minimal fixture, and strict logical-bundle
+validation.
 
 ## Goals
 
@@ -40,7 +40,12 @@ hashing and compatibility.
 
 The logical bundle is a directory. Transfer form is a ZIP archive with the
 extension `.manta` (a `.manta.zip` compatibility name is acceptable during
-migration). ZIP entries use UTF-8 names and forward slashes.
+migration). ZIP entries use UTF-8 names and forward slashes. Version 1 writers
+use ZIP method 0 (stored): JPEG, PNG, USDZ, and raw depth assets are already
+compressed at their artifact layer, and a single deterministic container method
+keeps readers small and auditable. Readers reject encryption, data descriptors,
+multi-disk archives, ZIP64, and other compression methods until a later format
+version explicitly permits them.
 
 Archive readers must reject:
 
@@ -50,6 +55,13 @@ Archive readers must reject:
   paths.
 - Uncompressed sizes or compression ratios above configured safety limits.
 - A manifest that is not at the archive root.
+
+Extraction is streamed through bounded buffers into a private partial
+directory. The partial directory is deleted on any error and is moved to its
+requested destination only after manifest, size, SHA-256, lineage, and capture
+validation succeeds. Default reader limits are 10,000 entries, 16 GiB archive
+and expanded totals, 8 GiB per entry, and a 200:1 expansion ratio; applications
+may impose tighter limits.
 
 ## Proposed version 1 layout
 
@@ -95,6 +107,15 @@ changes in `log_manta.json`.
 
 Exporting CSV, BESA ELP, MNE SFP, BIDS, EGI electrode-coordinate XML, or another
 terminal format does not create a new MANTA bundle or alter lineage.
+
+The iOS working session writes throttled live OCR/depth output to
+`runs/live-current/run.json`. Each comprehensive **Finalize Electrode Detection**
+pass writes a new immutable run directory keyed by UUID. Run metadata records
+the engine/version, contributing frame IDs, raw/live counts when available,
+directly localized versus template-predicted electrodes, suspect labels,
+template-fit residual, and the complete electrode result. These run files are
+included in export so live, finalized, and future desktop solvers can be
+compared without treating provisional template positions as observations.
 
 ## Manifest
 
@@ -191,6 +212,10 @@ Each observation records:
 - Observation UUID and timestamp.
 - RGB asset path and pixel dimensions.
 - Camera intrinsics as a 3x3 Float64 matrix.
+- Advisory quality evidence: AR frame timestamp, mapping state, light,
+  luminance/clipping, sharpness, pose novelty, coverage sector, valid-depth and
+  high-confidence fractions, and warning codes. Pilot thresholds do not discard
+  raw evidence.
 - Camera-to-world transform as a 4x4 Float64 matrix.
 - Image origin and orientation applied to stored pixels.
 - Optional depth/confidence asset paths and formats.
@@ -259,6 +284,12 @@ The paired artifacts establish:
   provenance. The XML itself has no explicit units field, so the future exporter
   must perform an explicit head-frame millimeter-to-centimeter conversion and
   record units outside the XML where possible.
+- MANTA's MNE-oriented SFP export is always converted to meters. SFP has no
+  embedded unit declaration, so this is an exporter contract rather than a
+  property discoverable from the file itself.
+- BIDS export pairs `electrodes.tsv` with a required `coordsystem.json`; EGI XML
+  is converted to centimeters; BESA ELP contains spherical theta/phi angles and
+  never Cartesian XYZ values.
 
 The reconstructed GeoScan conversion is more than a rigid frame change. Three
 fiducials determine an effectively exact rigid transform. Electrode/reference
@@ -353,12 +384,12 @@ Before schema 1.0.0 is frozen, add:
 3. Add JSON Schemas and hand-authored minimal fixtures.
 4. Implement read-only bundle validation in `MANTACore`.
 5. Implement deterministic metadata encoding and bundle finalization.
-6. Add a legacy importer for the current `session.json` directory/ZIP format.
-7. Switch iOS export to the new bundle while retaining legacy import tests.
-8. Build macOS local-file import and inspection against the same validator.
-9. Add processing runs, reviews, iOS Export/macOS Save As finalization, and
+6. Switch iOS export directly to the new bundle; pre-release working-session
+   formats are intentionally unsupported.
+7. Build macOS local-file import and inspection against the same validator.
+8. Add processing runs, reviews, iOS Export/macOS Save As finalization, and
    lineage UI.
-10. Add authenticated/resumable network transfer after file import is stable.
+9. Add authenticated/resumable network transfer after file import is stable.
 
 ## Decisions still required before 1.0.0
 
