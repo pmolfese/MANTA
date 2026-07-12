@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import MANTACore
 import Testing
 import simd
 @testable import MANTA
@@ -100,6 +101,7 @@ struct HeadCoordinateFrameTests {
         ]
 
         let converted = try #require(HeadCoordinateFrame.apply(to: session))
+        #expect(converted.coordinateSpace == .headRASMillimeters)
 
         // The electrode sits exactly on RPA -> (+halfWidth mm, 0, 0). Ear spacing
         // 0.15 m -> half = 0.075 m -> 75 mm.

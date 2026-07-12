@@ -54,7 +54,28 @@ targets:
 This subdivision is a direction, not a prerequisite for the current models
 migration. Avoid adding targets until a dependency boundary makes one useful.
 
+The current `MANTACore` library now owns the portable solver slice: pinhole
+projection, observation fusion, neighbor validation, cap orientation, template
+fitting, head-RAS conversion, HydroCel XML/metadata parsing, electrode exporters,
+and detection orchestration over recognized text/depth samples. The application
+retains adapters for Vision/CGImage recognition, captured-artifact decoding, and
+Bundle resource discovery; these adapters feed portable values into Core.
+
 ## Coordinate systems and units
+
+MANTA's canonical solved/review coordinate unit is **millimeters**. Units are
+typed and declared at subsystem boundaries rather than imposed globally:
+
+- ARKit world positions, LiDAR depth, and camera geometry remain meters.
+- Fiducial-anchored head RAS coordinates are millimeters.
+- Imported EGI layout priors and `coordinates_mff` XML are centimeters and are
+  converted explicitly when entering a millimeter-based solved/export context.
+- Photogrammetry model coordinates declare their own model frame and metric unit.
+
+`MANTACore` owns `DistanceUnit`, extensible `CoordinateFrameID`, and
+`CoordinateSpace`. Because MANTA is pre-release, persisted models require these
+keys and reject missing or unknown unit/frame metadata. No compatibility shim
+exists for earlier working-session JSON.
 
 Captured detections are stored in the ARKit world frame in meters. The frame is
 arbitrary but internally consistent within a capture because every observation
@@ -108,14 +129,16 @@ included as an observed point in accuracy calculations.
 
 ## Persistence responsibilities
 
-The current `CaptureArtifactStore` mixes session persistence, image/depth
-encoding, reconstruction preparation, and ZIP creation. The intended split is:
+`CaptureArtifactStore` still owns working-session persistence, iOS image/depth
+encoding, and reconstruction preparation. Finalized archive transport has moved
+to `MANTACore`:
 
 - Capture encoders: iOS-only CoreVideo/UIKit conversion.
 - Bundle codec: shared manifest and metadata encoding/decoding.
 - Bundle validator: paths, schema, sizes, hashes, and required relationships.
 - Session repository: application-selected storage and indexing.
-- Archive transport: ZIP import/export without domain decisions.
+- Archive transport: deterministic ZIP export plus hardened, bounded import
+  without application-domain decisions.
 
 An imported macOS bundle should not need to masquerade as an iOS Documents
 folder.

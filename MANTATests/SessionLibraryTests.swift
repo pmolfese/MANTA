@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import MANTACore
 import Testing
 @testable import MANTA
 
@@ -100,18 +101,18 @@ struct SessionLibraryTests {
 
     // MARK: - Export bundle
 
-    @Test func exportBundleProducesZipNamedFromSession() throws {
+    @Test func exportBundleProducesPHIFreeMANTASnapshot() throws {
         let store = try makeStore()
         let s = session(subjectLabel: "Subject B")
         try store.writeSession(s)
 
-        let url = try store.exportSessionBundle(id: s.id)
+        let result = try store.exportSessionBundle(id: s.id)
 
-        #expect(url.pathExtension == "zip")
-        #expect(url.lastPathComponent == "\(s.fileSafeName).zip")
-        let size = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        #expect(result.url.pathExtension == "manta")
+        #expect(!result.url.lastPathComponent.contains("Subject"))
+        let size = (try FileManager.default.attributesOfItem(atPath: result.url.path)[.size] as? Int) ?? 0
         #expect(size > 0)
-        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: result.url.deletingLastPathComponent())
     }
 
     @Test func exportBundleThrowsForMissingSession() throws {
@@ -119,6 +120,48 @@ struct SessionLibraryTests {
         #expect(throws: (any Error).self) {
             try store.exportSessionBundle(id: UUID())
         }
+    }
+
+    @Test func exportBundleCarriesLiveDetectionRunProvenance() throws {
+        let store = try makeStore()
+        let s = session()
+        try store.writeSession(s)
+        let diagnostics = DetectionRunDiagnostics(
+            id: s.id, mode: .live, startedAt: s.createdAt, completedAt: Date(),
+            engine: "test-live-detector", engineVersion: "1",
+            processedFrameIDs: [], rawDetectionCount: 0,
+            directlyLocalizedElectrodeCount: 0, templatePredictedElectrodeCount: 0,
+            suspectLabels: [], templateFitRMSMillimeters: nil,
+            templateAnchorCount: nil, electrodes: [])
+        try store.writeDetectionDiagnostics(diagnostics, for: s)
+
+        let exported = try store.exportSessionBundle(id: s.id)
+        let destination = exported.url.deletingLastPathComponent()
+            .appendingPathComponent("verified-\(UUID().uuidString)", isDirectory: true)
+        _ = try MANTAArchiveImporter().importBundle(at: exported.url, to: destination)
+
+        #expect(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("runs/live-current/run.json").path))
+        try? FileManager.default.removeItem(at: destination)
+        try? FileManager.default.removeItem(at: exported.url.deletingLastPathComponent())
+    }
+
+    @Test func fullLiDARMeshSnapshotPersistsPortablePLYTopology() throws {
+        let store = try makeStore()
+        let s = session(subjectLabel: nil)
+        let snapshot = LiDARMeshSnapshot(
+            vertices: [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0)],
+            triangleIndices: [0, 1, 2])
+
+        let path = try store.writeLiDARMeshSnapshot(snapshot, for: s)
+        let data = try Data(contentsOf: store.rootDirectory
+            .appendingPathComponent(s.id.uuidString).appendingPathComponent(path))
+        let prefix = String(decoding: data.prefix(220), as: UTF8.self)
+
+        #expect(path == "reconstruction/lidar_mesh.ply")
+        #expect(prefix.contains("format binary_little_endian 1.0"))
+        #expect(prefix.contains("element vertex 3"))
+        #expect(prefix.contains("element face 1"))
     }
 
     @Test func renamingPreservesCreatedAtAndTimestamp() {

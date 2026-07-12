@@ -6,14 +6,15 @@
 //
 
 import Foundation
+import MANTACore
 
-protocol ElectrodeDetectionPipeline {
+nonisolated protocol ElectrodeDetectionPipeline {
     func detectElectrodes(in context: DetectionContext) async throws -> [ElectrodeAnnotation]
 }
 
 /// Synthetic detections for previews and workflow development. Ignores the
 /// captured frames and lays electrodes out in rings from the layout definition.
-struct MockElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
+nonisolated struct MockElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
     func detectElectrodes(in context: DetectionContext) async throws -> [ElectrodeAnnotation] {
         context.layout.electrodes.enumerated().map { index, electrodeDefinition in
             let label = electrodeDefinition.label

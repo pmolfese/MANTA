@@ -17,7 +17,7 @@ import Foundation
 import simd
 
 /// One back-projected detection of a labeled electrode in a single frame.
-public struct LabeledDetection: Equatable {
+public struct LabeledDetection: Equatable, Sendable {
     /// Channel label as read from the disk, e.g. "E31" or "31".
     public var label: String
     /// Back-projected position in the ARKit world frame (meters).
@@ -33,7 +33,7 @@ public struct LabeledDetection: Equatable {
 }
 
 /// A fused electrode position with a quality estimate.
-public struct AggregatedElectrode: Equatable {
+public struct AggregatedElectrode: Equatable, Sendable {
     public var label: String
     /// Robust center of the inlier observations, in the ARKit world frame.
     public var position: SIMD3<Float>

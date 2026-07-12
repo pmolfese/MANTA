@@ -43,14 +43,10 @@ struct ContentView: View {
 
 private struct SidebarView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
+    @State private var showExportPreview = false
 
     var body: some View {
         List {
-            Section {
-                Text("MANTA")
-                    .font(.title2.weight(.bold))
-            }
-
             Section("Capture") {
                 Picker("Mode", selection: $viewModel.session.captureMode) {
                     ForEach(CaptureMode.allCases) { mode in
@@ -73,14 +69,38 @@ private struct SidebarView: View {
                     viewModel.selectLayout(named: newValue)
                 }
 
+                Toggle("Live Electrode Detection", isOn: $viewModel.liveDetectionEnabled)
+                    .onChange(of: viewModel.liveDetectionEnabled) { _, enabled in
+                        viewModel.setLiveDetectionEnabled(enabled)
+                    }
+
+                LabeledContent("Live results", value: "\(viewModel.liveDirectElectrodeCount)")
+                Text(viewModel.liveDetectionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Button {
                     Task {
-                        await viewModel.runInitialDetection()
+                        await viewModel.finalizeElectrodeDetection()
                     }
                 } label: {
-                    Label("Detect Electrodes", systemImage: "viewfinder")
+                    Label("Finalize Electrode Detection", systemImage: "viewfinder")
                 }
-                .disabled(viewModel.isDetecting)
+                .disabled(viewModel.isDetecting || viewModel.session.captureObservations.isEmpty)
+            }
+
+            if !viewModel.liveElectrodes.isEmpty || !viewModel.session.electrodes.isEmpty {
+                Section("Detection Comparison") {
+                    LabeledContent("Live localized", value: "\(viewModel.liveDirectElectrodeCount)")
+                    LabeledContent("Finalized localized", value: "\(viewModel.finalizedDirectElectrodeCount)")
+                    if let mean = viewModel.detectionComparisonMeanDistanceMM {
+                        LabeledContent("Mean disagreement", value: String(format: "%.1f mm", mean))
+                    } else {
+                        Text("Finalize detection to compare shared electrode coordinates.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             if viewModel.session.captureMode.usesPhotogrammetry {
@@ -172,6 +192,21 @@ private struct SidebarView: View {
                 .onChange(of: viewModel.selectedFormat) { _, newValue in
                     viewModel.updateFormat(newValue)
                 }
+
+                Button {
+                    showExportPreview.toggle()
+                } label: {
+                    Label(showExportPreview ? "Hide Preview" : "Preview", systemImage: "doc.text.magnifyingglass")
+                }
+
+                if showExportPreview {
+                    ScrollView(.horizontal) {
+                        Text(viewModel.exportPreview.isEmpty ? "Finalize detection to preview an export." : viewModel.exportPreview)
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 180)
+                }
             }
         }
     }
@@ -181,39 +216,62 @@ private struct ScanReviewView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
-    @State private var showExportPreview = false
+    @State private var visualMode: CaptureVisualMode = .split
 
     var body: some View {
         VStack(spacing: 0) {
             ScanHeaderView(
                 viewModel: viewModel,
                 showSidebar: $showSidebar,
-                showLibrary: $showLibrary,
-                showExportPreview: $showExportPreview
+                showLibrary: $showLibrary
             )
 
             Divider()
 
             GeometryReader { geometry in
-                HStack(spacing: 0) {
-                    VStack(spacing: 0) {
-                        LiveScanPanel(viewModel: viewModel)
-                            .frame(height: min(480, geometry.size.height * 0.58))
+                if geometry.size.width > geometry.size.height {
+                    HStack(spacing: 0) {
+                        CaptureVisualTabs(
+                            viewModel: viewModel,
+                            selection: $visualMode,
+                            splitHorizontally: true
+                        )
+                        .frame(width: geometry.size.width * 0.82)
 
                         Divider()
 
-                        DetectionSummaryView(viewModel: viewModel)
+                        CaptureControlRail(
+                            viewModel: viewModel,
+                            scanViewModel: viewModel.scanViewModel
+                        )
+                        .frame(maxWidth: .infinity)
                     }
+                } else {
+                    VStack(spacing: 0) {
+                        CaptureVisualTabs(
+                            viewModel: viewModel,
+                            selection: $visualMode,
+                            splitHorizontally: true
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: geometry.size.height * 0.62)
 
-                    if showExportPreview {
                         Divider()
 
-                        ExportPreviewView(viewModel: viewModel)
-                            .frame(width: min(420, geometry.size.width * 0.4))
-                            .transition(.move(edge: .trailing))
+                        HStack(spacing: 0) {
+                            PortraitReviewTabs(viewModel: viewModel)
+                                .frame(width: geometry.size.width * 0.8)
+
+                            Divider()
+
+                            CompactCaptureControls(
+                                viewModel: viewModel,
+                                scanViewModel: viewModel.scanViewModel
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
                     }
                 }
-                .animation(.easeInOut(duration: 0.22), value: showExportPreview)
             }
         }
         .navigationTitle(viewModel.session.name)
@@ -224,252 +282,174 @@ private struct ScanHeaderView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
-    @Binding var showExportPreview: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Button {
-                    showSidebar.toggle()
-                } label: {
-                    Image(systemName: "sidebar.left")
-                }
-                .buttonStyle(.bordered)
-                .help("Show settings")
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 12) {
+                        Button {
+                            showSidebar.toggle()
+                        } label: {
+                            Image(systemName: "sidebar.left")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Show settings")
 
-                Button {
-                    showLibrary = true
-                } label: {
-                    Label("Subjects", systemImage: "person.crop.rectangle.stack")
-                }
-                .buttonStyle(.bordered)
-                .help("Subject library")
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(viewModel.session.displayName)
-                        .font(.title2.weight(.semibold))
-                    Text(viewModel.statusMessage)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    showExportPreview.toggle()
-                } label: {
-                    Label("Preview", systemImage: "doc.text.magnifyingglass")
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    viewModel.exportDiagnostics()
-                } label: {
-                    Label("Save JSON", systemImage: "doc.badge.gearshape")
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    Task {
-                        await viewModel.runInitialDetection()
+                        Button {
+                            showLibrary = true
+                        } label: {
+                            Label("Subjects", systemImage: "person.crop.rectangle.stack")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Subject library")
                     }
-                } label: {
-                    Label(viewModel.isDetecting ? "Detecting" : "Run Detection", systemImage: "sparkles")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.isDetecting)
-            }
 
-            HStack(spacing: 20) {
-                Text("Electrodes: \(viewModel.session.detectedElectrodeCount)")
-                Text("Reviewed: \(viewModel.session.reviewedElectrodeCount)")
-                Text("Fiducials: \(viewModel.session.fiducialsReady ? "3/3" : "0/3")")
-                Text("AR Samples: \(viewModel.session.captureObservations.count)")
+                    Text(viewModel.session.displayName)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(maxWidth: 230, alignment: .leading)
+                        .padding(.leading, 48)
+                }
+
+                Spacer(minLength: 12)
+
+                VStack(spacing: 6) {
+                    ScanStatusOverlay(viewModel: viewModel)
+                    SessionStatusOverlay(viewModel: viewModel)
+                }
+                .frame(maxWidth: 520)
+                .layoutPriority(1)
             }
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
         }
         .padding()
     }
 }
 
-private struct LiveScanPanel: View {
+private struct SessionStatusOverlay: View {
     @ObservedObject var viewModel: ScanSessionViewModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .bottom) {
-                LiveARScanView(scanViewModel: viewModel.scanViewModel) { point in
-                    viewModel.handleScanTap(viewPoint: point)
-                }
+        HStack(spacing: 6) {
+            StatusPill(
+                title: "Electrodes",
+                value: "\(viewModel.session.detectedElectrodeCount)",
+                systemImage: "point.3.connected.trianglepath.dotted")
+            StatusPill(
+                title: "Live",
+                value: "\(viewModel.liveDirectElectrodeCount)",
+                systemImage: "dot.radiowaves.left.and.right")
+            StatusPill(
+                title: "Reviewed",
+                value: "\(viewModel.session.reviewedElectrodeCount)",
+                systemImage: "checkmark.seal")
+            StatusPill(
+                title: "Fiducials",
+                value: viewModel.session.fiducialsReady ? "3/3" : "0/3",
+                systemImage: "scope")
+            StatusPill(
+                title: "AR Samples",
+                value: "\(viewModel.session.captureObservations.count)",
+                systemImage: "camera")
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
 
-                ScanStatusOverlay(scanViewModel: viewModel.scanViewModel)
+private struct LiveCameraSurface: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            LiveARScanView(scanViewModel: viewModel.scanViewModel) { point in
+                viewModel.handleScanTap(viewPoint: point)
+            }
+
+            if let prompt = viewModel.fiducialPlacementPrompt {
+                Label(prompt, systemImage: "hand.tap.fill")
+                    .font(.headline)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.ultraThickMaterial, in: Capsule())
+                    .foregroundStyle(.orange)
                     .padding(12)
             }
-
-            Divider()
-
-            FiducialControlsView(viewModel: viewModel)
-
-            Divider()
-
-            ScanControlsView(viewModel: viewModel, scanViewModel: viewModel.scanViewModel)
         }
     }
 }
 
-private struct FiducialControlsView: View {
-    @ObservedObject var viewModel: ScanSessionViewModel
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text("Fiducials")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            ForEach(FiducialKind.allCases) { kind in
-                let isPlaced = viewModel.session.fiducials.first { $0.kind == kind }?.coordinate != nil
-                let isArmed = viewModel.fiducialPlacementKind == kind
-
-                Button {
-                    viewModel.armFiducialPlacement(kind)
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: isPlaced ? "checkmark.circle.fill" : "circle")
-                        Text(kind.rawValue)
-                    }
-                    .font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .tint(isArmed ? .orange : (isPlaced ? .green : .secondary))
-            }
-
-            Spacer()
-
-            if viewModel.isExportHeadFramed {
-                Label("Head frame", systemImage: "scale.3d")
-                    .font(.caption2)
-                    .foregroundStyle(.green)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-}
-
-private struct ScanStatusOverlay: View {
-    @ObservedObject var scanViewModel: ARScanViewModel
-
-    private var status: LiveScanStatus {
-        scanViewModel.status
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            StatusPill(title: "Tracking", value: status.trackingSummary, systemImage: "location.viewfinder")
-            StatusPill(title: "Depth", value: status.hasSceneDepth ? "On" : "Waiting", systemImage: "square.3.layers.3d")
-            StatusPill(title: "Mesh", value: "\(status.meshAnchorCount)", systemImage: "cube.transparent")
-            StatusPill(title: "Frames", value: "\(status.frameCount)", systemImage: "camera")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct StatusPill: View {
-    var title: String
-    var value: String
-    var systemImage: String
-
-    var body: some View {
-        Label {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(value)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-            }
-        } icon: {
-            Image(systemName: systemImage)
-                .frame(width: 18)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-private struct ScanControlsView: View {
+private struct CaptureControlRail: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @ObservedObject var scanViewModel: ARScanViewModel
     @State private var showRatePopover = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(scanViewModel.status.message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+        VStack(spacing: 18) {
+            Spacer(minLength: 8)
 
-                Spacer()
-            }
-
-            HStack(spacing: 16) {
-                Button {
-                    viewModel.startLiveScan()
-                } label: {
-                    Label("Start", systemImage: "play.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!scanViewModel.status.isSupported || scanViewModel.status.isRunning)
-
-                Button {
+            RoundCaptureButton(
+                title: scanViewModel.status.isRunning ? "Pause" : "Start",
+                systemImage: scanViewModel.status.isRunning ? "pause.fill" : "play.fill",
+                tint: scanViewModel.status.isRunning ? .orange : .blue
+            ) {
+                if scanViewModel.status.isRunning {
                     viewModel.pauseLiveScan()
-                } label: {
-                    Label("Pause", systemImage: "pause.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!scanViewModel.status.isRunning)
-
-                if viewModel.isAutoSampling {
-                    Button {
-                        viewModel.stopAutoSampling()
-                    } label: {
-                        Label("Stop Auto", systemImage: "stop.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!scanViewModel.status.isSupported)
-                    .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
-                    .popover(isPresented: $showRatePopover) { ratePopover }
                 } else {
-                    Button {
-                        viewModel.startAutoSampling()
-                    } label: {
-                        Label("Auto Sample", systemImage: "camera.metering.matrix")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!scanViewModel.status.isSupported)
-                    .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
-                    .popover(isPresented: $showRatePopover) { ratePopover }
+                    viewModel.startLiveScan()
                 }
-
-                Button {
-                    viewModel.sampleCurrentARFrame()
-                } label: {
-                    Label("Sample Frame", systemImage: "camera.badge.ellipsis")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!scanViewModel.status.isRunning)
             }
+            .disabled(!scanViewModel.status.isSupported)
+
+            RoundCaptureButton(
+                title: viewModel.isAutoSampling ? "Stop Auto" : "Auto Sample",
+                systemImage: viewModel.isAutoSampling ? "stop.fill" : "camera.metering.matrix",
+                tint: viewModel.isAutoSampling ? .red : .blue
+            ) {
+                if viewModel.isAutoSampling {
+                    viewModel.stopAutoSampling()
+                } else {
+                    viewModel.startAutoSampling()
+                }
+            }
+            .disabled(!scanViewModel.status.isSupported || viewModel.isGuidedFiducialPlacementActive)
+            .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
+            .popover(isPresented: $showRatePopover) { ratePopover }
+
+            RoundCaptureButton(
+                title: "Sample Frame",
+                systemImage: "camera.badge.ellipsis",
+                tint: .teal
+            ) {
+                viewModel.sampleCurrentARFrame()
+            }
+            .disabled(!scanViewModel.status.isRunning || viewModel.isGuidedFiducialPlacementActive)
+
+            RoundCaptureButton(
+                title: viewModel.isGuidedFiducialPlacementActive ? "Cancel Marks" : "Mark Fiducials",
+                systemImage: viewModel.isGuidedFiducialPlacementActive ? "xmark" : "scope",
+                tint: viewModel.isGuidedFiducialPlacementActive ? .orange : .purple
+            ) {
+                if viewModel.isGuidedFiducialPlacementActive {
+                    viewModel.cancelGuidedFiducialPlacement()
+                } else {
+                    viewModel.startGuidedFiducialPlacement()
+                }
+            }
+            .disabled(!scanViewModel.status.isRunning)
+
+            Spacer(minLength: 8)
+
+            Text(scanViewModel.status.message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .padding(.horizontal, 8)
         }
-        .padding(12)
+        .padding(.vertical, 8)
+        .background(Color(.secondarySystemBackground))
     }
 
     private var ratePopover: some View {
@@ -489,24 +469,272 @@ private struct ScanControlsView: View {
     }
 }
 
-private struct DetectionSummaryView: View {
+private struct CompactCaptureControls: View {
     @ObservedObject var viewModel: ScanSessionViewModel
+    @ObservedObject var scanViewModel: ARScanViewModel
+    @State private var showRatePopover = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            NetPopulationView(session: viewModel.session)
-                .padding(12)
-                .frame(maxWidth: .infinity)
+        GeometryReader { geometry in
+            let diameter = max(42, min(60, geometry.size.width - 16))
+            VStack(spacing: 6) {
+                Spacer(minLength: 4)
+
+                RoundCaptureButton(
+                    title: scanViewModel.status.isRunning ? "Pause" : "Start",
+                    systemImage: scanViewModel.status.isRunning ? "pause.fill" : "play.fill",
+                    tint: scanViewModel.status.isRunning ? .orange : .blue,
+                    diameter: diameter
+                ) {
+                    if scanViewModel.status.isRunning {
+                        viewModel.pauseLiveScan()
+                    } else {
+                        viewModel.startLiveScan()
+                    }
+                }
+                .disabled(!scanViewModel.status.isSupported)
+
+                RoundCaptureButton(
+                    title: viewModel.isAutoSampling ? "Stop Auto" : "Auto Sample",
+                    systemImage: viewModel.isAutoSampling ? "stop.fill" : "camera.metering.matrix",
+                    tint: viewModel.isAutoSampling ? .red : .blue,
+                    diameter: diameter
+                ) {
+                    if viewModel.isAutoSampling {
+                        viewModel.stopAutoSampling()
+                    } else {
+                        viewModel.startAutoSampling()
+                    }
+                }
+                .disabled(
+                    !scanViewModel.status.isSupported
+                        || viewModel.isGuidedFiducialPlacementActive)
+                .simultaneousGesture(
+                    LongPressGesture().onEnded { _ in showRatePopover = true })
+                .popover(isPresented: $showRatePopover) { ratePopover }
+
+                RoundCaptureButton(
+                    title: "Sample Frame",
+                    systemImage: "camera.badge.ellipsis",
+                    tint: .teal,
+                    diameter: diameter
+                ) {
+                    viewModel.sampleCurrentARFrame()
+                }
+                .disabled(
+                    !scanViewModel.status.isRunning
+                        || viewModel.isGuidedFiducialPlacementActive)
+
+                RoundCaptureButton(
+                    title: viewModel.isGuidedFiducialPlacementActive
+                        ? "Cancel Marks" : "Mark Fiducials",
+                    systemImage: viewModel.isGuidedFiducialPlacementActive ? "xmark" : "scope",
+                    tint: viewModel.isGuidedFiducialPlacementActive ? .orange : .purple,
+                    diameter: diameter
+                ) {
+                    if viewModel.isGuidedFiducialPlacementActive {
+                        viewModel.cancelGuidedFiducialPlacement()
+                    } else {
+                        viewModel.startGuidedFiducialPlacement()
+                    }
+                }
+                .disabled(!scanViewModel.status.isRunning)
+
+                Text(scanViewModel.status.message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .padding(.horizontal, 4)
+
+                Spacer(minLength: 4)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(.secondarySystemBackground))
+    }
+
+    private var ratePopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Auto Sample Rate")
+                .font(.headline)
+            Stepper(
+                "\(viewModel.autoSamplingInterval, specifier: "%.2f")s per sample",
+                value: $viewModel.autoSamplingInterval,
+                in: 0.25...3,
+                step: 0.25
+            )
+        }
+        .padding()
+        .frame(minWidth: 240)
+        .presentationCompactAdaptation(.popover)
+    }
+}
+
+private enum CaptureVisualMode: String, CaseIterable, Identifiable {
+    case camera = "Camera"
+    case model = "Live Model"
+    case split = "Split"
+    var id: String { rawValue }
+}
+
+private struct CaptureVisualTabs: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+    @Binding var selection: CaptureVisualMode
+    var splitHorizontally: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Capture view", selection: $selection) {
+                ForEach(CaptureVisualMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 420)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
 
             Divider()
 
+            switch selection {
+            case .camera:
+                LiveCameraSurface(viewModel: viewModel)
+            case .model:
+                LiveHeadModelView(viewModel: viewModel)
+            case .split:
+                if splitHorizontally {
+                    HStack(spacing: 0) {
+                        LiveCameraSurface(viewModel: viewModel)
+                        Divider()
+                        LiveHeadModelView(viewModel: viewModel)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        LiveCameraSurface(viewModel: viewModel)
+                        Divider()
+                        LiveHeadModelView(viewModel: viewModel)
+                    }
+                }
+            }
+        }
+        .onChange(of: viewModel.isGuidedFiducialPlacementActive) { _, active in
+            if active, selection == .model { selection = .camera }
+        }
+    }
+}
+
+private struct RoundCaptureButton: View {
+    var title: String
+    var systemImage: String
+    var tint: Color
+    var diameter: CGFloat = 88
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: diameter < 72 ? 15 : 22, weight: .semibold))
+                Text(title)
+                    .font(.system(size: diameter < 72 ? 9 : 12, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+            }
+            .foregroundStyle(.white)
+            .frame(width: diameter, height: diameter)
+            .background(tint, in: Circle())
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ScanStatusOverlay: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+
+    private var status: LiveScanStatus {
+        viewModel.scanViewModel.status
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            StatusPill(title: "Tracking", value: status.trackingSummary, systemImage: "location.viewfinder")
+            StatusPill(title: "Depth", value: status.hasSceneDepth ? "On" : "Waiting", systemImage: "square.3.layers.3d")
+            StatusPill(title: "Mesh", value: "\(status.meshAnchorCount)", systemImage: "cube.transparent")
+            StatusPill(title: "Saved", value: "\(viewModel.session.captureObservations.count)", systemImage: "camera")
+            StatusPill(title: "Coverage", value: "\(viewModel.captureCoverageSectorCount)", systemImage: "circle.grid.3x3")
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct StatusPill: View {
+    var title: String
+    var value: String
+    var systemImage: String
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                Text(value)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+                .frame(width: 18)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct PortraitReviewTabs: View {
+    enum ReviewTab: String, CaseIterable, Identifiable {
+        case population = "Net Population"
+        case electrodes = "Electrodes"
+        var id: String { rawValue }
+    }
+
+    @ObservedObject var viewModel: ScanSessionViewModel
+    @State private var selection: ReviewTab = .population
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Review", selection: $selection) {
+                ForEach(ReviewTab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 360)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            switch selection {
+            case .population:
+            NetPopulationView(session: viewModel.session)
+                .padding(10)
+                .frame(maxWidth: .infinity)
+            case .electrodes:
             List {
                 Section("Electrodes") {
                     if viewModel.session.electrodes.isEmpty {
                         ContentUnavailableView(
                             "No detections yet",
                             systemImage: "viewfinder",
-                            description: Text("Run detection to create the first mock triangulation set.")
+                            description: Text("Finalize detection to solve electrodes from the captured frames.")
                         )
                     } else {
                         ForEach(viewModel.session.electrodes) { electrode in
@@ -518,6 +746,7 @@ private struct DetectionSummaryView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            }
         }
     }
 }
@@ -723,34 +952,5 @@ private struct ElectrodeRow: View {
 
     private func coordinate(_ value: Double) -> String {
         String(format: "%.1f", value)
-    }
-}
-
-private struct ExportPreviewView: View {
-    @ObservedObject var viewModel: ScanSessionViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(viewModel.selectedFormat.rawValue)
-                    .font(.headline)
-                Spacer()
-                Label("Preview", systemImage: "doc.text.magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding()
-
-            Divider()
-
-            ScrollView {
-                Text(viewModel.exportPreview.isEmpty ? "Run detection to preview an export." : viewModel.exportPreview)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
-            }
-            .background(Color(.secondarySystemBackground))
-        }
     }
 }

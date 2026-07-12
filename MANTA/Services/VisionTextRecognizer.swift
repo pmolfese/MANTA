@@ -21,7 +21,7 @@ import simd
 #if canImport(Vision)
 import Vision
 
-struct VisionTextRecognizer: TextRecognizing {
+nonisolated struct VisionTextRecognizer: TextRecognizing {
     /// Digits only; disks show numbers (and occasional 10-20 letters we ignore).
     var minimumTextHeight: Float = 0.02
 

@@ -12,6 +12,9 @@ public enum MANTABundleFormat {
     public static let currentSchemaVersion = "1.0.0"
     public static let supportedMajorVersion = 1
     public static let manifestFilename = "manifest.json"
+    public static let manifestSchema = "https://manta.local/schemas/bundle-manifest-1.0.0.json"
+    public static let captureSchema = "https://manta.local/schemas/capture-1.0.0.json"
+    public static let changeLogSchema = "https://manta.local/schemas/change-log-1.0.0.json"
 }
 
 public enum MANTABundleFilename {
@@ -248,10 +251,10 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
 public struct MANTACoordinateSystem: Codable, Equatable, Sendable {
     public var id: String
     public var handedness: String
-    public var units: String
+    public var units: DistanceUnit
     public var description: String
 
-    public init(id: String, handedness: String, units: String, description: String) {
+    public init(id: String, handedness: String, units: DistanceUnit, description: String) {
         self.id = id
         self.handedness = handedness
         self.units = units
@@ -281,6 +284,7 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
     public var worldCoordinateSystem: String
     public var depth: MANTADepthArtifact?
     public var trackingState: String
+    public var quality: CaptureQualityMetrics?
 
     public init(
         id: UUID,
@@ -293,7 +297,8 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         cameraToWorld: [Double],
         worldCoordinateSystem: String = "arkit-world",
         depth: MANTADepthArtifact? = nil,
-        trackingState: String
+        trackingState: String,
+        quality: CaptureQualityMetrics? = nil
     ) {
         self.id = id
         self.capturedAt = capturedAt
@@ -306,6 +311,7 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         self.worldCoordinateSystem = worldCoordinateSystem
         self.depth = depth
         self.trackingState = trackingState
+        self.quality = quality
     }
 }
 
@@ -315,7 +321,7 @@ public struct MANTADepthArtifact: Codable, Equatable, Sendable {
     public var dimensions: MANTAImageDimensions
     public var scalarType: String
     public var byteOrder: String
-    public var units: String
+    public var units: DistanceUnit
     public var layout: String
     public var compression: String
     public var imageMapping: String
@@ -326,7 +332,7 @@ public struct MANTADepthArtifact: Codable, Equatable, Sendable {
         dimensions: MANTAImageDimensions,
         scalarType: String = "float32",
         byteOrder: String = "little-endian",
-        units: String = "meters",
+        units: DistanceUnit = .meters,
         layout: String = "row-major",
         compression: String = "zlib",
         imageMapping: String = "resolution-scale"
@@ -344,6 +350,10 @@ public struct MANTADepthArtifact: Codable, Equatable, Sendable {
 }
 
 public enum MANTAJSON {
+    public static func canonicalData<T: Encodable>(_ value: T) throws -> Data {
+        try makeEncoder().encode(value)
+    }
+
     public static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in

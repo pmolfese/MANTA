@@ -25,7 +25,7 @@
 import Foundation
 import simd
 
-public struct PinholeCamera: Equatable {
+public struct PinholeCamera: Equatable, Sendable {
     /// Focal lengths in pixels.
     public var fx: Float
     public var fy: Float

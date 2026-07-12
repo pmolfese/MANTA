@@ -35,6 +35,16 @@ enum ReconstructionError: LocalizedError {
 struct ReconstructionResult {
     /// Location of the produced model file (USDZ).
     var modelURL: URL
+    var diagnostics: ReconstructionDiagnostics
+}
+
+struct ReconstructionDiagnostics: Codable, Equatable {
+    var inputImageCount: Int
+    var sampleOrdering: String
+    var featureSensitivity: String
+    var requestedDetail: String
+    var skippedSampleIDs: [String]
+    var automaticDownsampling: Bool
 }
 
 /// One captured frame's pose in the ARKit world, persisted next to the input images.
@@ -88,9 +98,12 @@ struct PhotogrammetryReconstructionService: PhotogrammetryReconstructing {
 
         var configuration = PhotogrammetrySession.Configuration()
         configuration.sampleOrdering = .sequential
+        configuration.featureSensitivity = .high
 
         let session = try PhotogrammetrySession(input: imagesDirectory, configuration: configuration)
         let request = PhotogrammetrySession.Request.modelFile(url: outputModelURL, detail: .reduced)
+        var skippedSampleIDs = [String]()
+        var automaticDownsampling = false
 
         try session.process(requests: [request])
 
@@ -99,7 +112,19 @@ struct PhotogrammetryReconstructionService: PhotogrammetryReconstructing {
             case .requestProgress(_, let fraction):
                 progress(fraction)
             case .processingComplete:
-                return ReconstructionResult(modelURL: outputModelURL)
+                return ReconstructionResult(
+                    modelURL: outputModelURL,
+                    diagnostics: ReconstructionDiagnostics(
+                        inputImageCount: images.count,
+                        sampleOrdering: "sequential",
+                        featureSensitivity: "high",
+                        requestedDetail: "reduced",
+                        skippedSampleIDs: skippedSampleIDs,
+                        automaticDownsampling: automaticDownsampling))
+            case .skippedSample(let id):
+                skippedSampleIDs.append(String(describing: id))
+            case .automaticDownsampling:
+                automaticDownsampling = true
             case .requestError(_, let error):
                 throw ReconstructionError.sessionFailed(error.localizedDescription)
             case .processingCancelled:

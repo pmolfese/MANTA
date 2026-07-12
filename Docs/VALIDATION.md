@@ -25,9 +25,12 @@ and exporters. Synthetic generation proves internal consistency but does not
 independently validate ARKit conventions because generation and solving share
 the same camera model.
 
-Add versioned bundle fixtures, schema validation, compatibility migrations,
-binary byte-count tests, hash corruption cases, and hostile archive tests as
-specified in [Capture format](CAPTURE_FORMAT.md).
+Add versioned bundle fixtures, schema validation, binary byte-count tests, hash
+corruption cases, and hostile archive tests as specified in
+[Capture format](CAPTURE_FORMAT.md). Compatibility fixtures begin when a schema
+is actually released; pre-release working-session models are not supported.
+The archive importer is exercised against traversal, normalized/case-colliding
+paths, symlinks, CRC corruption, extraction limits, and cleanup after rejection.
 
 ### Real-capture convention fixture
 
@@ -92,20 +95,36 @@ positions do not count as automatically observed labels.
 
 1. Build the `MANTA` scheme to a LiDAR-equipped iPhone/iPad, not the simulator.
 2. Create a subject/session, select `Both`, and choose the 128 or 256 layout.
-3. Use even lighting and avoid glare; keep printed numbers visibly sharp.
-4. Orbit the head approximately 30–60 cm away, maintaining normal tracking and
-   scene depth. Capture at least 40 well-distributed frames.
-5. If testing fiducials, place nasion, LPA, and RPA in the live scan.
-6. Stop sampling and pause. Reconstruction is optional for OCR/depth testing.
-7. Export the complete session from the Subjects library or copy it from the
-   Files app/Finder file sharing.
-8. Sanitize as required and place an approved fixture under
+3. Confirm adequate free storage, normal tracking, scene depth, even lighting,
+   and a stationary participant before starting auto-sampling.
+4. Collect a horizontal pass around the complete net, followed by a higher
+   counter-direction pass aimed toward the crown. Stay approximately 30–60 cm
+   away, move slowly, and preserve overlapping views.
+5. Capture deliberate sharp views of the frontal/nasion, left temporal/LPA,
+   right temporal/RPA, posterior, and crown/reference regions. Capture at least
+   40 well-distributed frames and over-capture initial pilot sessions.
+6. Watch the live coverage-sector count and quality advisories. Advisories are
+   recorded rather than used as hard rejection thresholds until pilot data can
+   tune them.
+7. Place and review nasion, LPA, and RPA while the participant remains present.
+8. Stop sampling and pause. Pausing persists the complete world-space LiDAR PLY
+   mesh with triangle topology independently of photogrammetry.
+9. Review the participant-release advisories: frame count, coverage, depth,
+   mesh persistence, sharpness, and fiducials. Repeat weak regions before the
+   participant leaves.
+10. Run quick OCR/detection and attempt reconstruction when supported.
+    Reconstruction uses sequential samples and high feature sensitivity and
+    records skipped samples and automatic downsampling. Reconstruction success
+    is not required for raw-capture completeness.
+11. Export `.manta`. Export snapshots the mesh again, finalizes the immutable
+    archive, then immediately re-imports and validates it before sharing.
+12. Sanitize as required and place an approved fixture under
    `Fixtures/RealCaptures/<session-uuid>/`.
 
-Expected legacy artifacts are RGB JPEGs, compressed raw metric depth and
-confidence, `diagnostics.json`, `session.json`, and optional reconstruction
-files. New captures will transition to the versioned format in
-[Capture format](CAPTURE_FORMAT.md).
+Expected `.manta` artifacts include RGB JPEGs, compressed raw metric depth and
+confidence, per-frame quality/coverage metadata, camera poses/intrinsics, the
+full LiDAR PLY mesh when available, and optional reconstruction model, poses,
+and diagnostics. See [Capture format](CAPTURE_FORMAT.md).
 
 ## Export validation
 

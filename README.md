@@ -39,7 +39,8 @@ MANTA.xcodeproj/       iOS project; planned home of the macOS target
 ```
 
 See [Architecture](Docs/ARCHITECTURE.md), [Capture format](Docs/CAPTURE_FORMAT.md),
-[Validation](Docs/VALIDATION.md), and [TODO](Docs/TODO.md).
+[Data privacy](Docs/DATA_PRIVACY.md), [Validation](Docs/VALIDATION.md), and
+[TODO](Docs/TODO.md).
 
 ## Requirements
 

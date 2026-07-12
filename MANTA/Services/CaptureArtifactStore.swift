@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import MANTACore
 import simd
 
 #if canImport(CoreImage) && canImport(UIKit)
@@ -36,6 +37,12 @@ struct CaptureArtifactStore {
         self.fileManager = fileManager
         self.rootDirectory = rootDirectory
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+    }
+
+    var availableCapacityBytes: Int64? {
+        let values = try? rootDirectory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage
     }
 
     func sessionDirectory(for session: ScanSession) throws -> URL {
@@ -92,40 +99,171 @@ struct CaptureArtifactStore {
         }
     }
 
-    /// Zips a session's whole folder (RGB, depth, confidence, diagnostics,
-    /// session.json, reconstruction) into a single archive for off-device
-    /// hand-off/archival. Named from the session's `fileSafeName` (subject +
-    /// timestamp). Returns a URL in the temporary directory.
-    func exportSessionBundle(id: UUID) throws -> URL {
+    /// Finalizes an immutable, validated `.manta` snapshot for off-device hand-off.
+    /// Mutable working-session files are adapted into the public capture contract;
+    /// `session.json` and diagnostics are intentionally not copied into the bundle.
+    func exportSessionBundle(id: UUID) throws -> MANTAStoreExportResult {
         let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
         guard fileManager.fileExists(atPath: directory.path) else {
             throw CaptureArtifactStoreError.sessionNotFound
         }
+        let session = try loadSession(id: id)
+        let finalizedAt = Date()
+        let bundleID = UUID()
+        let capture = makeCaptureDocument(session)
+        let sources = bundleFileSources(session, in: directory)
+        let changes: [MANTAChangeRecord]
+        if session.lastExportedBundleID == nil {
+            changes = []
+        } else {
+            changes = [
+                MANTAChangeRecord(
+                    changedAt: finalizedAt,
+                    category: "session-export",
+                    summary: "Exported a revised capture or processing snapshot.",
+                    targets: ["capture.json"])
+            ]
+        }
+        let request = MANTABundleFinalizationRequest(
+            capture: capture,
+            producer: producerMetadata(),
+            createdAt: session.createdAt,
+            finalizedAt: finalizedAt,
+            bundleID: bundleID,
+            parentBundleID: session.lastExportedBundleID,
+            changes: changes,
+            files: sources)
+        let outputDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("MANTA Exports", isDirectory: true)
+            .appendingPathComponent(bundleID.uuidString, isDirectory: true)
+        let finalized = try MANTABundleFinalizer(fileManager: fileManager).finalize(
+            request, in: outputDirectory)
+        let verificationDirectory = outputDirectory.appendingPathComponent("verified", isDirectory: true)
+        _ = try MANTAArchiveImporter(fileManager: fileManager).importBundle(
+            at: finalized.archiveURL, to: verificationDirectory)
+        try fileManager.removeItem(at: verificationDirectory)
+        return MANTAStoreExportResult(url: finalized.archiveURL, bundleID: bundleID)
+    }
 
-        let baseName = (try? loadSession(id: id))?.fileSafeName ?? id.uuidString
-        let destination = fileManager.temporaryDirectory.appendingPathComponent("\(baseName).zip")
-        try? fileManager.removeItem(at: destination)
+    private func makeCaptureDocument(_ session: ScanSession) -> MANTACaptureDocument {
+        let observations = session.captureObservations.map { observation in
+            let depth: MANTADepthArtifact?
+            if let path = observation.rawDepthFilename, let format = observation.rawDepthFormat {
+                depth = MANTADepthArtifact(
+                    path: path,
+                    confidencePath: observation.rawConfidenceFilename,
+                    dimensions: MANTAImageDimensions(width: format.width, height: format.height),
+                    scalarType: format.scalarType.lowercased(),
+                    byteOrder: format.byteOrder == "littleEndian" ? "little-endian" : format.byteOrder,
+                    units: format.units,
+                    layout: format.layout,
+                    compression: format.compression,
+                    imageMapping: "resolution-scale")
+            } else {
+                depth = nil
+            }
+            return MANTACaptureObservation(
+                id: observation.id,
+                capturedAt: observation.capturedAt,
+                imagePath: observation.cameraSnapshotFilename,
+                imageDimensions: MANTAImageDimensions(
+                    width: observation.imageResolution.width,
+                    height: observation.imageResolution.height),
+                imageOrigin: "top-left",
+                imageOrientation: "up",
+                intrinsics: observation.cameraIntrinsics.map(Double.init),
+                cameraToWorld: observation.cameraTransform.map(Double.init),
+                worldCoordinateSystem: "arkit-world",
+                depth: depth,
+                trackingState: observation.trackingSummary,
+                quality: observation.quality)
+        }
+        let mode: String
+        switch session.captureMode {
+        case .lidar: mode = "lidar"
+        case .photogrammetry: mode = "photogrammetry"
+        case .both: mode = "both"
+        }
+        return MANTACaptureDocument(
+            schema: MANTABundleFormat.captureSchema,
+            sessionID: session.id,
+            captureMode: mode,
+            layoutID: session.layout.id,
+            coordinateSystems: [
+                MANTACoordinateSystem(
+                    id: "arkit-world",
+                    handedness: "right",
+                    units: .meters,
+                    description: "Right-handed ARKit world frame; camera looks down negative Z.")
+            ],
+            observations: observations)
+    }
 
-        // NSFileCoordinator's `.forUploading` produces a zip of the directory in
-        // a system temp location that is reclaimed once the accessor returns, so
-        // copy it out to a stable URL with the name we want.
-        let coordinator = NSFileCoordinator()
-        var coordinationError: NSError?
-        var copyError: Error?
-        coordinator.coordinate(readingItemAt: directory, options: [.forUploading], error: &coordinationError) { zipURL in
-            do {
-                try fileManager.copyItem(at: zipURL, to: destination)
-            } catch {
-                copyError = error
+    private func bundleFileSources(_ session: ScanSession, in directory: URL) -> [MANTABundleFileSource] {
+        var items = [String: (mediaType: String, role: String)]()
+        for observation in session.captureObservations {
+            if let path = observation.cameraSnapshotFilename {
+                items[path] = ("image/jpeg", "camera-image")
+            }
+            if let path = observation.depthSnapshotFilename {
+                items[path] = ("image/png", "depth-preview")
+            }
+            if let path = observation.rawDepthFilename {
+                items[path] = ("application/octet-stream", "metric-depth")
+            }
+            if let path = observation.rawConfidenceFilename {
+                items[path] = ("application/octet-stream", "depth-confidence")
             }
         }
-
-        if let coordinationError { throw coordinationError }
-        if let copyError { throw copyError }
-        guard fileManager.fileExists(atPath: destination.path) else {
-            throw CaptureArtifactStoreError.exportFailed
+        if let path = session.lidarMeshFilename {
+            items[path] = ("application/octet-stream", "lidar-mesh")
         }
-        return destination
+        if let path = session.photogrammetryModelFilename {
+            items[path] = ("model/vnd.usdz+zip", "photogrammetry-model")
+        }
+        for path in ["reconstruction/poses.json", "reconstruction/diagnostics.json"] {
+            if fileManager.fileExists(atPath: directory.appendingPathComponent(path).path) {
+                items[path] = ("application/json", "reconstruction-metadata")
+            }
+        }
+        let runsDirectory = directory.appendingPathComponent("runs", isDirectory: true)
+        if let enumerator = fileManager.enumerator(
+            at: runsDirectory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]) {
+            for case let file as URL in enumerator where file.pathExtension.lowercased() == "json" {
+                let relative = file.path.replacingOccurrences(
+                    of: runsDirectory.path + "/", with: "")
+                items["runs/\(relative)"] =
+                    ("application/json", "electrode-detection-run")
+            }
+        }
+        return items.map { path, metadata in
+            MANTABundleFileSource(
+                path: path,
+                sourceURL: directory.appendingPathComponent(path),
+                mediaType: metadata.mediaType,
+                role: metadata.role)
+        }
+    }
+
+    private func producerMetadata() -> MANTAProducer {
+        let info = Bundle.main.infoDictionary ?? [:]
+        #if canImport(UIKit)
+        let platform = UIDevice.current.userInterfaceIdiom == .pad ? "iPadOS" : "iOS"
+        let operatingSystemVersion = UIDevice.current.systemVersion
+        let deviceModel = UIDevice.current.model
+        #else
+        let platform = "Apple"
+        let operatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let deviceModel = "unknown"
+        #endif
+        return MANTAProducer(
+            application: info["CFBundleDisplayName"] as? String ?? "MANTA",
+            version: info["CFBundleShortVersionString"] as? String ?? "0",
+            build: info["CFBundleVersion"] as? String ?? "0",
+            platform: platform,
+            operatingSystemVersion: operatingSystemVersion,
+            deviceModel: deviceModel)
     }
 
     /// Lightweight summaries of all persisted sessions, newest first. Sorting is
@@ -142,7 +280,7 @@ struct CaptureArtifactStore {
 
         let decoder = JSONDecoder()
         let summaries: [SessionSummary] = entries.compactMap { directory in
-            guard let id = UUID(uuidString: directory.lastPathComponent) else { return nil }
+            guard UUID(uuidString: directory.lastPathComponent) != nil else { return nil }
             let metadata = directory.appendingPathComponent("session.json")
             guard let data = try? Data(contentsOf: metadata),
                   let session = try? decoder.decode(ScanSession.self, from: data) else {
@@ -160,11 +298,47 @@ struct CaptureArtifactStore {
             .appendingPathComponent("reconstruction", isDirectory: true)
     }
 
+    func runsDirectory(for session: ScanSession) -> URL {
+        rootDirectory
+            .appendingPathComponent(session.id.uuidString, isDirectory: true)
+            .appendingPathComponent("runs", isDirectory: true)
+    }
+
+    @discardableResult
+    func writeDetectionDiagnostics(
+        _ diagnostics: DetectionRunDiagnostics, for session: ScanSession
+    ) throws -> URL {
+        let root = runsDirectory(for: session)
+        let directory = root.appendingPathComponent(
+            diagnostics.mode == .live ? "live-current" : diagnostics.id.uuidString,
+            isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("run.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(diagnostics).write(to: url, options: .atomic)
+        return url
+    }
+
     /// Relative path (from the session directory) of the reconstructed model.
     var reconstructionModelRelativePath: String { "reconstruction/model.usdz" }
 
     func reconstructionModelURL(for session: ScanSession) -> URL {
         reconstructionDirectory(for: session).appendingPathComponent("model.usdz")
+    }
+
+    @discardableResult
+    func writeReconstructionDiagnostics(
+        _ diagnostics: ReconstructionDiagnostics, for session: ScanSession
+    ) throws -> URL {
+        let directory = reconstructionDirectory(for: session)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("diagnostics.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(diagnostics).write(to: url, options: .atomic)
+        return url
     }
 
     /// Persists a world-space LiDAR mesh point cloud as little-endian Float32 XYZ triples.
@@ -185,6 +359,44 @@ struct CaptureArtifactStore {
 
         let data = floats.withUnsafeBufferPointer { Data(buffer: $0) }
         let filename = "lidar_mesh.f32"
+        try data.write(to: reconstruction.appendingPathComponent(filename), options: .atomic)
+        return "reconstruction/\(filename)"
+    }
+
+    /// Persists the complete ARKit mesh as binary little-endian PLY so deferred
+    /// solvers retain both world-space vertices and triangle topology.
+    @discardableResult
+    func writeLiDARMeshSnapshot(_ snapshot: LiDARMeshSnapshot, for session: ScanSession) throws -> String {
+        _ = try sessionDirectory(for: session)
+        let reconstruction = reconstructionDirectory(for: session)
+        try fileManager.createDirectory(at: reconstruction, withIntermediateDirectories: true)
+        let faceCount = snapshot.triangleIndices.count / 3
+        let header = """
+            ply
+            format binary_little_endian 1.0
+            comment MANTA ARKit world-space mesh; coordinates are meters
+            element vertex \(snapshot.vertices.count)
+            property float x
+            property float y
+            property float z
+            element face \(faceCount)
+            property list uchar uint vertex_indices
+            end_header
+            """ + "\n"
+        var data = Data(header.utf8)
+        data.reserveCapacity(data.count + snapshot.vertices.count * 12 + faceCount * 13)
+        for vertex in snapshot.vertices {
+            data.appendLittleEndian(vertex.x.bitPattern)
+            data.appendLittleEndian(vertex.y.bitPattern)
+            data.appendLittleEndian(vertex.z.bitPattern)
+        }
+        for face in 0..<faceCount {
+            data.append(3)
+            data.appendLittleEndian(snapshot.triangleIndices[face * 3])
+            data.appendLittleEndian(snapshot.triangleIndices[face * 3 + 1])
+            data.appendLittleEndian(snapshot.triangleIndices[face * 3 + 2])
+        }
+        let filename = "lidar_mesh.ply"
         try data.write(to: reconstruction.appendingPathComponent(filename), options: .atomic)
         return "reconstruction/\(filename)"
     }
@@ -406,7 +618,7 @@ struct CaptureArtifactStore {
             height: height,
             scalarType: "Float32",
             byteOrder: "littleEndian",
-            units: "meters",
+            units: .meters,
             layout: "rowMajorNoPadding",
             compression: "zlib"
         )
@@ -510,6 +722,13 @@ struct CaptureArtifactStore {
     #endif
 }
 
+private extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { append(contentsOf: $0) }
+    }
+}
+
 enum CaptureArtifactStoreError: LocalizedError {
     case imageEncodingFailed
     case depthEncodingFailed
@@ -537,6 +756,11 @@ enum CaptureArtifactStoreError: LocalizedError {
             return "The session bundle could not be created."
         }
     }
+}
+
+struct MANTAStoreExportResult {
+    var url: URL
+    var bundleID: UUID
 }
 
 /// Lightweight, list-friendly view of a persisted session (no observation array).

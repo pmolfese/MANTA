@@ -5,31 +5,37 @@ Last updated: 2026-07-11.
 This file is the prioritized queue. Completed design context lives in
 [Architecture](ARCHITECTURE.md), the proposed interchange contract in
 [Capture format](CAPTURE_FORMAT.md), and the evidence plan in
-[Validation](VALIDATION.md). The repository overview and build instructions are
-in the root [README](../README.md).
+[Validation](VALIDATION.md). Privacy classification and safeguards are in
+[Data privacy](DATA_PRIVACY.md). The repository overview and build instructions
+are in the root [README](../README.md).
 
 ## Now: versioned capture interchange
 
 - [ ] Confirm real-device RGB orientation, camera transform, intrinsics, and
   depth registration conventions before freezing schema 1.0.0.
 - [ ] Resolve the open version-1 decisions listed in `CAPTURE_FORMAT.md`.
-- [~] Define shared coordinate-frame, unit, identifier, and persisted capture
-  types in `MANTACore`; initial manifest/capture types are in place and
-  `LiveScanStatus` remains app-side.
+- [x] Define shared coordinate-frame, unit, identifier, and persisted capture
+  types in `MANTACore`. Solved/head coordinates are canonically millimeters;
+  capture remains meters; EGI layout priors declare centimeters; `LiveScanStatus`
+  remains app-side. Required spatial metadata deliberately has no pre-release
+  legacy decoding fallback.
 - [~] Add JSON Schemas for manifest, capture, subject, layout, run, and review;
   manifest, capture, and change-log schemas are in place.
 - [~] Add minimal 128/256 fixtures plus invalid/corrupt/malicious fixtures;
   the minimal 128 fixture and programmatic corruption cases are in place.
 - [x] Implement read-only logical-directory bundle loading and validation in
-  `MANTACore` (archive extraction remains separate).
+  `MANTACore`.
+- [x] Add bounded `.manta` archive extraction with traversal, collision,
+  symlink, CRC, structural, and resource-limit defenses followed by logical
+  bundle validation.
 - [x] Define immutable snapshot lineage, required `log_manta.json` validation,
   and PHI-free UTC `yyyyMMdd_HHmmss.manta` filenames.
-- [ ] Implement deterministic encoding, hashing, and bundle finalization.
-- [ ] Make iOS **Export** finalize the current working session as `.manta`; keep
+- [x] Implement deterministic encoding, hashing, validation, immutable archive
+  creation, and bundle finalization.
+- [x] Make iOS **Export** finalize the current working session as `.manta`; keep
   the most recently exported bundle ID so subsequent exports form a logged
   lineage without exposing Save As in the iOS UI.
-- [ ] Add a legacy importer for the current `session.json` folder/ZIP format.
-- [ ] Switch iOS export to versioned `.manta` bundles.
+- [x] Switch iOS export to versioned `.manta` bundles.
 - [ ] Add immutable processing-run provenance and separate user reviews.
 
 ## Next: finish the shared core
@@ -37,15 +43,25 @@ in the root [README](../README.md).
 - [x] Create the local `MANTACore` package and wire the application/test targets.
 - [x] Move and test `PinholeCamera` and `ElectrodeObservationAggregator`.
 - [x] Move and test world alignment and point-cloud loading.
-- [ ] Move persisted domain/capture models after the format vocabulary is set.
-- [ ] Move neighbor validation, template fitting, cap orientation, head-frame
-  conversion, layout loading, exporters, and portable detection orchestration.
-- [ ] Separate portable artifact decoding from iOS-only capture encoding and ZIP
-  presentation.
+- [x] Move persisted domain/capture models after the format vocabulary is set;
+  temporary app type aliases keep the source refactor incremental without
+  promising persisted-format compatibility.
+- [x] Move neighbor validation, template fitting, cap orientation, head-frame
+  conversion, layout parsing/loading, portable detection orchestration, and
+  typed SFP/ELP/BIDS/EGI exporters into `MANTACore`. Bundle/resource discovery,
+  Vision, CoreGraphics images, and artifact decoding remain application adapters.
+- [x] Add hardened portable `.manta` archive extraction/import while keeping
+  iOS-only camera and depth encoding in the application target.
 - [ ] Keep ARKit, RealityKit, UIKit, and SwiftUI out of solver targets.
 - [ ] Run `MANTACore` tests in CI on every push.
 
 ## Critical empirical work
+
+- [ ] Before participant use, document and verify encrypted storage, controlled
+  access, approved transfer, backup, retention/deletion, and incident-response
+  controls for raw working sessions and `.manta` bundles.
+- [ ] Treat raw captures as potentially identifiable; do not claim anonymization
+  or de-identification based only on removing names or using PHI-free filenames.
 
 - [ ] Capture and retain an approved real-device convention fixture.
 - [ ] Tune Vision orientation, `minimumTextHeight`, depth confidence, and fusion
@@ -76,9 +92,15 @@ in the root [README](../README.md).
 ## Detection and capture UX
 
 - [ ] Add explicit re-detect/reconstruct actions for loaded sessions.
-- [ ] Guided capture coverage feedback.
-- [ ] Reject blurred frames and poor tracking before sampling.
-- [ ] Add progress, cancellation, and failure UI for reconstruction.
+- [~] Guided capture coverage feedback. Live azimuth/elevation sector counts and
+  participant-release coverage advisories are implemented; a graphical head map
+  awaits real captures.
+- [~] Score blur, exposure, pose novelty, mapping, depth coverage, and confidence
+  for every saved frame. Thresholds are advisory until pilot data are available;
+  hard rejection remains intentionally deferred.
+- [~] Add progress, cancellation, and failure UI for reconstruction. Progress
+  and failures exist; skipped samples, automatic downsampling, ordering,
+  sensitivity, detail, and input count are now persisted.
 - [ ] Add storage usage and archival/offload policy while retaining raw inputs.
 - [ ] Decide whether the subject library opens by default.
 - [ ] Consider affine template fitting only if real-head similarity residuals

@@ -19,7 +19,7 @@
 import Foundation
 import simd
 
-public enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable {
+public enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable, Sendable {
     case icp = "ICP"
     case fiducial = "Fiducial"
     case depthAssisted = "Depth-Assisted"
@@ -39,7 +39,7 @@ public enum WorldAlignmentStrategy: String, CaseIterable, Codable, Identifiable 
 }
 
 /// How ICP is initialized before iterating. Exposed so the different seeds can be compared.
-public enum AlignmentSeed: String, CaseIterable, Codable, Identifiable {
+public enum AlignmentSeed: String, CaseIterable, Codable, Identifiable, Sendable {
     case identity = "None"
     case coarsePCA = "Coarse (PCA)"
     case landmarks = "Source Landmarks"
