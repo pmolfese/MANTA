@@ -1,5 +1,9 @@
 # MANTA
 
+<p align="center">
+  <img src="Docs/Assets/MANTA-Icon.svg" alt="MANTA icon: a manta ray carrying an EEG net" width="240">
+</p>
+
 MANTA is a work-in-progress iPhone and iPad application for capturing EGI
 HydroCel 128- and 256-channel EEG nets with LiDAR and photogrammetry. The goal
 is to locate and label electrodes, anchor them to nasion/LPA/RPA fiducials,
