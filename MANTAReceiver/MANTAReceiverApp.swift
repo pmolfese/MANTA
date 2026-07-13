@@ -20,6 +20,37 @@ final class MANTAReceiverAppDelegate: NSObject, NSApplicationDelegate {
 
         NSApplication.shared.applicationIconImage = icon
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        do {
+            try MANTAReceiverApplicationSupport.removeAll()
+        } catch {
+            NSLog("MANTA Receiver could not clear Application Support: %@", error.localizedDescription)
+        }
+    }
+}
+
+nonisolated enum MANTAReceiverApplicationSupport {
+    static let directoryName = "MANTA Receiver"
+
+    static func removeAll(fileManager: FileManager = .default) throws {
+        let applicationSupport = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false)
+            .standardizedFileURL
+        let receiverDirectory = applicationSupport
+            .appendingPathComponent(directoryName, isDirectory: true)
+            .standardizedFileURL
+
+        // Keep the deletion rigidly scoped to this application's own support
+        // directory. Never remove the shared Application Support directory.
+        guard receiverDirectory.deletingLastPathComponent() == applicationSupport,
+              receiverDirectory.lastPathComponent == directoryName,
+              fileManager.fileExists(atPath: receiverDirectory.path) else { return }
+        try fileManager.removeItem(at: receiverDirectory)
+    }
 }
 
 @main

@@ -159,6 +159,10 @@ private struct BundleInspector: View {
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
+            ReceiverExportView(
+                bundle: bundle,
+                ephemeralReconstruction: store.ephemeralReconstruction)
+                .tabItem { Label("Export", systemImage: "square.and.arrow.up") }
             metadata
                 .tabItem { Label("Metadata", systemImage: "list.bullet.rectangle") }
         }

@@ -26,7 +26,7 @@ struct CombinedModelViewer: View {
     @State private var showFusedDepth = false
     @State private var showAnnotations = true
     @State private var lidarChoice: ReceiverLiDARChoice
-    @State private var lidarStyle = ReceiverLiDARStyle.solid
+    @State private var lidarStyle = ReceiverLiDARStyle.wireframe
     @State private var selection: ReceiverSceneSelection?
     @State private var loadError: String?
     @State private var frameRequest = 0
@@ -924,17 +924,34 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
             for hit: SCNHitTestResult
         ) -> ReceiverSceneSelection.Surface? {
             let category = hit.node.categoryBitMask
+            // SCNView may return a nominal hit for `.point` primitives whose
+            // worldCoordinates are unrelated to the rendered vertex. Never use
+            // that coordinate for a fiducial. Point clouds are handled below by
+            // nearestMetricPoint, which returns an actual stored world vertex.
+            guard isTriangleSurface(hit) else { return nil }
             if category & ReceiverSceneCategory.lidar != 0 {
                 return .lidar
-            }
-            if category & ReceiverSceneCategory.fusedDepth != 0 {
-                return .fusedDepth
             }
             if category & ReceiverSceneCategory.photogrammetry != 0,
                photogrammetryAligned {
                 return .photogrammetry(aligned: true)
             }
             return nil
+        }
+
+        private func isTriangleSurface(_ hit: SCNHitTestResult) -> Bool {
+            guard let geometry = hit.node.geometry,
+                  geometry.elements.indices.contains(hit.geometryIndex) else {
+                return false
+            }
+            switch geometry.elements[hit.geometryIndex].primitiveType {
+            case .triangles, .triangleStrip, .polygon:
+                return true
+            case .line, .point:
+                return false
+            @unknown default:
+                return false
+            }
         }
 
         private func acceptFiducialPlacement(
