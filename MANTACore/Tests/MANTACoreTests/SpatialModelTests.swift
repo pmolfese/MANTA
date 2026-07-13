@@ -20,6 +20,20 @@ struct SpatialModelTests {
         #expect(session.layout.id == "hydrocel-128")
     }
 
+    @Test func headMeshOnlyLayoutExplicitlyDeclaresNoNet() throws {
+        let layout = ElectrodeLayout.headMeshOnly
+        #expect(layout.id == "none")
+        #expect(!layout.hasElectrodeNet)
+        #expect(layout.channelCount == 0)
+        #expect(layout.electrodes.isEmpty)
+        #expect(layout.coordinateSpace == .arkitWorldMeters)
+
+        let session = ScanSession.newSession(layout: layout)
+        let decoded = try JSONDecoder().decode(
+            ScanSession.self, from: JSONEncoder().encode(session))
+        #expect(decoded.layout == layout)
+    }
+
     @Test func sessionJSONWithoutRequiredSpatialKeysIsRejected() throws {
         let encoded = try JSONEncoder().encode(ScanSession.newSession())
         let completeObject = try #require(
@@ -62,6 +76,7 @@ struct SpatialModelTests {
             meanLuminance: 0.5, darkPixelFraction: 0.1, brightPixelFraction: 0.02,
             sharpnessScore: 0.08, translationFromPreviousSampleMeters: 0.04,
             rotationFromPreviousSampleDegrees: 9, coverageSector: "azimuth-3-upper",
+            headCenteredCoverageSector: "azimuth-5-level",
             validDepthFraction: 0.9, highConfidenceDepthFraction: 0.8,
             warnings: ["near-duplicate-view"])
 

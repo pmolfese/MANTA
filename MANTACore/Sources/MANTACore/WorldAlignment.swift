@@ -117,13 +117,19 @@ public enum WorldAlignmentSolver {
 
         case .icp:
             let seed = seedTransform(for: input)
-            // The photogrammetry model's scale is arbitrary relative to the metric LiDAR target,
-            // so ICP estimates scale as it iterates.
+            // PCA and landmark seeds already establish the only defensible metric
+            // scale. Re-estimating similarity scale from changing nearest-neighbor
+            // pairs lets ICP collapse the source around a small target cluster and
+            // report a deceptively low one-way RMS. Keep seeded scale fixed while
+            // ICP refines rotation and translation. The explicit identity/debug
+            // seed retains legacy free-scale behavior because it has no scale cue.
+            let fixedScale = input.seed == .identity ? nil : uniformScale(of: seed)
             return ICP.align(
                 source: input.sourceCloud,
                 target: input.targetCloud,
                 seed: seed,
-                estimateScale: true,
+                estimateScale: fixedScale == nil,
+                fixedScale: fixedScale,
                 maxIterations: input.icpMaxIterations,
                 tolerance: input.icpTolerance
             )
@@ -147,6 +153,15 @@ public enum WorldAlignmentSolver {
                 target: input.targetCloud
             )?.transform ?? matrix_identity_float4x4
         }
+    }
+
+    private static func uniformScale(of transform: simd_float4x4) -> Float {
+        let scales = [
+            simd_length(SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z)),
+            simd_length(SIMD3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z)),
+            simd_length(SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z))
+        ]
+        return scales.reduce(0, +) / 3
     }
 }
 
@@ -388,13 +403,16 @@ enum ICP {
         target: [SIMD3<Float>],
         seed: simd_float4x4,
         estimateScale: Bool = false,
+        fixedScale: Float? = nil,
         maxIterations: Int,
         tolerance: Float
     ) -> WorldAlignmentResult {
         guard source.count >= 3, target.count >= 3 else {
             return WorldAlignmentResult(transform: seed, rmsError: .nan, iterations: 0)
         }
-        let scaleMode: AbsoluteOrientation.ScaleMode = estimateScale ? .estimate : .rigid
+        let scaleMode: AbsoluteOrientation.ScaleMode = fixedScale.map {
+            .fixed($0)
+        } ?? (estimateScale ? .estimate : .rigid)
 
         var transform = seed
         var previousError = Float.greatestFiniteMagnitude

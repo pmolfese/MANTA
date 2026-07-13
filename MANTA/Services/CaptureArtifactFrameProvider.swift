@@ -17,7 +17,7 @@ import simd
 import Compression
 import ImageIO
 
-nonisolated struct CaptureArtifactFrameProvider: DetectionFrameProvider {
+nonisolated struct CaptureArtifactFrameProvider: DetectionFrameProvider, Sendable {
     let sessionDirectory: URL
 
     init(store: CaptureArtifactStore, session: ScanSession) {
@@ -44,6 +44,24 @@ nonisolated struct CaptureArtifactFrameProvider: DetectionFrameProvider {
         )
     }
 
+    /// Loads only the native metric-depth evidence needed by the shared point
+    /// fusion engine. RGB decoding is intentionally skipped for the live preview.
+    func metricDepthPointFrame(
+        for observation: CaptureObservation, frameID: Int
+    ) -> MetricDepthPointFrame? {
+        guard let grid = loadDepthSampler(for: observation) else { return nil }
+        return MetricDepthPointFrame(
+            depthValues: grid.depth,
+            confidenceValues: grid.confidence,
+            depthWidth: grid.depthWidth,
+            depthHeight: grid.depthHeight,
+            imageWidth: grid.imageWidth,
+            imageHeight: grid.imageHeight,
+            intrinsics: observation.cameraIntrinsics,
+            cameraToWorld: observation.cameraTransform,
+            frameID: frameID)
+    }
+
     private func loadImage(relativePath: String) -> CGImage? {
         let url = sessionDirectory.appendingPathComponent(relativePath)
         guard
@@ -55,7 +73,7 @@ nonisolated struct CaptureArtifactFrameProvider: DetectionFrameProvider {
         return image
     }
 
-    private func loadDepthSampler(for observation: CaptureObservation) -> DepthSampler? {
+    private func loadDepthSampler(for observation: CaptureObservation) -> DepthGridSampler? {
         guard
             let depthPath = observation.rawDepthFilename,
             let format = observation.rawDepthFormat,

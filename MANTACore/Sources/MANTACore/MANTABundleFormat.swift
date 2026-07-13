@@ -20,12 +20,19 @@ public enum MANTABundleFormat {
 public enum MANTABundleFilename {
     /// PHI-safe archive name in UTC, for example `20260711_133022.manta`.
     public static func timestamped(for date: Date) -> String {
+        timestamped(for: date, tag: nil)
+    }
+
+    /// Adds a PHI-free semantic tag for paired snapshots such as `raw` and
+    /// `solved`, while preserving the stable timestamp naming convention.
+    public static func timestamped(for date: Date, tag: String?) -> String {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd_HHmmss"
-        return "\(formatter.string(from: date)).manta"
+        let suffix = tag.map { "_\($0)" } ?? ""
+        return "\(formatter.string(from: date))\(suffix).manta"
     }
 }
 
@@ -266,7 +273,11 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
 
 public struct MANTAReconstructionReference: Codable, Equatable, Sendable {
     public var lidarMeshPath: String?
+    public var headCroppedLidarMeshPath: String?
     public var objectCaptureModelPath: String?
+    /// Exact world-space region used for live focus and the derived head mesh.
+    /// The full LiDAR mesh remains available independently.
+    public var headBoundingBox: HeadBoundingBox?
     /// Column-major 4x4 transform from ObjectCapture model coordinates to the
     /// coordinate system identified by `worldCoordinateSystem`.
     public var modelToWorld: [Double]?
@@ -274,12 +285,16 @@ public struct MANTAReconstructionReference: Codable, Equatable, Sendable {
 
     public init(
         lidarMeshPath: String? = nil,
+        headCroppedLidarMeshPath: String? = nil,
         objectCaptureModelPath: String? = nil,
+        headBoundingBox: HeadBoundingBox? = nil,
         modelToWorld: [Double]? = nil,
         worldCoordinateSystem: String = "arkit-world"
     ) {
         self.lidarMeshPath = lidarMeshPath
+        self.headCroppedLidarMeshPath = headCroppedLidarMeshPath
         self.objectCaptureModelPath = objectCaptureModelPath
+        self.headBoundingBox = headBoundingBox
         self.modelToWorld = modelToWorld
         self.worldCoordinateSystem = worldCoordinateSystem
     }
@@ -351,6 +366,10 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
     public var id: UUID
     public var capturedAt: Date
     public var imagePath: String?
+    /// Optional lossless encoding of the same pixels represented by `imagePath`.
+    public var losslessImagePath: String?
+    /// Optional HEIC/JPEG encoding of the same pixels as the primary image.
+    public var compressedImagePath: String?
     public var imageDimensions: MANTAImageDimensions
     public var imageOrigin: String
     public var imageOrientation: String
@@ -365,6 +384,8 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         id: UUID,
         capturedAt: Date,
         imagePath: String? = nil,
+        losslessImagePath: String? = nil,
+        compressedImagePath: String? = nil,
         imageDimensions: MANTAImageDimensions,
         imageOrigin: String = "top-left",
         imageOrientation: String = "up",
@@ -378,6 +399,8 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         self.id = id
         self.capturedAt = capturedAt
         self.imagePath = imagePath
+        self.losslessImagePath = losslessImagePath
+        self.compressedImagePath = compressedImagePath
         self.imageDimensions = imageDimensions
         self.imageOrigin = imageOrigin
         self.imageOrientation = imageOrientation

@@ -14,7 +14,7 @@ macOS receipt, archival storage, offline solvers, and third-party tools. It must
 - Define units, coordinate frames, camera conventions, and file relationships.
 - Detect truncation, corruption, substitution, and incomplete transfers.
 - Support forward-compatible readers and explicit migrations.
-- Preserve multiple processing runs instead of silently overwriting results.
+- Preserve the protected acquisition separately from mutable working results.
 - Remain inspectable with common JSON, XML, image, and binary-data tools.
 
 Bundles can contain PHI and identifiable imagery. Integrity metadata is part of
@@ -38,14 +38,16 @@ hashing and compatibility.
 
 ## Container
 
-The logical bundle is a directory. Transfer form is a ZIP archive with the
+The RAW logical bundle is a directory. Its transfer form is a ZIP archive with the
 extension `.manta` (a `.manta.zip` compatibility name is acceptable during
 migration). ZIP entries use UTF-8 names and forward slashes. Version 1 writers
-use ZIP method 0 (stored): JPEG, PNG, USDZ, and raw depth assets are already
+use ZIP method 0 (stored): HEIC, JPEG, PNG, USDZ, and raw depth assets are already
 compressed at their artifact layer, and a single deterministic container method
 keeps readers small and auditable. Readers reject encryption, data descriptors,
 multi-disk archives, ZIP64, and other compression methods until a later format
-version explicitly permits them.
+version explicitly permits them. A macOS PROCESSED `.manta` is instead a mutable
+directory package: it is not zipped, archive-wide hashed, or passed through RAW
+validation after every edit.
 
 Archive readers must reject:
 
@@ -75,13 +77,16 @@ may impose tighter limits.
 │  ├─ layout.json                  normalized layout snapshot
 │  └─ source/                      optional original EGI XML/metadata
 ├─ assets/
-│  ├─ camera_<observation-uuid>.jpg
+│  ├─ camera_<observation-uuid>.png primary lossless RGB
+│  ├─ camera_<observation-uuid>.heic optional compressed comparison
+│  │                                      (`_compressed.jpg` encoder fallback)
 │  ├─ depth_<observation-uuid>.f32.zlib
 │  ├─ confidence_<observation-uuid>.u8.zlib
 │  └─ depth_<observation-uuid>.png optional preview
 ├─ reconstruction/                optional
 │  ├─ model.usdz
-│  ├─ lidar_mesh.f32
+│  ├─ lidar_mesh.ply              complete raw ARKit environment mesh
+│  ├─ lidar_mesh_head.ply         optional head-bounds crop
 │  └─ poses.json
 ├─ runs/                           optional, repeatable derived results
 │  └─ <run-uuid>/
@@ -92,11 +97,13 @@ may impose tighter limits.
    └─ <review-uuid>.json
 ```
 
-Every finalized `.manta` archive is immutable. Editing, reprocessing, or review
-happens in a working representation. On macOS, persisting those changes requires
-**Save As…** to a new `.manta` snapshot with a new `bundleID`, the same
-`sessionID`, a `parentBundleID`, and a hashed `log_manta.json`. The parent archive
-is never modified.
+MANTA exposes two package roles. **RAW** is the immutable acquisition ZIP and is
+never modified. **PROCESSED** is one editable directory package for that session.
+The first saved reconstruction, review, or solve promotes the Receiver's existing
+extracted RAW workspace into PROCESSED, gives it a stable `bundleID`, and records
+RAW as `parentBundleID`. Later macOS edits atomically replace only the assets or
+JSON they changed and append to `log_manta.json`. PROCESSED is intentionally not
+re-zipped, fully re-hashed, or RAW-validated after each edit.
 
 The iPhone/iPad UI uses **Export**, not Save As. Export finalizes the current
 working session as a new immutable `.manta`, including any newly applied model
@@ -169,32 +176,33 @@ Rules:
 - Readers ignore unknown object properties for minor-version compatibility but
   preserve them when performing a lossless rewrite where practical.
 
-An original capture omits both `parentBundleID` and `content.changeLog`. A
-derived bundle includes both; they must agree with the IDs inside
+An original RAW capture omits both `parentBundleID` and `content.changeLog`. A
+PROCESSED bundle includes both; they must agree with the IDs inside
 `log_manta.json`.
 
-## Immutability and `log_manta.json`
+## RAW immutability, PROCESSED updates, and `log_manta.json`
 
-`log_manta.json` documents the direct transition from one immutable snapshot to
-the next. It contains:
+`log_manta.json` is the cumulative audit trail for PROCESSED. It contains:
 
 - Its own schema version.
-- The new bundle ID and direct parent bundle ID.
+- The stable PROCESSED bundle ID and immutable RAW parent bundle ID.
 - UTC creation time and producing application/build/device.
 - One or more uniquely identified change records.
 - For each change: UTC time, category, human-readable summary, and stable
   targets such as `electrodes/E17`, a processing-run ID, or a review ID.
 
-The manifest lists and hashes the change log like every other content file. A
-derived bundle without a change log, a change log without a parent ID, an empty
-change list, or mismatched lineage IDs is invalid. Following `parentBundleID`
-values reconstructs provenance when earlier snapshots remain available.
+RAW manifests list and hash every protected file. PROCESSED still lists its
+working files for discovery, but modified entries do not carry an integrity
+promise and are not fed back through the RAW validator. A lightweight load checks
+that the package, manifest, capture, and change-log IDs agree. Each update retains
+prior change records and appends the new operation before replacing only the
+changed files.
 
-Bundle filenames are PHI-free UTC timestamps using `yyyyMMdd_HHmmss.manta`, for
-example `20260711_133022.manta`. If a file with the same timestamp already
-exists, the application must ask the user to choose another destination or
-replace explicitly; it must not silently mutate or overwrite an existing
-snapshot.
+Bundle filenames are PHI-free UTC timestamps with semantic roles, normally
+`yyyyMMdd_HHmmss_raw.manta` and `yyyyMMdd_HHmmss_processed.manta`. If a RAW file
+with the same timestamp already exists, the application must ask the user to
+choose another destination or replace explicitly; it must not silently mutate
+or overwrite an existing snapshot.
 
 ## Capture metadata
 
@@ -217,23 +225,60 @@ Each observation records:
   high-confidence fractions, and warning codes. Pilot thresholds do not discard
   raw evidence.
 - Camera-to-world transform as a 4x4 Float64 matrix.
-- Image origin and orientation applied to stored pixels.
+- Image origin and EXIF-style orientation required to display the stored sensor
+  pixels upright.
+- Optional compressed HEIC path associated with the same observation as the
+  primary lossless PNG image. A high-quality JPEG may occupy this role when the
+  platform encoder refuses HEIC.
 - Optional depth/confidence asset paths and formats.
 - Depth dimensions, scalar type, byte order, compression, units, and mapping to
   RGB pixel coordinates.
 - Tracking state and acquisition-quality metrics.
 
-When a reconstruction is present, `capture.json` explicitly relates its LiDAR
-mesh and/or ObjectCapture model to the capture. LiDAR meshes are stored directly
-in the declared ARKit world frame. ObjectCapture models also record a
+When a reconstruction is present, `capture.json` explicitly relates its full
+LiDAR mesh, optional head-bounds crop, and/or ObjectCapture model to the capture.
+Both LiDAR meshes are stored directly in the declared ARKit world frame; the
+full mesh remains the immutable acquisition input and the crop is a reversible
+convenience artifact. `reconstruction.headBoundingBox` records the exact
+world-space center and width/height/depth used to produce that crop so deferred
+depth fusion can apply the same region rather than inferring it from surviving
+triangles. ObjectCapture models also record a
 column-major 4x4 model-to-world transform so desktop viewers can overlay
 fiducials and electrode solutions without assuming the two coordinate frames
 coincide.
+
+Each observation may record both `quality.coverageSector` (the camera optical
+axis direction) and `quality.headCenteredCoverageSector` (the camera position
+around the selected head center). Acquisition-readiness counts use the latter;
+consumers must not treat the two sector definitions as interchangeable.
 
 Matrices are serialized as flat arrays in column-major order for compatibility
 with ARKit and `simd`. Every matrix field also has a schema-defined shape and
 direction; names such as `cameraToWorld` are preferred over ambiguous
 `transform`.
+
+### Fiducial placement evidence
+
+`acquisition/fiducial-placements.json` retains how each fiducial was obtained so
+alternative head-frame solvers can audit it. Each record's **world coordinate**
+(`arkit-world`, meters) is the authoritative landmark; the `hitMethod`,
+`rayOrigin`, and `rayDirection` describe how it was derived (LiDAR mesh raycast
+vs. estimated-plane raycast vs. model-surface pick).
+
+Caveat for consumers: for live-camera placements, the app saves a dedicated
+observation at placement time and links it through `observationID`. Its
+`imagePoint` is still a tap location in **AR-view point space**
+(`pointCoordinateSpace: "ar-view-points"`), not stored image-pixel space.
+Therefore:
+
+- Treat the world coordinate as ground truth for the placement.
+- Use the linked observation as contemporaneous camera evidence, but do **not**
+  reproject `imagePoint` as though it were already a pixel coordinate.
+
+If a future solver needs pixel-exact fiducial correspondence, add a pixel point
+computed from the view's `displayTransform` for the linked frame. The current
+evidence is contemporaneous but intentionally does not pretend view points are
+image pixels.
 
 The version 1 world frame is identified as `arkit-world`, right-handed, in
 meters. The ARKit camera looks along its negative Z axis. Stored RGB pixel
@@ -245,7 +290,13 @@ before freezing schema 1.0.0.
 
 Version 1 retains the existing encodings:
 
-- RGB: JPEG with dimensions and orientation declared in `capture.json`.
+- RGB: lossless PNG is always the primary image. When **Also Save HEIC** is
+  enabled, the same observation also receives a maximum-quality HEIC companion,
+  or a high-quality JPEG if the device encoder refuses HEIC. Dimensions and
+  orientation are declared in `capture.json`; the media type of every image is
+  declared in the manifest. RGB is captured at the highest camera format the
+  device offers; for LiDAR modes the dedicated high-resolution-frame format is
+  deliberately avoided so scene depth stays synchronized to the color frame.
 - Depth: zlib-compressed little-endian IEEE-754 Float32, row-major, meters.
 - Confidence: zlib-compressed UInt8, row-major, using the declared value map.
 - LiDAR mesh: little-endian Float32 XYZ triples in the declared world frame.
@@ -255,6 +306,10 @@ expected count before allocation. Future formats receive new media types and
 must not silently reuse an existing type with different semantics.
 
 ## Layout snapshot
+
+A head-mesh-only acquisition declares `layoutID: "none"`, uses a zero-channel
+layout in the working session, and omits layout reference artifacts. This is an
+explicit acquisition choice rather than an unknown or missing net model.
 
 `layouts/layout.json` is the normalized layout actually used for capture and
 solving, rather than only a reference to whatever layout ships with a later app.

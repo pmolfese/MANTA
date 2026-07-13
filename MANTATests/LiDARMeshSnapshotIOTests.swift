@@ -61,4 +61,20 @@ struct LiDARMeshSnapshotIOTests {
         let point = try #require(hit)
         #expect(abs(point.z) < 1e-4)
     }
+
+    @Test func headBoundsKeepOnlyFullyContainedTriangles() {
+        let snapshot = LiDARMeshSnapshot(
+            vertices: [
+                SIMD3(-0.1, 0, 0), SIMD3(0.1, 0, 0), SIMD3(0, 0.1, 0),
+                SIMD3(1, 0, 0), SIMD3(1.1, 0, 0), SIMD3(1, 0.1, 0)
+            ],
+            triangleIndices: [0, 1, 2, 3, 4, 5])
+        let bounds = HeadBoundingBox(
+            center: .zero, widthMeters: 0.5, heightMeters: 0.5, depthMeters: 0.5)
+
+        let cropped = snapshot.cropped(to: bounds)
+
+        #expect(cropped.vertices.count == 3)
+        #expect(cropped.triangleIndices == [0, 1, 2])
+    }
 }

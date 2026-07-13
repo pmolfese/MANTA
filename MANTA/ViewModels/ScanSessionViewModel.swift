@@ -9,24 +9,30 @@ import Foundation
 import Combine
 import MANTACore
 import simd
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// A prepared export archive, wrapped so SwiftUI can present a share sheet via
 /// `.sheet(item:)`.
 struct ExportedBundle: Identifiable {
     let id = UUID()
-    let url: URL
+    let urls: [URL]
 }
 
 @MainActor
 final class ScanSessionViewModel: ObservableObject {
-    @Published var session = ScanSession.newSession()
-    @Published var availableLayouts: [ElectrodeLayout] = [.fallback128]
-    @Published var selectedLayoutName = ElectrodeLayout.fallback128.name
+    @Published var session = ScanSession.newSession(layout: .headMeshOnly)
+    @Published var availableLayouts: [ElectrodeLayout] = [.headMeshOnly, .fallback128]
+    @Published var selectedLayoutName = ElectrodeLayout.headMeshOnly.name
     @Published var scanViewModel = ARScanViewModel()
     @Published var selectedFormat: ElectrodeExportFormat = .csv
     @Published var exportPreview = ""
     @Published var isDetecting = false
-    @Published var liveDetectionEnabled = true
+    @Published var liveDetectionEnabled = false
+    /// Debug acquisition option used to compare the primary lossless PNG with a
+    /// compressed HEIC/JPEG encoding of the exact same sampled frame.
+    @Published var captureCompressedImageReferences = false
     @Published var isLiveDetecting = false
     @Published var liveElectrodes: [ElectrodeAnnotation] = []
     @Published var liveDetectionStatus = "Waiting for a saved frame."
@@ -39,16 +45,29 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var promptForModelFiducials = false
     @Published var sessionSummaries: [SessionSummary] = []
     @Published var exportedBundle: ExportedBundle?
+    @Published var isExporting = false
+    @Published var exportProgress = 0.0
+    @Published var exportStage = ""
+    @Published var exportStartedAt: Date?
     /// When set, the next tap on the live scan places this fiducial.
     @Published var fiducialPlacementKind: FiducialKind?
     /// When set, the next tap on the 3D head model places this fiducial. This is
     /// the cameras-off path: it works while the session is paused or reopened,
-    /// intersecting the persisted/in-memory LiDAR mesh instead of the live camera.
+    /// intersecting fused depth or the LiDAR mesh instead of the live camera.
     @Published var modelFiducialPlacementKind: FiducialKind?
+    @Published var isHeadBoundsPlacementActive = false
+    /// Starts each new unbounded scan in tap-to-place mode. This can be disabled
+    /// before capture for workflows that intentionally want the full environment.
+    @Published var requestHeadRegionOnScanStart = true
+    /// Incremental high-confidence RGB-D derivative shown in the Live Model tab.
+    /// Raw depth frames remain the authoritative evidence for offline fusion.
+    @Published var liveMetricDepthPointCloud = MetricDepthPointCloudSnapshot()
+    @Published var liveMetricDepthFusionStatus = "Set the head region to build dense depth points."
 
     /// Cached mesh loaded from disk, used when no live anchors are in memory
     /// (e.g. a reopened session). Live anchors always take precedence.
     private var cachedMeshSnapshot: LiDARMeshSnapshot?
+    private let liveMetricDepthFusion = LiveMetricDepthFusion()
 
     var isGuidedFiducialPlacementActive: Bool { fiducialPlacementKind != nil }
     var isModelSurfacePlacementActive: Bool { modelFiducialPlacementKind != nil }
@@ -63,16 +82,27 @@ final class ScanSessionViewModel: ObservableObject {
         return "Tap the \(kind.rawValue) on the head model."
     }
 
+    var scanPlacementPrompt: String? {
+        if isHeadBoundsPlacementActive {
+            return "Tap the center of the visible head to define the LiDAR region."
+        }
+        return fiducialPlacementPrompt
+    }
+
     /// The mesh to display and tap for offline placement: the live in-memory mesh
     /// when scanning, otherwise the mesh persisted for this session.
     func displayMeshSnapshot() -> LiDARMeshSnapshot {
         let live = scanViewModel.fullMeshSnapshot()
-        if !live.vertices.isEmpty { return live }
-        if let cached = cachedMeshSnapshot { return cached }
+        if !live.vertices.isEmpty {
+            return session.headBoundingBox.map { live.cropped(to: $0) } ?? live
+        }
+        if let cached = cachedMeshSnapshot {
+            return session.headBoundingBox.map { cached.cropped(to: $0) } ?? cached
+        }
         if let loaded = artifactStore?.loadLiDARMeshSnapshot(for: session),
            !loaded.vertices.isEmpty {
             cachedMeshSnapshot = loaded
-            return loaded
+            return session.headBoundingBox.map { loaded.cropped(to: $0) } ?? loaded
         }
         return live
     }
@@ -166,6 +196,11 @@ final class ScanSessionViewModel: ObservableObject {
         guard let index = session.modelFiducials.firstIndex(where: { $0.kind == kind }) else { return }
         session.modelFiducials[index].coordinate = Coordinate3D(x: Double(point.x), y: Double(point.y), z: Double(point.z))
         session.modelFiducials[index].state = .reviewed
+        appendFiducialEvidence(FiducialPlacementEvidence(
+            kind: kind, source: "photogrammetry-model", hitMethod: "model-surface-pick",
+            coordinateSystem: "photogrammetry-model",
+            coordinate: Coordinate3D(x: Double(point.x), y: Double(point.y), z: Double(point.z))))
+        persistSession()
     }
 
     init(
@@ -178,20 +213,23 @@ final class ScanSessionViewModel: ObservableObject {
 
         do {
             let layouts = try HydroCelLayoutLoader().loadLayouts()
-            availableLayouts = layouts
-            if let firstLayout = layouts.first {
-                selectedLayoutName = firstLayout.name
-                session = ScanSession.newSession(layout: firstLayout)
-            }
+            availableLayouts = [.headMeshOnly] + layouts
+            selectedLayoutName = ElectrodeLayout.headMeshOnly.name
+            session = ScanSession.newSession(layout: .headMeshOnly)
+            session.acquisitionContext = AcquisitionContext()
         } catch {
-            availableLayouts = [.fallback128]
-            selectedLayoutName = ElectrodeLayout.fallback128.name
-            session = ScanSession.newSession(layout: .fallback128)
-            statusMessage = "Using fallback layout: \(error.localizedDescription)"
+            availableLayouts = [.headMeshOnly, .fallback128]
+            selectedLayoutName = ElectrodeLayout.headMeshOnly.name
+            session = ScanSession.newSession(layout: .headMeshOnly)
+            session.acquisitionContext = AcquisitionContext()
+            statusMessage = "Net layouts unavailable; head-mesh capture is ready: \(error.localizedDescription)"
         }
 
         refreshExportPreview()
         refreshSessions()
+        scanViewModel.eventHandler = { [weak self] event in
+            self?.recordAcquisitionEvent(event)
+        }
     }
 
     // MARK: - Subject library
@@ -209,12 +247,16 @@ final class ScanSessionViewModel: ObservableObject {
         resetLiveDetection()
         fiducialPlacementKind = nil
         modelFiducialPlacementKind = nil
+        isHeadBoundsPlacementActive = false
         cachedMeshSnapshot = nil
         let layout = availableLayouts.first(where: { $0.name == selectedLayoutName }) ?? session.layout
         var newSession = ScanSession.newSession(layout: layout)
         newSession.subjectLabel = subjectLabel
         newSession.name = newSession.displayName
+        newSession.acquisitionContext = AcquisitionContext(
+            netModel: layout.hasElectrodeNet ? layout.name : nil)
         session = newSession
+        resetLiveMetricDepthFusion()
         statusMessage = "New session \(session.displayName)."
         refreshExportPreview()
     }
@@ -230,12 +272,15 @@ final class ScanSessionViewModel: ObservableObject {
             resetLiveDetection()
             fiducialPlacementKind = nil
             modelFiducialPlacementKind = nil
+            isHeadBoundsPlacementActive = false
             cachedMeshSnapshot = nil
             let loaded = try artifactStore.loadSession(id: id)
             session = loaded
+            resetLiveMetricDepthFusion()
             if availableLayouts.contains(where: { $0.name == loaded.layout.name }) {
                 selectedLayoutName = loaded.layout.name
             }
+            liveDetectionEnabled = loaded.layout.hasElectrodeNet
             statusMessage = "Opened \(loaded.displayName)."
             refreshExportPreview()
         } catch {
@@ -287,19 +332,88 @@ final class ScanSessionViewModel: ObservableObject {
         }
         statusMessage = "Preparing session bundle…"
         do {
-            let result = try artifactStore.exportSessionBundle(id: id)
             if id == session.id {
-                session.lastExportedBundleID = result.bundleID
+                recordAcquisitionEvent(AcquisitionEvent(
+                    kind: "export-started", message: "Preparing paired raw and solved snapshots."))
+            }
+            let result = try artifactStore.exportSessionBundles(id: id)
+            if id == session.id {
+                session.lastRawExportedBundleID = result.raw.bundleID
+                session.lastExportedBundleID = result.solved.bundleID
                 try artifactStore.writeSession(session)
             } else {
                 var exportedSession = try artifactStore.loadSession(id: id)
-                exportedSession.lastExportedBundleID = result.bundleID
+                exportedSession.lastRawExportedBundleID = result.raw.bundleID
+                exportedSession.lastExportedBundleID = result.solved.bundleID
                 try artifactStore.writeSession(exportedSession)
             }
-            exportedBundle = ExportedBundle(url: result.url)
-            statusMessage = "Bundle ready: \(result.url.lastPathComponent)"
+            exportedBundle = ExportedBundle(urls: [result.raw.url, result.solved.url])
+            statusMessage = "Raw + solved bundles ready · receipt \(result.receipt.status.rawValue)."
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Seals and shares only immutable acquisition evidence. This is the
+    /// preferred hand-off when processing will happen later on iPad or macOS.
+    func exportRawSession(id: UUID) {
+        guard !isExporting else { return }
+        guard let artifactStore else {
+            statusMessage = "Could not access the app Documents folder."
+            return
+        }
+        if id == session.id {
+            persistCurrentLiDARMesh()
+            persistSession()
+            recordAcquisitionEvent(AcquisitionEvent(
+                kind: "raw-export-started",
+                message: "Preparing a raw acquisition snapshot for deferred solving."))
+        }
+        statusMessage = "Validating and sealing raw acquisition…"
+        let startedAt = Date()
+        isExporting = true
+        exportProgress = 0
+        exportStage = "Preparing acquisition"
+        exportStartedAt = startedAt
+
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try artifactStore.exportRawSessionBundle(id: id) { [weak self] fraction, stage in
+                        Task { @MainActor in
+                            self?.exportProgress = fraction
+                            self?.exportStage = stage
+                        }
+                    }
+                }.value
+                if id == session.id {
+                    session.lastRawExportedBundleID = result.export.bundleID
+                    try artifactStore.writeSession(session)
+                } else {
+                    var exportedSession = try artifactStore.loadSession(id: id)
+                    exportedSession.lastRawExportedBundleID = result.export.bundleID
+                    try artifactStore.writeSession(exportedSession)
+                }
+                exportedBundle = ExportedBundle(urls: [result.export.url])
+                let elapsed = Date().timeIntervalSince(startedAt)
+                statusMessage = String(
+                    format: "Raw bundle ready in %.1f s · receipt %@.",
+                    elapsed, result.receipt.status.rawValue)
+                recordAcquisitionEvent(AcquisitionEvent(
+                    kind: "raw-export-completed", message: "Raw acquisition snapshot is ready.",
+                    details: [
+                        "bundleID": result.export.bundleID.uuidString,
+                        "durationSeconds": String(format: "%.3f", elapsed)
+                    ]))
+            } catch {
+                statusMessage = "Raw export failed: \(error.localizedDescription)"
+                recordAcquisitionEvent(AcquisitionEvent(
+                    kind: "raw-export-failed", message: error.localizedDescription))
+            }
+            isExporting = false
+            exportProgress = 0
+            exportStage = ""
+            exportStartedAt = nil
         }
     }
 
@@ -308,7 +422,44 @@ final class ScanSessionViewModel: ObservableObject {
         _ = try? artifactStore?.writeSession(session)
     }
 
+    func updateAcquisitionContext(_ update: (inout AcquisitionContext) -> Void) {
+        var context = session.acquisitionContext ?? AcquisitionContext(
+            netModel: session.layout.hasElectrodeNet ? session.layout.name : nil)
+        update(&context)
+        session.acquisitionContext = context
+        persistSession()
+        _ = try? artifactStore?.writeAcquisitionContext(for: session)
+    }
+
+    func recordAppLifecycle(_ state: String) {
+        guard scanViewModel.status.isRunning || !session.captureObservations.isEmpty else { return }
+        recordAcquisitionEvent(AcquisitionEvent(
+            kind: "app-lifecycle", message: state))
+    }
+
+    private func recordAcquisitionEvent(_ event: AcquisitionEvent) {
+        guard let artifactStore else { return }
+        var enriched = event
+        enriched.details["captureMode"] = session.captureMode.rawValue
+        enriched.details["sampleCount"] = String(session.captureObservations.count)
+        enriched.details["tracking"] = scanViewModel.status.trackingSummary
+        if let bytes = artifactStore.availableCapacityBytes {
+            enriched.details["availableStorageBytes"] = String(bytes)
+        }
+        enriched.details["thermalState"] = String(ProcessInfo.processInfo.thermalState.rawValue)
+        #if canImport(UIKit)
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        enriched.details["batteryLevel"] = String(UIDevice.current.batteryLevel)
+        enriched.details["batteryState"] = String(UIDevice.current.batteryState.rawValue)
+        #endif
+        _ = try? artifactStore.appendAcquisitionEvent(enriched, for: session)
+    }
+
     func finalizeElectrodeDetection() async {
+        guard session.layout.hasElectrodeNet else {
+            statusMessage = "Select an electrode net before running electrode detection."
+            return
+        }
         isDetecting = true
         statusMessage = "Finalizing electrode detection across all captured frames..."
         let startedAt = Date()
@@ -340,8 +491,8 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     func setLiveDetectionEnabled(_ enabled: Bool) {
-        liveDetectionEnabled = enabled
-        if enabled {
+        liveDetectionEnabled = enabled && session.layout.hasElectrodeNet
+        if liveDetectionEnabled {
             liveDetectionStatus = "Waiting for the next saved frame."
         } else {
             pendingLiveObservation = nil
@@ -387,16 +538,33 @@ final class ScanSessionViewModel: ObservableObject {
         resetLiveDetection()
         fiducialPlacementKind = nil
         modelFiducialPlacementKind = nil
+        isHeadBoundsPlacementActive = false
         cachedMeshSnapshot = nil
         selectedLayoutName = name
         session = ScanSession.newSession(layout: layout)
-        statusMessage = "Ready to scan with \(layout.name)."
+        resetLiveMetricDepthFusion()
+        session.acquisitionContext = AcquisitionContext(
+            netModel: layout.hasElectrodeNet ? layout.name : nil)
+        liveDetectionEnabled = layout.hasElectrodeNet
+        statusMessage = layout.hasElectrodeNet
+            ? "Ready to scan with \(layout.name)."
+            : "Ready for head-mesh capture without an electrode net."
         refreshExportPreview()
     }
 
     func startLiveScan() {
         scanViewModel.start(captureMode: session.captureMode)
-        statusMessage = "Live \(session.captureMode.rawValue) scan running."
+        recordAcquisitionEvent(AcquisitionEvent(
+            kind: "capture-started", message: "AR capture started.",
+            details: ["autoSamplingIntervalSeconds": String(autoSamplingInterval)]))
+        if requestHeadRegionOnScanStart, session.headBoundingBox == nil,
+           session.captureMode.usesLiDAR {
+            fiducialPlacementKind = nil
+            isHeadBoundsPlacementActive = true
+            statusMessage = "Scan started. Tap the center of the visible head to set the capture region."
+        } else {
+            statusMessage = "Live \(session.captureMode.rawValue) scan running."
+        }
     }
 
     func setCaptureMode(_ mode: CaptureMode) {
@@ -446,7 +614,12 @@ final class ScanSessionViewModel: ObservableObject {
             }
 
             session.photogrammetryModelFilename = artifactStore.reconstructionModelRelativePath
-            _ = try artifactStore.writeReconstructionDiagnostics(result.diagnostics, for: session)
+            var reconstructionDiagnostics = result.diagnostics
+            reconstructionDiagnostics.producer = solverProducerMetadata()
+            reconstructionDiagnostics.parameters = [
+                "inputFrameCount": String(prepared.manifest.poses.count)
+            ]
+            _ = try artifactStore.writeReconstructionDiagnostics(reconstructionDiagnostics, for: session)
 
             // Snapshot the accumulated LiDAR mesh for ICP and persist it alongside the model.
             let meshCloud = scanViewModel.meshWorldPoints()
@@ -528,6 +701,7 @@ final class ScanSessionViewModel: ObservableObject {
             return
         }
         stopAutoSampling()
+        isHeadBoundsPlacementActive = false
         fiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.allCases.first
         statusMessage = fiducialPlacementPrompt ?? "Mark the live fiducials."
     }
@@ -540,21 +714,107 @@ final class ScanSessionViewModel: ObservableObject {
     /// Handles a tap on the live AR view while a fiducial is armed: ray-casts to
     /// the scanned surface and stores the world-frame landmark.
     func handleScanTap(viewPoint: CGPoint) {
+        if isHeadBoundsPlacementActive {
+            guard let result = scanViewModel.raycastToWorld(viewPoint: viewPoint) else {
+                statusMessage = "Couldn't hit the head surface there — aim at the head and retry."
+                return
+            }
+            let direction = result.rayDirection.map(simd_normalize) ?? SIMD3<Float>(0, 0, 0)
+            let center = result.point + direction * 0.10
+            let bounds = HeadBoundingBox(center: Coordinate3D(
+                x: Double(center.x), y: Double(center.y), z: Double(center.z)))
+            session.headBoundingBox = bounds
+            isHeadBoundsPlacementActive = false
+            resetLiveMetricDepthFusion()
+            persistSession()
+            recordAcquisitionEvent(AcquisitionEvent(
+                kind: "head-region-set", message: "Head-centered LiDAR boundary defined.",
+                details: [
+                    "centerX": String(bounds.center.x),
+                    "centerY": String(bounds.center.y),
+                    "centerZ": String(bounds.center.z),
+                    "widthMeters": String(bounds.widthMeters),
+                    "heightMeters": String(bounds.heightMeters),
+                    "depthMeters": String(bounds.depthMeters),
+                    "hitMethod": result.hitMethod
+                ]))
+            statusMessage = "Head region set. The live model now hides surrounding geometry."
+            return
+        }
         guard let kind = fiducialPlacementKind else { return }
-        guard let world = scanViewModel.raycastToWorld(viewPoint: viewPoint) else {
+        guard let result = scanViewModel.raycastToWorld(viewPoint: viewPoint) else {
             statusMessage = "Couldn't hit the surface there — aim at the head and retry."
             return
         }
 
-        recordFiducial(kind, world: world)
+        var evidenceObservationID = result.observationID
+        if let artifactStore {
+            do {
+                if let evidence = try scanViewModel.sampleCurrentFrame(
+                    artifactStore: artifactStore, session: session,
+                    includeCompressedImage: captureCompressedImageReferences
+                ) {
+                    session.captureObservations.append(evidence)
+                    evidenceObservationID = evidence.id
+                }
+            } catch {
+                recordAcquisitionEvent(AcquisitionEvent(
+                    kind: "fiducial-evidence-save-failed", message: error.localizedDescription))
+            }
+        }
+
+        recordFiducial(
+            kind, world: result.point, source: "live-camera", hitMethod: result.hitMethod,
+            observationID: evidenceObservationID, imagePoint: viewPoint,
+            rayOrigin: result.rayOrigin, rayDirection: result.rayDirection)
         let placed = session.fiducials.filter { $0.coordinate != nil }.count
         if let next = firstUnplacedFiducialKind() {
             fiducialPlacementKind = next
             statusMessage = "Placed \(kind.rawValue) (\(placed)/3). \(fiducialPlacementPrompt ?? "")"
         } else {
             fiducialPlacementKind = nil
-            statusMessage = "All fiducials placed — exports now use the head coordinate frame."
+            if session.headBoundingBox == nil, let center = fiducialCentroid {
+                session.headBoundingBox = HeadBoundingBox(center: center)
+            }
+            let warnings = fiducialPlausibilityWarnings
+            if warnings.isEmpty {
+                statusMessage = "All fiducials placed — geometry checks passed."
+            } else {
+                statusMessage = "Fiducials need review: \(warnings.joined(separator: "; "))."
+                recordAcquisitionEvent(AcquisitionEvent(
+                    kind: "fiducial-plausibility-warning",
+                    message: warnings.joined(separator: "; ")))
+            }
         }
+        persistSession()
+    }
+
+    func startHeadBoundsPlacement() {
+        guard scanViewModel.status.isRunning else {
+            statusMessage = "Start the scan before setting the head region."
+            return
+        }
+        stopAutoSampling()
+        fiducialPlacementKind = nil
+        isHeadBoundsPlacementActive = true
+        statusMessage = scanPlacementPrompt ?? "Tap the head center."
+    }
+
+    func clearHeadBoundingBox() {
+        isHeadBoundsPlacementActive = false
+        session.headBoundingBox = nil
+        session.headCroppedLidarMeshFilename = nil
+        resetLiveMetricDepthFusion()
+        persistSession()
+        statusMessage = "Showing the full ARKit environment mesh."
+    }
+
+    func updateHeadBoundingBox(_ update: (inout HeadBoundingBox) -> Void) {
+        guard var bounds = session.headBoundingBox else { return }
+        update(&bounds)
+        session.headBoundingBox = bounds
+        resetLiveMetricDepthFusion()
+        persistSession()
     }
 
     // MARK: - Fiducial placement (offline, on the 3D head model)
@@ -562,7 +822,8 @@ final class ScanSessionViewModel: ObservableObject {
     /// Enters the cameras-off placement flow. Intersects the displayed LiDAR mesh,
     /// so it works while the session is paused (patient on a break) or reopened.
     func beginModelSurfacePlacement() {
-        guard !displayMeshSnapshot().vertices.isEmpty else {
+        guard !displayMeshSnapshot().vertices.isEmpty
+                || !liveMetricDepthPointCloud.points.isEmpty else {
             statusMessage = "No head surface yet — scan first, then mark fiducials on the model."
             return
         }
@@ -578,18 +839,26 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     /// Handles a tap on the 3D head model: a world-space ray from the model view's
-    /// virtual camera, intersected against the same mesh the user sees.
+    /// virtual camera, matched to fused depth before falling back to the LiDAR mesh.
     func handleModelSurfaceRay(origin: SIMD3<Float>, direction: SIMD3<Float>) {
         guard let kind = modelFiducialPlacementKind else { return }
         let mesh = displayMeshSnapshot()
-        guard let world = MeshRaycaster.firstHit(
+        let depthHit = liveMetricDepthPointCloud.nearestPoint(
+            toRayOrigin: origin, direction: direction,
+            maximumPerpendicularDistance: 0.010)
+        let meshHit = MeshRaycaster.firstHit(
             origin: origin, direction: direction,
-            vertices: mesh.vertices, triangleIndices: mesh.triangleIndices) else {
+            vertices: mesh.vertices, triangleIndices: mesh.triangleIndices)
+        guard let world = depthHit ?? meshHit else {
             statusMessage = "Tap directly on the head surface to place the \(kind.rawValue)."
             return
         }
 
-        recordFiducial(kind, world: world)
+        recordFiducial(
+            kind, world: world,
+            source: depthHit == nil ? "offline-lidar-model" : "offline-fused-depth-model",
+            hitMethod: depthHit == nil ? "lidar-mesh-raycast" : "fused-depth-ray-proximity",
+            rayOrigin: origin, rayDirection: direction)
         let placed = session.fiducials.filter { $0.coordinate != nil }.count
         if let next = firstUnplacedFiducialKind() {
             modelFiducialPlacementKind = next
@@ -602,14 +871,36 @@ final class ScanSessionViewModel: ObservableObject {
 
     /// Writes a placed fiducial in the ARKit world frame. Shared by the live and
     /// model-surface placement paths so both produce identical, comparable landmarks.
-    private func recordFiducial(_ kind: FiducialKind, world: SIMD3<Float>) {
+    private func recordFiducial(
+        _ kind: FiducialKind, world: SIMD3<Float>, source: String, hitMethod: String,
+        observationID: UUID? = nil, imagePoint: CGPoint? = nil,
+        rayOrigin: SIMD3<Float>? = nil, rayDirection: SIMD3<Float>? = nil
+    ) {
+        let coordinate = Coordinate3D(x: Double(world.x), y: Double(world.y), z: Double(world.z))
         if let index = session.fiducials.firstIndex(where: { $0.kind == kind }) {
-            session.fiducials[index].coordinate = Coordinate3D(
-                x: Double(world.x), y: Double(world.y), z: Double(world.z))
+            session.fiducials[index].coordinate = coordinate
             session.fiducials[index].state = .reviewed
         }
+        appendFiducialEvidence(FiducialPlacementEvidence(
+            kind: kind, source: source, hitMethod: hitMethod,
+            coordinateSystem: "arkit-world", coordinate: coordinate,
+            observationID: observationID,
+            imagePoint: imagePoint.map { Coordinate2D(x: Double($0.x), y: Double($0.y)) },
+            pointCoordinateSpace: imagePoint == nil ? nil : "ar-view-points",
+            rayOrigin: rayOrigin.map { Coordinate3D(x: Double($0.x), y: Double($0.y), z: Double($0.z)) },
+            rayDirection: rayDirection.map { Coordinate3D(x: Double($0.x), y: Double($0.y), z: Double($0.z)) }))
         persistSession()
+        _ = try? artifactStore?.writeFiducialPlacementEvidence(for: session)
         refreshExportPreview()
+    }
+
+    private func appendFiducialEvidence(_ evidence: FiducialPlacementEvidence) {
+        var placements = session.fiducialPlacementEvidence ?? []
+        placements.append(evidence)
+        session.fiducialPlacementEvidence = placements
+        recordAcquisitionEvent(AcquisitionEvent(
+            kind: "fiducial-placed", message: evidence.kind.rawValue,
+            details: ["source": evidence.source, "hitMethod": evidence.hitMethod]))
     }
 
     /// First fiducial kind that still has no coordinate, in canonical order.
@@ -627,13 +918,49 @@ final class ScanSessionViewModel: ObservableObject {
         persistCurrentLiDARMesh()
         persistSession()
         let issues = captureReadinessIssues
+        recordAcquisitionEvent(AcquisitionEvent(
+            kind: "capture-paused", message: "AR capture paused.",
+            details: ["readinessIssues": issues.joined(separator: " | ")]))
         statusMessage = issues.isEmpty
             ? "Capture paused. Raw capture completeness checks passed."
             : "Capture paused · \(issues.count) advisory issue(s): \(issues.prefix(2).joined(separator: "; "))."
     }
 
     var captureCoverageSectorCount: Int {
-        Set(session.captureObservations.compactMap { $0.quality?.coverageSector }).count
+        Set<String>(session.captureObservations.compactMap { observation -> String? in
+            guard observation.quality?.warnings.contains("possible-motion-blur") != true else {
+                return nil
+            }
+            return headCenteredCoverageSector(for: observation)
+        }).count
+    }
+
+    private func headCenteredCoverageSector(for observation: CaptureObservation) -> String? {
+        guard observation.cameraTransform.count == 16 else { return nil }
+        guard let center = session.headBoundingBox?.center ?? fiducialCentroid else {
+            return observation.quality?.coverageSector
+        }
+        let offset = SIMD3<Double>(
+            Double(observation.cameraTransform[12]) - center.x,
+            Double(observation.cameraTransform[13]) - center.y,
+            Double(observation.cameraTransform[14]) - center.z)
+        let distance = simd_length(offset)
+        guard distance > 0.01 else { return nil }
+        var azimuth = atan2(offset.x, -offset.z) * 180 / .pi
+        if azimuth < 0 { azimuth += 360 }
+        let azimuthBin = Int((azimuth + 22.5) / 45) % 8
+        let elevation = asin(max(-1, min(1, offset.y / distance))) * 180 / .pi
+        let elevationBin = elevation > 20 ? "upper" : elevation < -20 ? "lower" : "level"
+        return "azimuth-\(azimuthBin)-\(elevationBin)"
+    }
+
+    private var fiducialCentroid: Coordinate3D? {
+        let coordinates = session.fiducials.compactMap(\.coordinate)
+        guard coordinates.count == 3 else { return nil }
+        return Coordinate3D(
+            x: coordinates.map(\.x).reduce(0, +) / 3,
+            y: coordinates.map(\.y).reduce(0, +) / 3,
+            z: coordinates.map(\.z).reduce(0, +) / 3)
     }
 
     var captureReadinessIssues: [String] {
@@ -661,8 +988,40 @@ final class ScanSessionViewModel: ObservableObject {
            Double(sharpFrames) / Double(session.captureObservations.count) < 0.7 {
             issues.append("many frames may be blurred")
         }
-        if !session.fiducialsReady { issues.append("fiducials are incomplete") }
+        if session.layout.hasElectrodeNet, !session.fiducialsReady {
+            issues.append("fiducials are incomplete")
+        }
+        issues.append(contentsOf: fiducialPlausibilityWarnings)
         return issues
+    }
+
+    var fiducialPlausibilityWarnings: [String] {
+        guard let nasion = session.fiducials.first(where: { $0.kind == .nasion })?.coordinate,
+              let left = session.fiducials.first(where: { $0.kind == .leftPreauricular })?.coordinate,
+              let right = session.fiducials.first(where: { $0.kind == .rightPreauricular })?.coordinate
+        else { return [] }
+        func distance(_ a: Coordinate3D, _ b: Coordinate3D) -> Double {
+            sqrt(pow(a.x - b.x, 2) + pow(a.y - b.y, 2) + pow(a.z - b.z, 2))
+        }
+        let earSpan = distance(left, right)
+        let leftNasion = distance(nasion, left)
+        let rightNasion = distance(nasion, right)
+        var warnings = [String]()
+        if !(0.10...0.24).contains(earSpan) {
+            warnings.append(String(format: "implausible LPA–RPA distance (%.0f mm)", earSpan * 1000))
+        }
+        if !(0.10...0.27).contains(leftNasion) {
+            warnings.append(String(format: "implausible nasion–LPA distance (%.0f mm)", leftNasion * 1000))
+        }
+        if !(0.10...0.27).contains(rightNasion) {
+            warnings.append(String(format: "implausible nasion–RPA distance (%.0f mm)", rightNasion * 1000))
+        }
+        if abs(leftNasion - rightNasion) > 0.06 {
+            warnings.append(String(
+                format: "left/right nasion distances differ by %.0f mm",
+                abs(leftNasion - rightNasion) * 1000))
+        }
+        return warnings
     }
 
     var capturePreflightIssues: [String] {
@@ -690,9 +1049,29 @@ final class ScanSessionViewModel: ObservableObject {
 
     private func persistCurrentLiDARMesh() {
         guard session.captureMode.usesLiDAR, let artifactStore else { return }
-        let snapshot = scanViewModel.fullMeshSnapshot()
-        guard !snapshot.vertices.isEmpty, !snapshot.triangleIndices.isEmpty else { return }
-        session.lidarMeshFilename = try? artifactStore.writeLiDARMeshSnapshot(snapshot, for: session)
+        let liveSnapshot = scanViewModel.fullMeshSnapshot()
+        let hasLiveMesh = !liveSnapshot.vertices.isEmpty && !liveSnapshot.triangleIndices.isEmpty
+        if hasLiveMesh {
+            session.lidarMeshFilename = try? artifactStore.writeLiDARMeshSnapshot(
+                liveSnapshot, for: session)
+            cachedMeshSnapshot = liveSnapshot
+        }
+
+        guard let source = hasLiveMesh
+                ? liveSnapshot
+                : cachedMeshSnapshot ?? artifactStore.loadLiDARMeshSnapshot(for: session),
+              !source.vertices.isEmpty, !source.triangleIndices.isEmpty else { return }
+
+        // Regenerate this convenience artifact from the immutable full mesh so a
+        // changed box can never leave a stale head crop referenced by the session.
+        session.headCroppedLidarMeshFilename = nil
+        if let bounds = session.headBoundingBox {
+            let cropped = source.cropped(to: bounds)
+            if !cropped.vertices.isEmpty, !cropped.triangleIndices.isEmpty {
+                session.headCroppedLidarMeshFilename = try? artifactStore.writeLiDARMeshSnapshot(
+                    cropped, for: session, filename: "lidar_mesh_head.ply")
+            }
+        }
     }
 
     func startAutoSampling() {
@@ -712,6 +1091,9 @@ final class ScanSessionViewModel: ObservableObject {
 
         autoSamplingTask?.cancel()
         isAutoSampling = true
+        recordAcquisitionEvent(AcquisitionEvent(
+            kind: "auto-sampling-started", message: "Automatic sampling started.",
+            details: ["intervalSeconds": String(autoSamplingInterval)]))
         let preflight = capturePreflightIssues
         statusMessage = preflight.isEmpty
             ? "Auto-sampling started."
@@ -734,6 +1116,10 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     func stopAutoSampling() {
+        if isAutoSampling {
+            recordAcquisitionEvent(AcquisitionEvent(
+                kind: "auto-sampling-stopped", message: "Automatic sampling stopped."))
+        }
         autoSamplingTask?.cancel()
         autoSamplingTask = nil
         isAutoSampling = false
@@ -746,12 +1132,31 @@ final class ScanSessionViewModel: ObservableObject {
         }
 
         do {
-            guard let observation = try scanViewModel.sampleCurrentFrame(artifactStore: artifactStore, session: session) else {
+            guard let observation = try scanViewModel.sampleCurrentFrame(
+                artifactStore: artifactStore, session: session,
+                includeCompressedImage: captureCompressedImageReferences
+            ) else {
                 statusMessage = scanViewModel.status.message
                 return
             }
 
             session.captureObservations.append(observation)
+            recordAcquisitionEvent(AcquisitionEvent(
+                kind: "sample-saved", message: "RGB and available depth evidence saved.",
+                details: [
+                    "observationID": observation.id.uuidString,
+                    "primaryImageFormat": observation.cameraSnapshotFilename.map {
+                        URL(fileURLWithPath: $0).pathExtension.lowercased()
+                    } ?? "none",
+                    "primaryImageLosslessPNG": String(
+                        observation.cameraSnapshotFilename?.lowercased().hasSuffix(".png") == true),
+                    "compressedImageRequested": String(captureCompressedImageReferences),
+                    "compressedImageProvided": String(
+                        observation.compressedCameraSnapshotFilename != nil)
+                ]))
+            enqueueLiveMetricDepthFusion(
+                observation,
+                frameID: session.captureObservations.count)
             enqueueLiveDetection(observation)
             let diagnosticsURL = try artifactStore.writeDiagnostics(for: session, scanStatus: scanViewModel.status)
             diagnosticsPath = diagnosticsURL.path
@@ -761,7 +1166,51 @@ final class ScanSessionViewModel: ObservableObject {
                 ? sampleStatus(observation)
                 : "Saved sample \(session.captureObservations.count) and diagnostics JSON."
         } catch {
+            recordAcquisitionEvent(AcquisitionEvent(
+                kind: "sample-save-failed", message: error.localizedDescription))
             statusMessage = "Could not save AR sample: \(error.localizedDescription)"
+        }
+    }
+
+    private func resetLiveMetricDepthFusion() {
+        liveMetricDepthPointCloud = MetricDepthPointCloudSnapshot()
+        liveMetricDepthFusionStatus = session.headBoundingBox == nil
+            ? "Set the head region to build dense depth points."
+            : "Dense depth preview is ready for the next saved sample."
+        let sessionID = session.id
+        Task { await liveMetricDepthFusion.reset(to: sessionID) }
+    }
+
+    private func enqueueLiveMetricDepthFusion(
+        _ observation: CaptureObservation, frameID: Int
+    ) {
+        guard session.captureMode.usesLiDAR,
+              observation.rawDepthFilename != nil,
+              let bounds = session.headBoundingBox,
+              let artifactStore else { return }
+        let sessionID = session.id
+        let directory = artifactStore.rootDirectory.appendingPathComponent(
+            sessionID.uuidString, isDirectory: true)
+        let fusion = liveMetricDepthFusion
+        if liveMetricDepthPointCloud.points.isEmpty {
+            liveMetricDepthFusionStatus = "Building the first lightweight depth preview…"
+        }
+
+        Task { [weak self] in
+            let frame = await Task.detached(priority: .userInitiated) {
+                CaptureArtifactFrameProvider(sessionDirectory: directory)
+                    .metricDepthPointFrame(for: observation, frameID: frameID)
+            }.value
+            guard let frame,
+                  let update = await fusion.ingest(
+                    frame, sessionID: sessionID, bounds: bounds) else { return }
+            guard let self, self.session.id == sessionID,
+                  self.session.headBoundingBox == bounds else { return }
+            self.liveMetricDepthPointCloud = update.snapshot
+            self.liveMetricDepthFusionStatus = "6 mm live preview · "
+                + "\(update.snapshot.points.count.formatted()) points · "
+                + "\(update.snapshot.repeatObservedPointCount.formatted()) repeat-observed · "
+                + "\(Int((update.elapsedSeconds * 1_000).rounded())) ms"
         }
     }
 
@@ -865,7 +1314,14 @@ final class ScanSessionViewModel: ObservableObject {
             suspectLabels: suspects.sorted(),
             templateFitRMSMillimeters: templateFit.map { Double($0.rmsError * 1000) },
             templateAnchorCount: templateFit?.anchorCount,
-            electrodes: liveElectrodes)
+            electrodes: liveElectrodes,
+            producer: solverProducerMetadata(),
+            parameters: [
+                "ocrConfidenceThreshold": "0.45",
+                "aggregationConfidenceThreshold": "0.55",
+                "fillsMissingFromTemplate": "true",
+                "neighborValidation": "true"
+            ])
         _ = try? artifactStore.writeDetectionDiagnostics(diagnostics, for: session)
     }
 
@@ -889,8 +1345,30 @@ final class ScanSessionViewModel: ObservableObject {
             suspectLabels: suspects.sorted(),
             templateFitRMSMillimeters: templateFit.map { Double($0.rmsError * 1000) },
             templateAnchorCount: templateFit?.anchorCount,
-            electrodes: session.electrodes)
+            electrodes: session.electrodes,
+            producer: solverProducerMetadata(),
+            parameters: [
+                "aggregationConfidenceThreshold": "0.55",
+                "fillsMissingFromTemplate": "true",
+                "neighborValidation": "true"
+            ])
         _ = try? artifactStore.writeDetectionDiagnostics(diagnostics, for: session)
+    }
+
+    private func solverProducerMetadata() -> [String: String] {
+        let info = Bundle.main.infoDictionary ?? [:]
+        var metadata = [
+            "applicationVersion": info["CFBundleShortVersionString"] as? String ?? "unknown",
+            "build": info["CFBundleVersion"] as? String ?? "unknown",
+            "operatingSystem": ProcessInfo.processInfo.operatingSystemVersionString
+        ]
+        if let revision = info["MANTAGitRevision"] as? String, !revision.isEmpty {
+            metadata["sourceRevision"] = revision
+        }
+        #if canImport(UIKit)
+        metadata["deviceModel"] = DeviceHardwareIdentifier.current
+        #endif
+        return metadata
     }
 
     private func resetLiveDetection() {

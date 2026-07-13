@@ -33,18 +33,21 @@ struct LiveHeadModelView: View {
         // rebuild more often than ARKit meaningfully refines the mesh.
         TimelineView(.periodic(from: .now, by: 2.0)) { context in
             let snapshot = viewModel.displayMeshSnapshot()
+            let depthPoints = viewModel.liveMetricDepthPointCloud
             let electrodes = viewModel.visualizedElectrodes
             let fiducials = viewModel.session.fiducials
             let stats = ModelStats(
                 electrodes: electrodes,
                 fiducials: fiducials,
                 snapshot: snapshot,
+                depthPoints: depthPoints,
                 channelCount: viewModel.session.layout.channelCount,
                 coverageSectors: viewModel.captureCoverageSectorCount,
                 coverageSectorTotal: Self.coverageSectorTotal)
 
             HeadMeshSceneView(
                 snapshot: snapshot,
+                depthPoints: depthPoints,
                 electrodes: electrodes,
                 fiducials: fiducials,
                 refreshDate: context.date,
@@ -148,9 +151,16 @@ struct LiveHeadModelView: View {
                     .font(.caption.weight(.semibold))
             }
             if stats.hasSurface {
-                Text("\(stats.localizedCount)/\(stats.channelCount) localized · \(stats.predictedCount) predicted · \(stats.vertexCount) vertices")
+                Text(stats.channelCount > 0
+                     ? "\(stats.localizedCount)/\(stats.channelCount) localized · \(stats.meshVertexCount) mesh · \(stats.depthPointCount) depth points"
+                     : "Head only · \(stats.meshVertexCount) mesh · \(stats.depthPointCount) depth points")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
+                if stats.depthPointCount > 0 {
+                    Text(viewModel.liveMetricDepthFusionStatus)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.cyan)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -184,10 +194,13 @@ struct LiveHeadModelView: View {
 
     private var markerLegend: some View {
         HStack(spacing: 12) {
-            LegendDot(title: "Confirmed", color: .green, filled: true)
-            LegendDot(title: "Provisional", color: .orange, filled: false)
-            LegendDot(title: "Missing", color: .gray, filled: false)
+            if viewModel.session.layout.hasElectrodeNet {
+                LegendDot(title: "Confirmed", color: .green, filled: true)
+                LegendDot(title: "Provisional", color: .orange, filled: false)
+                LegendDot(title: "Missing", color: .gray, filled: false)
+            }
             LegendDot(title: "Fiducials", color: .purple, filled: true)
+            LegendDot(title: "Fused depth", color: .cyan, filled: true)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -199,7 +212,9 @@ struct LiveHeadModelView: View {
 /// function of the current snapshot and solution.
 private struct ModelStats {
     var hasSurface: Bool
-    var vertexCount: Int
+    var hasMeshSurface: Bool
+    var meshVertexCount: Int
+    var depthPointCount: Int
     var localizedCount: Int
     var predictedCount: Int
     var channelCount: Int
@@ -208,11 +223,14 @@ private struct ModelStats {
 
     init(
         electrodes: [ElectrodeAnnotation], fiducials: [FiducialAnnotation],
-        snapshot: LiDARMeshSnapshot, channelCount: Int,
+        snapshot: LiDARMeshSnapshot, depthPoints: MetricDepthPointCloudSnapshot,
+        channelCount: Int,
         coverageSectors: Int, coverageSectorTotal: Int
     ) {
-        hasSurface = !snapshot.vertices.isEmpty
-        vertexCount = snapshot.vertices.count
+        hasMeshSurface = !snapshot.vertices.isEmpty
+        hasSurface = hasMeshSurface || !depthPoints.points.isEmpty
+        meshVertexCount = snapshot.vertices.count
+        depthPointCount = depthPoints.points.count
         localizedCount = electrodes.filter { $0.confidence > 0 }.count
         predictedCount = electrodes.filter { $0.confidence == 0 }.count
         self.channelCount = channelCount
@@ -246,6 +264,7 @@ private struct LegendDot: View {
 
 private struct HeadMeshSceneView: UIViewRepresentable {
     var snapshot: LiDARMeshSnapshot
+    var depthPoints: MetricDepthPointCloudSnapshot
     var electrodes: [ElectrodeAnnotation]
     var fiducials: [FiducialAnnotation]
     var refreshDate: Date
@@ -301,6 +320,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
         context.coordinator.update(
             in: view,
             snapshot: snapshot,
+            depthPoints: depthPoints,
             electrodes: electrodes,
             fiducials: fiducials
         )
@@ -328,6 +348,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         private let meshHolder = SCNNode()
+        private let depthPointHolder = SCNNode()
         private let markerHolder = SCNNode()
         private var installed = false
 
@@ -350,6 +371,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
         /// Change-detection keys: the scene is only rebuilt when one of these
         /// changes, so an idle 2 s tick with no new mesh/detections is a no-op.
         private var lastVertexCount = -1
+        private var lastDepthPointRevision = -1
         private var lastMarkerSignature = 0
 
         func attach(view: SCNView) {
@@ -425,35 +447,50 @@ private struct HeadMeshSceneView: UIViewRepresentable {
         func update(
             in view: SCNView,
             snapshot: LiDARMeshSnapshot,
+            depthPoints: MetricDepthPointCloudSnapshot,
             electrodes: [ElectrodeAnnotation],
             fiducials: [FiducialAnnotation]
         ) {
             guard let scene = view.scene else { return }
             if !installed {
                 scene.rootNode.addChildNode(meshHolder)
+                scene.rootNode.addChildNode(depthPointHolder)
                 scene.rootNode.addChildNode(markerHolder)
                 installed = true
             }
 
-            guard !snapshot.vertices.isEmpty else {
-                if lastVertexCount != 0 {
+            guard !snapshot.vertices.isEmpty || !depthPoints.points.isEmpty else {
+                if lastVertexCount != 0 || lastDepthPointRevision != depthPoints.revision {
                     meshHolder.childNodes.forEach { $0.removeFromParentNode() }
+                    depthPointHolder.childNodes.forEach { $0.removeFromParentNode() }
                     markerHolder.childNodes.forEach { $0.removeFromParentNode() }
                     lastVertexCount = 0
+                    lastDepthPointRevision = depthPoints.revision
                     lastMarkerSignature = 0
                 }
                 return
             }
 
-            let bounds = MeshBounds(vertices: snapshot.vertices)
+            let bounds = MeshBounds(vertices:
+                depthPoints.points.isEmpty ? snapshot.vertices : depthPoints.points)
 
             // Rebuild the mesh geometry only when the vertex count changes. ARKit
             // grows the mesh vertex-by-vertex, so this catches real refinement
             // while skipping identical ticks.
             if snapshot.vertices.count != lastVertexCount {
                 meshHolder.childNodes.forEach { $0.removeFromParentNode() }
-                meshHolder.addChildNode(meshNode(snapshot: snapshot))
+                if !snapshot.vertices.isEmpty {
+                    meshHolder.addChildNode(meshNode(snapshot: snapshot))
+                }
                 lastVertexCount = snapshot.vertices.count
+            }
+
+            if depthPoints.revision != lastDepthPointRevision {
+                depthPointHolder.childNodes.forEach { $0.removeFromParentNode() }
+                if !depthPoints.points.isEmpty {
+                    depthPointHolder.addChildNode(depthPointNode(snapshot: depthPoints))
+                }
+                lastDepthPointRevision = depthPoints.revision
             }
 
             // Rebuild markers only when the solution actually changed.
@@ -556,6 +593,56 @@ private struct HeadMeshSceneView: UIViewRepresentable {
             material.emission.contents = UIColor.systemTeal.withAlphaComponent(0.16)
             material.fillMode = .lines
             material.isDoubleSided = true
+            geometry.materials = [material]
+            return SCNNode(geometry: geometry)
+        }
+
+        private func depthPointNode(snapshot: MetricDepthPointCloudSnapshot) -> SCNNode {
+            // Feed SIMD storage directly to SceneKit. Avoiding tens of thousands
+            // of SCNVector3 allocations materially reduces camera hitches when a
+            // new live preview replaces the previous point geometry.
+            let vertexData = snapshot.points.withUnsafeBytes { Data($0) }
+            let vertexSource = SCNGeometrySource(
+                data: vertexData,
+                semantic: .vertex,
+                vectorCount: snapshot.points.count,
+                usesFloatComponents: true,
+                componentsPerVector: 3,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<SIMD3<Float>>.stride)
+            let colors = snapshot.viewCounts.map { views -> SIMD4<Float> in
+                views >= 2
+                    ? SIMD4<Float>(0.15, 0.95, 1.0, 0.92)
+                    : SIMD4<Float>(0.20, 0.55, 1.0, 0.48)
+            }
+            let colorData = colors.withUnsafeBytes { Data($0) }
+            let colorSource = SCNGeometrySource(
+                data: colorData,
+                semantic: .color,
+                vectorCount: colors.count,
+                usesFloatComponents: true,
+                componentsPerVector: 4,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<SIMD4<Float>>.stride)
+            let indices = Array(UInt32(0)..<UInt32(snapshot.points.count))
+            let indexData = indices.withUnsafeBytes { Data($0) }
+            let element = SCNGeometryElement(
+                data: indexData,
+                primitiveType: .point,
+                primitiveCount: snapshot.points.count,
+                bytesPerIndex: MemoryLayout<UInt32>.size)
+            element.pointSize = 3
+            element.minimumPointScreenSpaceRadius = 1
+            element.maximumPointScreenSpaceRadius = 6
+            let geometry = SCNGeometry(
+                sources: [vertexSource, colorSource], elements: [element])
+            let material = SCNMaterial()
+            material.lightingModel = .constant
+            material.diffuse.contents = UIColor.white
+            material.blendMode = .alpha
+            material.writesToDepthBuffer = true
             geometry.materials = [material]
             return SCNNode(geometry: geometry)
         }

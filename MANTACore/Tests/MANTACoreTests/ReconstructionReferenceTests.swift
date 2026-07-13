@@ -18,6 +18,8 @@ struct ReconstructionReferenceTests {
             reconstruction: MANTAReconstructionReference(
                 lidarMeshPath: "reconstruction/lidar_mesh.ply",
                 objectCaptureModelPath: "reconstruction/model.usdz",
+                headBoundingBox: HeadBoundingBox(
+                    center: Coordinate3D(x: 0.1, y: 0.2, z: -0.4)),
                 modelToWorld: Array(repeating: 0, count: 16),
                 worldCoordinateSystem: "arkit-world"))
 

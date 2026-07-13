@@ -117,6 +117,33 @@ struct WorldAlignmentTests {
         #expect(result.rmsError < 3.0)
     }
 
+    @Test func seededICPDoesNotCollapseEstablishedScale() throws {
+        var source = [SIMD3<Float>]()
+        for x in 0..<8 {
+            for y in 0..<5 {
+                for z in 0..<6 where (x + y + z).isMultiple(of: 3) {
+                    source.append(SIMD3(Float(x) * 0.04, Float(y) * 0.05, Float(z) * 0.03))
+                }
+            }
+        }
+        let truth = knownTransform(
+            scale: 1.7, axis: SIMD3(0.3, 1, -0.2), angle: 1.2,
+            translation: SIMD3(0.2, -0.4, 0.1))
+        let target = source.map { apply(truth, $0) }
+
+        var input = WorldAlignmentInput()
+        input.seed = .coarsePCA
+        input.sourceCloud = source
+        input.targetCloud = target
+        let result = WorldAlignmentSolver.solve(strategy: .icp, input: input)
+
+        let solvedScale = simd_length(SIMD3(
+            result.transform.columns.0.x,
+            result.transform.columns.0.y,
+            result.transform.columns.0.z))
+        #expect(abs(solvedScale - 1.7) < 0.02)
+    }
+
     @Test func pcaSeedReturnsFiniteResidual() throws {
         let cloud: [SIMD3<Float>] = (0..<30).map { SIMD3(Float($0), Float($0) * 0.5, Float(($0 % 5)) * 2) }
         let truth = knownTransform(scale: 1, axis: SIMD3(0, 0, 1), angle: 0.6, translation: SIMD3(2, 3, 1))

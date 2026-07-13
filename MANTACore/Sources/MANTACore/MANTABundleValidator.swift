@@ -80,6 +80,16 @@ public struct MANTABundleValidator {
     }
 
     public func validate(directory rootDirectory: URL) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyFileHashes: true)
+    }
+
+    /// Internal fast path for the finalizer, which has just computed every hash
+    /// while building the manifest. External callers always receive full hash
+    /// verification through the public overload above.
+    func validate(
+        directory rootDirectory: URL,
+        verifyFileHashes: Bool
+    ) throws -> MANTAValidatedBundle {
         let root = rootDirectory.standardizedFileURL
         let manifestURL = root.appendingPathComponent(MANTABundleFormat.manifestFilename)
         guard fileManager.fileExists(atPath: manifestURL.path) else {
@@ -92,7 +102,8 @@ public struct MANTABundleValidator {
             throw MANTABundleValidationError.unsupportedFormat(manifest.format)
         }
 
-        let declaredPaths = try validateFiles(manifest.files, in: root)
+        let declaredPaths = try validateFiles(
+            manifest.files, in: root, verifyFileHashes: verifyFileHashes)
         try validateContentReferences(manifest.content, declaredPaths: declaredPaths)
         try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
 
@@ -137,7 +148,9 @@ public struct MANTABundleValidator {
         }
     }
 
-    private func validateFiles(_ entries: [MANTAFileEntry], in root: URL) throws -> Set<String> {
+    private func validateFiles(
+        _ entries: [MANTAFileEntry], in root: URL, verifyFileHashes: Bool
+    ) throws -> Set<String> {
         var paths = Set<String>()
         for entry in entries {
             try validateRelativePath(entry.path)
@@ -168,7 +181,7 @@ public struct MANTABundleValidator {
                     actual: actualSize
                 )
             }
-            guard try sha256(of: url) == entry.sha256 else {
+            if verifyFileHashes, try sha256(of: url) != entry.sha256 {
                 throw MANTABundleValidationError.hashMismatch(entry.path)
             }
         }
@@ -244,7 +257,11 @@ public struct MANTABundleValidator {
             guard capture.coordinateSystems.contains(where: { $0.id == observation.worldCoordinateSystem }) else {
                 throw MANTABundleValidationError.invalidCapture("observation references an unknown coordinate system")
             }
-            for path in [observation.imagePath, observation.depth?.path, observation.depth?.confidencePath].compactMap({ $0 }) {
+            for path in [
+                observation.imagePath, observation.losslessImagePath,
+                observation.compressedImagePath, observation.depth?.path,
+                observation.depth?.confidencePath
+            ].compactMap({ $0 }) {
                 try validateRelativePath(path)
                 guard declaredPaths.contains(path) else {
                     throw MANTABundleValidationError.missingFile(path)
@@ -282,7 +299,10 @@ public struct MANTABundleValidator {
                 throw MANTABundleValidationError.invalidCapture(
                     "reconstruction references an unknown coordinate system")
             }
-            for path in [reconstruction.lidarMeshPath, reconstruction.objectCaptureModelPath].compactMap({ $0 }) {
+            for path in [
+                reconstruction.lidarMeshPath, reconstruction.headCroppedLidarMeshPath,
+                reconstruction.objectCaptureModelPath
+            ].compactMap({ $0 }) {
                 guard declaredPaths.contains(path) else {
                     throw MANTABundleValidationError.invalidCapture(
                         "reconstruction references undeclared file \(path)")
@@ -292,6 +312,16 @@ public struct MANTABundleValidator {
                (transform.count != 16 || !transform.allSatisfy(\.isFinite)) {
                 throw MANTABundleValidationError.invalidCapture(
                     "modelToWorld must contain 16 finite column-major values")
+            }
+            if let bounds = reconstruction.headBoundingBox {
+                let center = bounds.center
+                guard center.x.isFinite, center.y.isFinite, center.z.isFinite,
+                      bounds.widthMeters.isFinite, bounds.widthMeters > 0,
+                      bounds.heightMeters.isFinite, bounds.heightMeters > 0,
+                      bounds.depthMeters.isFinite, bounds.depthMeters > 0 else {
+                    throw MANTABundleValidationError.invalidCapture(
+                        "headBoundingBox must contain a finite center and positive finite dimensions")
+                }
             }
         }
     }
