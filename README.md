@@ -1,7 +1,7 @@
 # MANTA
 
 <p align="center">
-  <img src="Docs/Assets/MANTA-Icon.svg" alt="MANTA icon: a manta ray carrying an EEG net" width="240">
+  <img src="Docs/Assets/MANTA-Icon.png" alt="MANTA icon: a manta ray carrying an EEG net" width="240">
 </p>
 
 MANTA is a work-in-progress iPhone and iPad application for capturing EGI
