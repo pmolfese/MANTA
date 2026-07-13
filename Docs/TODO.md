@@ -76,8 +76,13 @@ are in the root [README](../README.md).
 
 ## macOS receiver
 
-- [ ] Add a separate empty SwiftUI macOS target to `MANTA.xcodeproj`.
-- [ ] Import, validate, and inspect local `.manta` files before adding networking.
+- [x] Add a separate SwiftUI macOS receiver target to `MANTA.xcodeproj`.
+- [~] Import, validate, and inspect local `.manta` files before adding networking;
+  local file import now preserves the source archive in app-managed storage,
+  performs hardened extraction/validation, and shows capture metadata, saved
+  camera frames with projected annotations, an interactive LiDAR/ObjectCapture
+  surface with solution markers, and the manifest inventory. A persistent
+  import library and depth/confidence previews remain.
 - [ ] Keep imported `.manta` snapshots read-only on macOS and expose **Save As…**
   for derived MANTA snapshots.
 - [ ] Run offline detection, reconstruction, comparison, review, and export using

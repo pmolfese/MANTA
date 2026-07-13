@@ -35,8 +35,11 @@ MANTACore/             local cross-platform Swift package
 MANTATests/            iOS application tests and synthetic scan harness
 Fixtures/              EGI layouts and future capture fixtures
 Docs/                  architecture, format, validation, and roadmap
-MANTA.xcodeproj/       iOS project; planned home of the macOS target
+MANTA.xcodeproj/       iOS and macOS Receiver application targets
 ```
+
+The project now also contains a `MANTA Receiver` macOS scheme for importing,
+validating, and inspecting local `.manta` archives.
 
 See [Architecture](Docs/ARCHITECTURE.md), [Capture format](Docs/CAPTURE_FORMAT.md),
 [Data privacy](Docs/DATA_PRIVACY.md), [Validation](Docs/VALIDATION.md), and

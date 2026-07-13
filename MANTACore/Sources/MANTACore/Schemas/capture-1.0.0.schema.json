@@ -25,6 +25,21 @@
         "additionalProperties": true
       }
     },
+    "reconstruction": {
+      "type": "object",
+      "required": ["worldCoordinateSystem"],
+      "properties": {
+        "lidarMeshPath": { "type": "string", "minLength": 1 },
+        "objectCaptureModelPath": { "type": "string", "minLength": 1 },
+        "modelToWorld": { "type": "array", "minItems": 16, "maxItems": 16, "items": { "type": "number" } },
+        "worldCoordinateSystem": { "type": "string", "minLength": 1 }
+      },
+      "anyOf": [
+        { "required": ["lidarMeshPath"] },
+        { "required": ["objectCaptureModelPath"] }
+      ],
+      "additionalProperties": false
+    },
     "observations": {
       "type": "array",
       "items": {

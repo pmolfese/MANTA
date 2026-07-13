@@ -223,6 +223,13 @@ Each observation records:
   RGB pixel coordinates.
 - Tracking state and acquisition-quality metrics.
 
+When a reconstruction is present, `capture.json` explicitly relates its LiDAR
+mesh and/or ObjectCapture model to the capture. LiDAR meshes are stored directly
+in the declared ARKit world frame. ObjectCapture models also record a
+column-major 4x4 model-to-world transform so desktop viewers can overlay
+fiducials and electrode solutions without assuming the two coordinate frames
+coincide.
+
 Matrices are serialized as flat arrays in column-major order for compatibility
 with ARKit and `simd`. Every matrix field also has a schema-defined shape and
 direction; names such as `cameraToWorld` are preferred over ambiguous

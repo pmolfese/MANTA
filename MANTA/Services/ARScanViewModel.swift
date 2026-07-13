@@ -20,14 +20,38 @@ final class ARScanViewModel: NSObject, ObservableObject {
     @Published var status = LiveScanStatus(isSupported: ARWorldTrackingConfiguration.isSupported)
     @Published var observations: [CaptureObservation] = []
 
-    private weak var arView: ARView?
+    // The capture session outlives an individual SwiftUI Camera/Model tab.
+    // Keeping the ARView strongly owned here prevents a visual-mode switch from
+    // tearing down RealityKit and silently pausing an otherwise running scan.
+    private var arView: ARView?
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     private var lastSampledTransform: simd_float4x4?
 
     func attach(_ arView: ARView) {
         self.arView = arView
         arView.session.delegate = self
-        status.isSupported = ARWorldTrackingConfiguration.isSupported
+        // `attach` is called by `UIViewRepresentable.makeUIView`, while SwiftUI
+        // is still updating its view hierarchy. Publishing synchronously from
+        // that callback triggers "Publishing changes from within view updates"
+        // and can cause SwiftUI to discard or repeat the update. Yield to the
+        // next main-actor turn and ignore the write if this ARView was replaced
+        // before then.
+        Task { @MainActor [weak self, weak arView] in
+            await Task.yield()
+            guard let self, let arView, self.arView === arView else { return }
+            self.status.isSupported = ARWorldTrackingConfiguration.isSupported
+        }
+    }
+
+    /// Returns the single ARView backing this capture session. SwiftUI may
+    /// remove and recreate its representable while switching visual modes, but
+    /// the AR session and accumulated anchors remain attached to this view.
+    func captureView() -> ARView {
+        if let arView { return arView }
+        let view = ARView(frame: .zero)
+        view.automaticallyConfigureSession = false
+        attach(view)
+        return view
     }
 
     func start(captureMode: CaptureMode = .both) {
@@ -120,20 +144,48 @@ final class ARScanViewModel: NSObject, ObservableObject {
     }
 
     /// Ray-casts a point in the AR view (view coordinates) against the scanned
-    /// mesh/estimated surface and returns the hit in world coordinates. Used to
-    /// place nasion/LPA/RPA fiducials by tapping the live scan.
+    /// surface and returns the hit in world coordinates. Used to place
+    /// nasion/LPA/RPA fiducials by tapping the live scan.
+    ///
+    /// The reconstructed LiDAR mesh is tried first: for a curved head that hits
+    /// the actual scalp, whereas ARKit's estimated-plane fit only approximates it.
+    /// If no mesh has been built yet, it falls back to an estimated-plane raycast
+    /// so early taps still land somewhere sensible.
     func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? {
         guard let arView else { return nil }
 
-        let alignments: [ARRaycastQuery.TargetAlignment] = [.any]
-        for alignment in alignments {
-            if let query = arView.makeRaycastQuery(from: viewPoint, allowing: .estimatedPlane, alignment: alignment),
-               let result = arView.session.raycast(query).first {
-                let t = result.worldTransform.columns.3
-                return SIMD3<Float>(t.x, t.y, t.z)
+        if let (origin, direction) = arView.ray(through: viewPoint) {
+            let mesh = fullMeshSnapshot()
+            if let hit = MeshRaycaster.firstHit(
+                origin: origin, direction: direction,
+                vertices: mesh.vertices, triangleIndices: mesh.triangleIndices) {
+                return hit
             }
         }
+
+        if let query = arView.makeRaycastQuery(from: viewPoint, allowing: .estimatedPlane, alignment: .any),
+           let result = arView.session.raycast(query).first {
+            let t = result.worldTransform.columns.3
+            return SIMD3<Float>(t.x, t.y, t.z)
+        }
         return nil
+    }
+
+    /// Nearest hit of an arbitrary world-space ray against the accumulated mesh.
+    /// Used by the offline (cameras-off) model view, where the ray comes from the
+    /// 3D view's virtual camera instead of the ARKit camera.
+    func raycastMesh(origin: SIMD3<Float>, direction: SIMD3<Float>) -> SIMD3<Float>? {
+        let mesh = fullMeshSnapshot()
+        return MeshRaycaster.firstHit(
+            origin: origin, direction: direction,
+            vertices: mesh.vertices, triangleIndices: mesh.triangleIndices)
+    }
+
+    /// Current device (camera-to-world) transform, for driving the Live Model's
+    /// camera so the head rotates to match the operator's physical viewpoint.
+    /// Nil when no frame is available (session not running yet).
+    func currentCameraTransform() -> simd_float4x4? {
+        arView?.session.currentFrame?.camera.transform
     }
 
     /// World-space point cloud of the accumulated LiDAR reconstruction mesh.
@@ -429,5 +481,8 @@ final class ARScanViewModel: ObservableObject {
     func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? { nil }
     func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
     func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? { nil }
+    func raycastMesh(origin: SIMD3<Float>, direction: SIMD3<Float>) -> SIMD3<Float>? { nil }
+    func fullMeshSnapshot() -> LiDARMeshSnapshot { LiDARMeshSnapshot(vertices: [], triangleIndices: []) }
+    func currentCameraTransform() -> simd_float4x4? { nil }
 }
 #endif

@@ -223,6 +223,15 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     public var layoutID: String
     public var coordinateSystems: [MANTACoordinateSystem]
     public var observations: [MANTACaptureObservation]
+    /// Placed anatomical landmarks (nasion/LPA/RPA) in a declared coordinate
+    /// system. Optional and additive: older bundles omit it.
+    public var fiducials: [MANTAFiducialSolution]?
+    /// Solved electrode positions in a declared coordinate system. Optional and
+    /// additive so the receiver can re-read the solution alongside raw capture.
+    public var electrodes: [MANTAElectrodeSolution]?
+    /// Optional reconstructed surfaces and the transform required to display
+    /// model-space ObjectCapture assets with ARKit-world annotations.
+    public var reconstruction: MANTAReconstructionReference?
 
     public init(
         schema: String,
@@ -231,7 +240,10 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         captureMode: String,
         layoutID: String,
         coordinateSystems: [MANTACoordinateSystem],
-        observations: [MANTACaptureObservation]
+        observations: [MANTACaptureObservation],
+        fiducials: [MANTAFiducialSolution]? = nil,
+        electrodes: [MANTAElectrodeSolution]? = nil,
+        reconstruction: MANTAReconstructionReference? = nil
     ) {
         self.schema = schema
         self.schemaVersion = schemaVersion
@@ -240,11 +252,74 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         self.layoutID = layoutID
         self.coordinateSystems = coordinateSystems
         self.observations = observations
+        self.fiducials = fiducials
+        self.electrodes = electrodes
+        self.reconstruction = reconstruction
     }
 
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case schemaVersion, sessionID, captureMode, layoutID, coordinateSystems, observations
+        case fiducials, electrodes, reconstruction
+    }
+}
+
+public struct MANTAReconstructionReference: Codable, Equatable, Sendable {
+    public var lidarMeshPath: String?
+    public var objectCaptureModelPath: String?
+    /// Column-major 4x4 transform from ObjectCapture model coordinates to the
+    /// coordinate system identified by `worldCoordinateSystem`.
+    public var modelToWorld: [Double]?
+    public var worldCoordinateSystem: String
+
+    public init(
+        lidarMeshPath: String? = nil,
+        objectCaptureModelPath: String? = nil,
+        modelToWorld: [Double]? = nil,
+        worldCoordinateSystem: String = "arkit-world"
+    ) {
+        self.lidarMeshPath = lidarMeshPath
+        self.objectCaptureModelPath = objectCaptureModelPath
+        self.modelToWorld = modelToWorld
+        self.worldCoordinateSystem = worldCoordinateSystem
+    }
+}
+
+/// A placed anatomical landmark in a declared coordinate system. `coordinate`
+/// is nil when the landmark has not been marked.
+public struct MANTAFiducialSolution: Codable, Equatable, Sendable {
+    public var kind: String
+    public var coordinateSystem: String
+    public var coordinate: [Double]?
+    public var state: String
+
+    public init(kind: String, coordinateSystem: String, coordinate: [Double]?, state: String) {
+        self.kind = kind
+        self.coordinateSystem = coordinateSystem
+        self.coordinate = coordinate
+        self.state = state
+    }
+}
+
+/// A solved electrode position in a declared coordinate system.
+public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
+    public var label: String
+    public var role: String
+    public var coordinateSystem: String
+    public var coordinate: [Double]
+    public var confidence: Double
+    public var state: String
+
+    public init(
+        label: String, role: String, coordinateSystem: String,
+        coordinate: [Double], confidence: Double, state: String
+    ) {
+        self.label = label
+        self.role = role
+        self.coordinateSystem = coordinateSystem
+        self.coordinate = coordinate
+        self.confidence = confidence
+        self.state = state
     }
 }
 

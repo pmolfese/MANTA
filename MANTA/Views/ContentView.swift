@@ -217,19 +217,40 @@ private struct ScanReviewView: View {
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
     @State private var visualMode: CaptureVisualMode = .split
+    @State private var showPhoneReview = false
+
+    private var isPhone: Bool { UIDevice.current.userInterfaceIdiom == .phone }
 
     var body: some View {
         VStack(spacing: 0) {
             ScanHeaderView(
                 viewModel: viewModel,
                 showSidebar: $showSidebar,
-                showLibrary: $showLibrary
+                showLibrary: $showLibrary,
+                compact: isPhone
             )
 
             Divider()
 
             GeometryReader { geometry in
-                if geometry.size.width > geometry.size.height {
+                if isPhone {
+                    VStack(spacing: 0) {
+                        CaptureVisualTabs(
+                            viewModel: viewModel,
+                            selection: $visualMode,
+                            splitHorizontally: geometry.size.width > geometry.size.height
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        Divider()
+
+                        PhoneCaptureBar(
+                            viewModel: viewModel,
+                            scanViewModel: viewModel.scanViewModel,
+                            showReview: { showPhoneReview = true }
+                        )
+                    }
+                } else if geometry.size.width > geometry.size.height {
                     HStack(spacing: 0) {
                         CaptureVisualTabs(
                             viewModel: viewModel,
@@ -275,6 +296,22 @@ private struct ScanReviewView: View {
             }
         }
         .navigationTitle(viewModel.session.name)
+        .onAppear {
+            if isPhone, visualMode == .split { visualMode = .camera }
+        }
+        .sheet(isPresented: $showPhoneReview) {
+            NavigationStack {
+                PortraitReviewTabs(viewModel: viewModel)
+                    .navigationTitle("Capture Review")
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showPhoneReview = false }
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
     }
 }
 
@@ -282,9 +319,10 @@ private struct ScanHeaderView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
+    var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: compact ? 6 : 12) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 12) {
@@ -299,9 +337,10 @@ private struct ScanHeaderView: View {
                         Button {
                             showLibrary = true
                         } label: {
-                            Label("Subjects", systemImage: "person.crop.rectangle.stack")
+                            Image(systemName: "person.crop.rectangle.stack")
                         }
                         .buttonStyle(.bordered)
+                        .accessibilityLabel("Subjects")
                         .help("Subject library")
                     }
 
@@ -310,21 +349,46 @@ private struct ScanHeaderView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
-                        .frame(maxWidth: 230, alignment: .leading)
-                        .padding(.leading, 48)
+                        .frame(maxWidth: compact ? 150 : 230, alignment: .leading)
+                        .padding(.leading, compact ? 0 : 48)
                 }
 
                 Spacer(minLength: 12)
 
-                VStack(spacing: 6) {
-                    ScanStatusOverlay(viewModel: viewModel)
-                    SessionStatusOverlay(viewModel: viewModel)
+                if compact {
+                    CompactPhoneStatus(viewModel: viewModel)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    VStack(spacing: 6) {
+                        ScanStatusOverlay(viewModel: viewModel)
+                        SessionStatusOverlay(viewModel: viewModel)
+                    }
+                    .frame(maxWidth: 520)
+                    .layoutPriority(1)
                 }
-                .frame(maxWidth: 520)
-                .layoutPriority(1)
             }
         }
-        .padding()
+        .padding(compact ? 10 : 16)
+    }
+}
+
+private struct CompactPhoneStatus: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(viewModel.scanViewModel.status.trackingSummary, systemImage: "location.viewfinder")
+            Divider().frame(height: 18)
+            Label("\(viewModel.session.captureObservations.count)", systemImage: "camera")
+            Divider().frame(height: 18)
+            Label("\(viewModel.captureCoverageSectorCount)/24", systemImage: "circle.grid.3x3")
+        }
+        .font(.caption.weight(.semibold))
+        .lineLimit(1)
+        .minimumScaleFactor(0.65)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
     }
 }
 
@@ -568,6 +632,107 @@ private struct CompactCaptureControls: View {
         .padding()
         .frame(minWidth: 240)
         .presentationCompactAdaptation(.popover)
+    }
+}
+
+private struct PhoneCaptureBar: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+    @ObservedObject var scanViewModel: ARScanViewModel
+    var showReview: () -> Void
+    @State private var showRatePopover = false
+
+    var body: some View {
+        VStack(spacing: 7) {
+            HStack(spacing: 0) {
+                PhoneActionButton(
+                    title: scanViewModel.status.isRunning ? "Pause" : "Start",
+                    systemImage: scanViewModel.status.isRunning ? "pause.fill" : "play.fill",
+                    tint: scanViewModel.status.isRunning ? .orange : .blue
+                ) {
+                    scanViewModel.status.isRunning
+                        ? viewModel.pauseLiveScan() : viewModel.startLiveScan()
+                }
+                .disabled(!scanViewModel.status.isSupported)
+
+                PhoneActionButton(
+                    title: viewModel.isAutoSampling ? "Stop Auto" : "Auto",
+                    systemImage: viewModel.isAutoSampling ? "stop.fill" : "camera.metering.matrix",
+                    tint: viewModel.isAutoSampling ? .red : .blue
+                ) {
+                    viewModel.isAutoSampling
+                        ? viewModel.stopAutoSampling() : viewModel.startAutoSampling()
+                }
+                .disabled(!scanViewModel.status.isSupported || viewModel.isGuidedFiducialPlacementActive)
+                .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
+                .popover(isPresented: $showRatePopover) { ratePopover }
+
+                PhoneActionButton(title: "Sample", systemImage: "camera.badge.ellipsis", tint: .teal) {
+                    viewModel.sampleCurrentARFrame()
+                }
+                .disabled(!scanViewModel.status.isRunning || viewModel.isGuidedFiducialPlacementActive)
+
+                PhoneActionButton(
+                    title: viewModel.isGuidedFiducialPlacementActive ? "Cancel" : "Fiducials",
+                    systemImage: viewModel.isGuidedFiducialPlacementActive ? "xmark" : "scope",
+                    tint: viewModel.isGuidedFiducialPlacementActive ? .orange : .purple
+                ) {
+                    viewModel.isGuidedFiducialPlacementActive
+                        ? viewModel.cancelGuidedFiducialPlacement()
+                        : viewModel.startGuidedFiducialPlacement()
+                }
+                .disabled(!scanViewModel.status.isRunning)
+
+                PhoneActionButton(title: "Review", systemImage: "point.3.connected.trianglepath.dotted", tint: .indigo) {
+                    showReview()
+                }
+            }
+
+            Text(scanViewModel.status.message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 7)
+        .background(Color(.secondarySystemBackground))
+    }
+
+    private var ratePopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Auto Sample Rate").font(.headline)
+            Stepper(
+                "\(viewModel.autoSamplingInterval, specifier: "%.2f")s per sample",
+                value: $viewModel.autoSamplingInterval, in: 0.25...3, step: 0.25)
+        }
+        .padding().frame(minWidth: 240)
+        .presentationCompactAdaptation(.popover)
+    }
+}
+
+private struct PhoneActionButton: View {
+    var title: String
+    var systemImage: String
+    var tint: Color
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(height: 22)
+                Text(title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity, minHeight: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

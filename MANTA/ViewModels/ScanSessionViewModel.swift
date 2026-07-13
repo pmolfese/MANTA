@@ -41,12 +41,40 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var exportedBundle: ExportedBundle?
     /// When set, the next tap on the live scan places this fiducial.
     @Published var fiducialPlacementKind: FiducialKind?
+    /// When set, the next tap on the 3D head model places this fiducial. This is
+    /// the cameras-off path: it works while the session is paused or reopened,
+    /// intersecting the persisted/in-memory LiDAR mesh instead of the live camera.
+    @Published var modelFiducialPlacementKind: FiducialKind?
+
+    /// Cached mesh loaded from disk, used when no live anchors are in memory
+    /// (e.g. a reopened session). Live anchors always take precedence.
+    private var cachedMeshSnapshot: LiDARMeshSnapshot?
 
     var isGuidedFiducialPlacementActive: Bool { fiducialPlacementKind != nil }
+    var isModelSurfacePlacementActive: Bool { modelFiducialPlacementKind != nil }
 
     var fiducialPlacementPrompt: String? {
         guard let kind = fiducialPlacementKind else { return nil }
         return "Find the \(kind.rawValue), then tap it in the camera view."
+    }
+
+    var modelFiducialPlacementPrompt: String? {
+        guard let kind = modelFiducialPlacementKind else { return nil }
+        return "Tap the \(kind.rawValue) on the head model."
+    }
+
+    /// The mesh to display and tap for offline placement: the live in-memory mesh
+    /// when scanning, otherwise the mesh persisted for this session.
+    func displayMeshSnapshot() -> LiDARMeshSnapshot {
+        let live = scanViewModel.fullMeshSnapshot()
+        if !live.vertices.isEmpty { return live }
+        if let cached = cachedMeshSnapshot { return cached }
+        if let loaded = artifactStore?.loadLiDARMeshSnapshot(for: session),
+           !loaded.vertices.isEmpty {
+            cachedMeshSnapshot = loaded
+            return loaded
+        }
+        return live
     }
 
     private var pendingSourceCloud: [SIMD3<Float>] = []
@@ -180,6 +208,8 @@ final class ScanSessionViewModel: ObservableObject {
         stopAutoSampling()
         resetLiveDetection()
         fiducialPlacementKind = nil
+        modelFiducialPlacementKind = nil
+        cachedMeshSnapshot = nil
         let layout = availableLayouts.first(where: { $0.name == selectedLayoutName }) ?? session.layout
         var newSession = ScanSession.newSession(layout: layout)
         newSession.subjectLabel = subjectLabel
@@ -199,6 +229,8 @@ final class ScanSessionViewModel: ObservableObject {
             stopAutoSampling()
             resetLiveDetection()
             fiducialPlacementKind = nil
+            modelFiducialPlacementKind = nil
+            cachedMeshSnapshot = nil
             let loaded = try artifactStore.loadSession(id: id)
             session = loaded
             if availableLayouts.contains(where: { $0.name == loaded.layout.name }) {
@@ -353,6 +385,9 @@ final class ScanSessionViewModel: ObservableObject {
 
         stopAutoSampling()
         resetLiveDetection()
+        fiducialPlacementKind = nil
+        modelFiducialPlacementKind = nil
+        cachedMeshSnapshot = nil
         selectedLayoutName = name
         session = ScanSession.newSession(layout: layout)
         statusMessage = "Ready to scan with \(layout.name)."
@@ -493,7 +528,7 @@ final class ScanSessionViewModel: ObservableObject {
             return
         }
         stopAutoSampling()
-        fiducialPlacementKind = FiducialKind.allCases.first
+        fiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.allCases.first
         statusMessage = fiducialPlacementPrompt ?? "Mark the live fiducials."
     }
 
@@ -511,21 +546,78 @@ final class ScanSessionViewModel: ObservableObject {
             return
         }
 
-        if let index = session.fiducials.firstIndex(where: { $0.kind == kind }) {
-            session.fiducials[index].coordinate = Coordinate3D(x: Double(world.x), y: Double(world.y), z: Double(world.z))
-            session.fiducials[index].state = .reviewed
-        }
-        persistSession()
+        recordFiducial(kind, world: world)
         let placed = session.fiducials.filter { $0.coordinate != nil }.count
-        let kinds = FiducialKind.allCases
-        if let currentIndex = kinds.firstIndex(of: kind), currentIndex + 1 < kinds.count {
-            fiducialPlacementKind = kinds[currentIndex + 1]
+        if let next = firstUnplacedFiducialKind() {
+            fiducialPlacementKind = next
             statusMessage = "Placed \(kind.rawValue) (\(placed)/3). \(fiducialPlacementPrompt ?? "")"
         } else {
             fiducialPlacementKind = nil
             statusMessage = "All fiducials placed — exports now use the head coordinate frame."
         }
+    }
+
+    // MARK: - Fiducial placement (offline, on the 3D head model)
+
+    /// Enters the cameras-off placement flow. Intersects the displayed LiDAR mesh,
+    /// so it works while the session is paused (patient on a break) or reopened.
+    func beginModelSurfacePlacement() {
+        guard !displayMeshSnapshot().vertices.isEmpty else {
+            statusMessage = "No head surface yet — scan first, then mark fiducials on the model."
+            return
+        }
+        stopAutoSampling()
+        fiducialPlacementKind = nil
+        modelFiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.allCases.first
+        statusMessage = modelFiducialPlacementPrompt ?? "Mark the fiducials on the head model."
+    }
+
+    func cancelModelSurfacePlacement() {
+        modelFiducialPlacementKind = nil
+        statusMessage = "Model fiducial placement cancelled."
+    }
+
+    /// Handles a tap on the 3D head model: a world-space ray from the model view's
+    /// virtual camera, intersected against the same mesh the user sees.
+    func handleModelSurfaceRay(origin: SIMD3<Float>, direction: SIMD3<Float>) {
+        guard let kind = modelFiducialPlacementKind else { return }
+        let mesh = displayMeshSnapshot()
+        guard let world = MeshRaycaster.firstHit(
+            origin: origin, direction: direction,
+            vertices: mesh.vertices, triangleIndices: mesh.triangleIndices) else {
+            statusMessage = "Tap directly on the head surface to place the \(kind.rawValue)."
+            return
+        }
+
+        recordFiducial(kind, world: world)
+        let placed = session.fiducials.filter { $0.coordinate != nil }.count
+        if let next = firstUnplacedFiducialKind() {
+            modelFiducialPlacementKind = next
+            statusMessage = "Placed \(kind.rawValue) (\(placed)/3). \(modelFiducialPlacementPrompt ?? "")"
+        } else {
+            modelFiducialPlacementKind = nil
+            statusMessage = "All fiducials placed on the model — exports now use the head coordinate frame."
+        }
+    }
+
+    /// Writes a placed fiducial in the ARKit world frame. Shared by the live and
+    /// model-surface placement paths so both produce identical, comparable landmarks.
+    private func recordFiducial(_ kind: FiducialKind, world: SIMD3<Float>) {
+        if let index = session.fiducials.firstIndex(where: { $0.kind == kind }) {
+            session.fiducials[index].coordinate = Coordinate3D(
+                x: Double(world.x), y: Double(world.y), z: Double(world.z))
+            session.fiducials[index].state = .reviewed
+        }
+        persistSession()
         refreshExportPreview()
+    }
+
+    /// First fiducial kind that still has no coordinate, in canonical order.
+    /// Both placement flows resume here, so landmarks can be split freely between
+    /// the live camera and the 3D model without redoing already-placed ones.
+    private func firstUnplacedFiducialKind() -> FiducialKind? {
+        let placed = Dictionary(uniqueKeysWithValues: session.fiducials.map { ($0.kind, $0.coordinate != nil) })
+        return FiducialKind.allCases.first { placed[$0] != true }
     }
 
     func pauseLiveScan() {

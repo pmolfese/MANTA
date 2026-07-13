@@ -184,6 +184,36 @@ struct CaptureArtifactStore {
         case .photogrammetry: mode = "photogrammetry"
         case .both: mode = "both"
         }
+        // Fiducials and electrodes are persisted in the ARKit world frame (meters),
+        // matching the declared coordinate system, so a receiver can re-derive the
+        // head frame from the same landmarks the operator placed.
+        let fiducials = session.fiducials.map { fiducial in
+            MANTAFiducialSolution(
+                kind: fiducial.kind.rawValue,
+                coordinateSystem: "arkit-world",
+                coordinate: fiducial.coordinate.map { [$0.x, $0.y, $0.z] },
+                state: fiducial.state.rawValue)
+        }
+        let electrodes = session.electrodes.map { electrode in
+            MANTAElectrodeSolution(
+                label: electrode.label,
+                role: electrode.role.rawValue,
+                coordinateSystem: "arkit-world",
+                coordinate: [electrode.coordinate.x, electrode.coordinate.y, electrode.coordinate.z],
+                confidence: electrode.confidence,
+                state: electrode.state.rawValue)
+        }
+        let reconstruction: MANTAReconstructionReference? = {
+            guard session.lidarMeshFilename != nil || session.photogrammetryModelFilename != nil else {
+                return nil
+            }
+            return MANTAReconstructionReference(
+                lidarMeshPath: session.lidarMeshFilename,
+                objectCaptureModelPath: session.photogrammetryModelFilename,
+                modelToWorld: session.worldAlignmentTransform?.map(Double.init),
+                worldCoordinateSystem: "arkit-world")
+        }()
+
         return MANTACaptureDocument(
             schema: MANTABundleFormat.captureSchema,
             sessionID: session.id,
@@ -196,7 +226,10 @@ struct CaptureArtifactStore {
                     units: .meters,
                     description: "Right-handed ARKit world frame; camera looks down negative Z.")
             ],
-            observations: observations)
+            observations: observations,
+            fiducials: fiducials.isEmpty ? nil : fiducials,
+            electrodes: electrodes.isEmpty ? nil : electrodes,
+            reconstruction: reconstruction)
     }
 
     private func bundleFileSources(_ session: ScanSession, in directory: URL) -> [MANTABundleFileSource] {
@@ -399,6 +432,72 @@ struct CaptureArtifactStore {
         let filename = "lidar_mesh.ply"
         try data.write(to: reconstruction.appendingPathComponent(filename), options: .atomic)
         return "reconstruction/\(filename)"
+    }
+
+    /// Reads back a mesh persisted by `writeLiDARMeshSnapshot`, so the head
+    /// surface can be shown (and tapped for fiducials) after a session is
+    /// reopened with the cameras off. Returns nil when no mesh was persisted or
+    /// the file cannot be parsed.
+    func loadLiDARMeshSnapshot(for session: ScanSession) -> LiDARMeshSnapshot? {
+        guard let relativePath = session.lidarMeshFilename else { return nil }
+        let sessionDir = rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
+        let url = sessionDir.appendingPathComponent(relativePath)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return Self.parseBinaryLittleEndianPLY(data)
+    }
+
+    /// Parses the specific binary-little-endian PLY layout written above:
+    /// float32 xyz vertices followed by `uchar(3) + uint32×3` faces.
+    static func parseBinaryLittleEndianPLY(_ data: Data) -> LiDARMeshSnapshot? {
+        let marker = Data("end_header\n".utf8)
+        guard let headerRange = data.range(of: marker) else { return nil }
+        let header = String(decoding: data[data.startIndex..<headerRange.lowerBound], as: UTF8.self)
+
+        var vertexCount = 0
+        var faceCount = 0
+        for line in header.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ")
+            guard fields.count == 3, fields[0] == "element" else { continue }
+            if fields[1] == "vertex" { vertexCount = Int(fields[2]) ?? 0 }
+            if fields[1] == "face" { faceCount = Int(fields[2]) ?? 0 }
+        }
+        guard vertexCount > 0 else { return nil }
+
+        let bytes = [UInt8](data[headerRange.upperBound...])
+        var offset = 0
+
+        func readFloat() -> Float? {
+            guard offset + 4 <= bytes.count else { return nil }
+            let bits = UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+            offset += 4
+            return Float(bitPattern: bits)
+        }
+        func readUInt32() -> UInt32? {
+            guard offset + 4 <= bytes.count else { return nil }
+            let value = UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+            offset += 4
+            return value
+        }
+
+        var vertices = [SIMD3<Float>]()
+        vertices.reserveCapacity(vertexCount)
+        for _ in 0..<vertexCount {
+            guard let x = readFloat(), let y = readFloat(), let z = readFloat() else { return nil }
+            vertices.append(SIMD3(x, y, z))
+        }
+
+        var triangleIndices = [UInt32]()
+        triangleIndices.reserveCapacity(faceCount * 3)
+        for _ in 0..<faceCount {
+            guard offset < bytes.count, bytes[offset] == 3 else { break }
+            offset += 1
+            guard let a = readUInt32(), let b = readUInt32(), let c = readUInt32() else { break }
+            triangleIndices.append(contentsOf: [a, b, c])
+        }
+
+        return LiDARMeshSnapshot(vertices: vertices, triangleIndices: triangleIndices)
     }
 
     /// Collects the captured RGB frames into a dedicated input folder and writes the pose manifest.

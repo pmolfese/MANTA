@@ -255,6 +255,45 @@ public struct MANTABundleValidator {
                 throw MANTABundleValidationError.invalidCapture("depth dimensions must be positive")
             }
         }
+
+        let systemIDs = Set(capture.coordinateSystems.map(\.id))
+        for fiducial in capture.fiducials ?? [] {
+            guard systemIDs.contains(fiducial.coordinateSystem) else {
+                throw MANTABundleValidationError.invalidCapture("fiducial references an unknown coordinate system")
+            }
+            if let coordinate = fiducial.coordinate,
+               coordinate.count != 3 || !coordinate.allSatisfy(\.isFinite) {
+                throw MANTABundleValidationError.invalidCapture("fiducial coordinate must be three finite values")
+            }
+        }
+        guard Set((capture.electrodes ?? []).map(\.label)).count == (capture.electrodes ?? []).count else {
+            throw MANTABundleValidationError.invalidCapture("electrode labels must be unique")
+        }
+        for electrode in capture.electrodes ?? [] {
+            guard systemIDs.contains(electrode.coordinateSystem) else {
+                throw MANTABundleValidationError.invalidCapture("electrode references an unknown coordinate system")
+            }
+            guard electrode.coordinate.count == 3, electrode.coordinate.allSatisfy(\.isFinite) else {
+                throw MANTABundleValidationError.invalidCapture("electrode coordinate must be three finite values")
+            }
+        }
+        if let reconstruction = capture.reconstruction {
+            guard systemIDs.contains(reconstruction.worldCoordinateSystem) else {
+                throw MANTABundleValidationError.invalidCapture(
+                    "reconstruction references an unknown coordinate system")
+            }
+            for path in [reconstruction.lidarMeshPath, reconstruction.objectCaptureModelPath].compactMap({ $0 }) {
+                guard declaredPaths.contains(path) else {
+                    throw MANTABundleValidationError.invalidCapture(
+                        "reconstruction references undeclared file \(path)")
+                }
+            }
+            if let transform = reconstruction.modelToWorld,
+               (transform.count != 16 || !transform.allSatisfy(\.isFinite)) {
+                throw MANTABundleValidationError.invalidCapture(
+                    "modelToWorld must contain 16 finite column-major values")
+            }
+        }
     }
 
     private func validateRelativePath(_ path: String) throws {
