@@ -20,11 +20,10 @@ struct LiveARScanView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> ARView {
-        let arView = ARView(frame: .zero)
-        arView.automaticallyConfigureSession = false
-        scanViewModel.attach(arView)
+        let arView = scanViewModel.captureView()
 
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        context.coordinator.tapRecognizer = tap
         arView.addGestureRecognizer(tap)
         return arView
     }
@@ -34,11 +33,18 @@ struct LiveARScanView: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
-        uiView.session.pause()
+        // A Camera ↔ Live Model switch removes this representable, but it must
+        // not stop capture. The view model owns the ARView/session; only remove
+        // presentation-specific gestures here. Explicit Pause remains the sole
+        // control that pauses the session.
+        if let tap = coordinator.tapRecognizer {
+            uiView.removeGestureRecognizer(tap)
+        }
     }
 
     final class Coordinator {
         var onTap: (CGPoint) -> Void
+        weak var tapRecognizer: UITapGestureRecognizer?
 
         init(onTap: @escaping (CGPoint) -> Void) {
             self.onTap = onTap

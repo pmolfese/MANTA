@@ -18,6 +18,8 @@ struct DetectionRunDiagnostics: Codable, Sendable {
     var templateFitRMSMillimeters: Double?
     var templateAnchorCount: Int?
     var electrodes: [ElectrodeAnnotation]
+    var producer: [String: String]? = nil
+    var parameters: [String: String]? = nil
 }
 
 enum LiveElectrodeDetectionWorker {

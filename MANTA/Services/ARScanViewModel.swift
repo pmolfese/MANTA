@@ -11,6 +11,14 @@ import Combine
 import CoreGraphics
 import simd
 
+struct FiducialRaycastResult {
+    var point: SIMD3<Float>
+    var rayOrigin: SIMD3<Float>?
+    var rayDirection: SIMD3<Float>?
+    var hitMethod: String
+    var observationID: UUID?
+}
+
 #if canImport(ARKit) && canImport(RealityKit)
 import ARKit
 import RealityKit
@@ -19,15 +27,42 @@ import RealityKit
 final class ARScanViewModel: NSObject, ObservableObject {
     @Published var status = LiveScanStatus(isSupported: ARWorldTrackingConfiguration.isSupported)
     @Published var observations: [CaptureObservation] = []
+    var eventHandler: ((AcquisitionEvent) -> Void)?
 
-    private weak var arView: ARView?
+    // The capture session outlives an individual SwiftUI Camera/Model tab.
+    // Keeping the ARView strongly owned here prevents a visual-mode switch from
+    // tearing down RealityKit and silently pausing an otherwise running scan.
+    private var arView: ARView?
     private var meshAnchors: [UUID: ARMeshAnchor] = [:]
     private var lastSampledTransform: simd_float4x4?
+    private var lastReportedTrackingSummary: String?
+    private var hasReportedFirstFrame = false
 
     func attach(_ arView: ARView) {
         self.arView = arView
         arView.session.delegate = self
-        status.isSupported = ARWorldTrackingConfiguration.isSupported
+        // `attach` is called by `UIViewRepresentable.makeUIView`, while SwiftUI
+        // is still updating its view hierarchy. Publishing synchronously from
+        // that callback triggers "Publishing changes from within view updates"
+        // and can cause SwiftUI to discard or repeat the update. Yield to the
+        // next main-actor turn and ignore the write if this ARView was replaced
+        // before then.
+        Task { @MainActor [weak self, weak arView] in
+            await Task.yield()
+            guard let self, let arView, self.arView === arView else { return }
+            self.status.isSupported = ARWorldTrackingConfiguration.isSupported
+        }
+    }
+
+    /// Returns the single ARView backing this capture session. SwiftUI may
+    /// remove and recreate its representable while switching visual modes, but
+    /// the AR session and accumulated anchors remain attached to this view.
+    func captureView() -> ARView {
+        if let arView { return arView }
+        let view = ARView(frame: .zero)
+        view.automaticallyConfigureSession = false
+        attach(view)
+        return view
     }
 
     func start(captureMode: CaptureMode = .both) {
@@ -40,6 +75,10 @@ final class ARScanViewModel: NSObject, ObservableObject {
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
         configuration.environmentTexturing = .automatic
+
+        if let format = highestResolutionVideoFormat(usesLiDAR: captureMode.usesLiDAR) {
+            configuration.videoFormat = format
+        }
 
         // LiDAR depth + mesh are only enabled for modes that use them. Photogrammetry-only
         // capture still runs world tracking so every RGB frame carries an ARKit pose.
@@ -55,11 +94,52 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
         meshAnchors.removeAll()
         lastSampledTransform = nil
+        hasReportedFirstFrame = false
         arView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         status.isRunning = true
         status.message = captureMode.usesLiDAR
             ? "Move around the cap slowly; keep electrodes in view and avoid motion blur."
             : "Circle the head, keeping frames sharp and well-lit for photogrammetry."
+
+        // Probe 1 (requested): record the camera format and semantics we asked the
+        // device for. Comparing this to the first delivered frame reveals a silent
+        // ARKit fallback or missing scene depth before a subject is captured.
+        let requested = configuration.videoFormat.imageResolution
+        eventHandler?(AcquisitionEvent(
+            kind: "video-format-selected",
+            message: "Requested \(Int(requested.width))x\(Int(requested.height)) camera format.",
+            details: [
+                "requestedWidth": String(Int(requested.width)),
+                "requestedHeight": String(Int(requested.height)),
+                "requestedFPS": String(configuration.videoFormat.framesPerSecond),
+                "sceneDepthRequested": String(configuration.frameSemantics.contains(.sceneDepth)),
+                "sceneReconstructionMesh": String(configuration.sceneReconstruction == .mesh),
+                "supportedFormatCount": String(ARWorldTrackingConfiguration.supportedVideoFormats.count)
+            ]))
+    }
+
+    /// Chooses the highest-resolution camera format the device offers so the RGB
+    /// record carries as much disk/label detail as possible.
+    ///
+    /// For LiDAR modes the dedicated high-resolution-frame format is excluded: on
+    /// current hardware it disables synchronized scene depth, and keeping depth and
+    /// color registered to a single frame is worth more to the solvers than extra
+    /// RGB pixels. Photogrammetry-only capture has no depth to preserve, so it takes
+    /// the largest format available. Returns `nil` to leave the ARKit default in
+    /// place when no better format exists.
+    private func highestResolutionVideoFormat(usesLiDAR: Bool) -> ARConfiguration.VideoFormat? {
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        let candidates: [ARConfiguration.VideoFormat]
+        if usesLiDAR,
+           let hiRes = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
+            candidates = formats.filter { $0.imageResolution != hiRes.imageResolution }
+        } else {
+            candidates = formats
+        }
+        return candidates.max {
+            $0.imageResolution.width * $0.imageResolution.height
+                < $1.imageResolution.width * $1.imageResolution.height
+        }
     }
 
     func pause() {
@@ -68,18 +148,24 @@ final class ARScanViewModel: NSObject, ObservableObject {
         status.message = "Scan paused."
     }
 
-    func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? {
+    func sampleCurrentFrame(
+        artifactStore: CaptureArtifactStore, session: ScanSession,
+        includeCompressedImage: Bool = false
+    ) throws -> CaptureObservation? {
         guard let frame = arView?.session.currentFrame else {
             status.message = "No AR frame is available yet."
             return nil
         }
 
         var observation = makeObservation(from: frame)
-        observation.cameraSnapshotFilename = try artifactStore.writeCameraSnapshot(
+        let cameraArtifact = try artifactStore.writeCameraSnapshot(
             pixelBuffer: frame.capturedImage,
             observationID: observation.id,
-            for: session
+            for: session,
+            includeCompressedImage: includeCompressedImage
         )
+        observation.cameraSnapshotFilename = cameraArtifact.primaryFilename
+        observation.compressedCameraSnapshotFilename = cameraArtifact.compressedFilename
 
         if session.captureMode.usesLiDAR, let depthMap = frame.sceneDepth?.depthMap {
             let depthArtifact = try artifactStore.writeDepthSnapshot(
@@ -120,20 +206,52 @@ final class ARScanViewModel: NSObject, ObservableObject {
     }
 
     /// Ray-casts a point in the AR view (view coordinates) against the scanned
-    /// mesh/estimated surface and returns the hit in world coordinates. Used to
-    /// place nasion/LPA/RPA fiducials by tapping the live scan.
-    func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? {
+    /// surface and returns the hit in world coordinates. Used to place
+    /// nasion/LPA/RPA fiducials by tapping the live scan.
+    ///
+    /// The reconstructed LiDAR mesh is tried first: for a curved head that hits
+    /// the actual scalp, whereas ARKit's estimated-plane fit only approximates it.
+    /// If no mesh has been built yet, it falls back to an estimated-plane raycast
+    /// so early taps still land somewhere sensible.
+    func raycastToWorld(viewPoint: CGPoint) -> FiducialRaycastResult? {
         guard let arView else { return nil }
 
-        let alignments: [ARRaycastQuery.TargetAlignment] = [.any]
-        for alignment in alignments {
-            if let query = arView.makeRaycastQuery(from: viewPoint, allowing: .estimatedPlane, alignment: alignment),
-               let result = arView.session.raycast(query).first {
-                let t = result.worldTransform.columns.3
-                return SIMD3<Float>(t.x, t.y, t.z)
+        if let (origin, direction) = arView.ray(through: viewPoint) {
+            let mesh = fullMeshSnapshot()
+            if let hit = MeshRaycaster.firstHit(
+                origin: origin, direction: direction,
+                vertices: mesh.vertices, triangleIndices: mesh.triangleIndices) {
+                return FiducialRaycastResult(
+                    point: hit, rayOrigin: origin, rayDirection: direction,
+                    hitMethod: "lidar-mesh-raycast", observationID: observations.last?.id)
             }
         }
+
+        if let query = arView.makeRaycastQuery(from: viewPoint, allowing: .estimatedPlane, alignment: .any),
+           let result = arView.session.raycast(query).first {
+            let t = result.worldTransform.columns.3
+            return FiducialRaycastResult(
+                point: SIMD3<Float>(t.x, t.y, t.z), rayOrigin: nil, rayDirection: nil,
+                hitMethod: "estimated-plane-raycast", observationID: observations.last?.id)
+        }
         return nil
+    }
+
+    /// Nearest hit of an arbitrary world-space ray against the accumulated mesh.
+    /// Used by the offline (cameras-off) model view, where the ray comes from the
+    /// 3D view's virtual camera instead of the ARKit camera.
+    func raycastMesh(origin: SIMD3<Float>, direction: SIMD3<Float>) -> SIMD3<Float>? {
+        let mesh = fullMeshSnapshot()
+        return MeshRaycaster.firstHit(
+            origin: origin, direction: direction,
+            vertices: mesh.vertices, triangleIndices: mesh.triangleIndices)
+    }
+
+    /// Current device (camera-to-world) transform, for driving the Live Model's
+    /// camera so the head rotates to match the operator's physical viewpoint.
+    /// Nil when no frame is available (session not running yet).
+    func currentCameraTransform() -> simd_float4x4? {
+        arView?.session.currentFrame?.camera.transform
     }
 
     /// World-space point cloud of the accumulated LiDAR reconstruction mesh.
@@ -211,9 +329,42 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     private func updateStatus(from frame: ARFrame) {
         status.frameCount += 1
-        status.trackingSummary = trackingSummary(frame.camera.trackingState)
+        let summary = trackingSummary(frame.camera.trackingState)
+        status.trackingSummary = summary
         status.hasSceneDepth = frame.sceneDepth != nil
         status.meshAnchorCount = meshAnchors.count
+        if !hasReportedFirstFrame {
+            hasReportedFirstFrame = true
+            reportFirstFrame(frame)
+        }
+        if summary != lastReportedTrackingSummary {
+            eventHandler?(AcquisitionEvent(
+                kind: "tracking-state-changed", message: summary,
+                details: ["worldMappingStatus": worldMappingSummary(frame.worldMappingStatus)]))
+            lastReportedTrackingSummary = summary
+        }
+    }
+
+    /// Probe 2 (delivered): records what the first real frame actually carried, so
+    /// it can be compared to `video-format-selected`. A resolution that differs from
+    /// the request means ARKit fell back to another format; absent scene depth in a
+    /// LiDAR mode means the depth-fusion assumption is broken for this session.
+    private func reportFirstFrame(_ frame: ARFrame) {
+        let resolution = frame.camera.imageResolution
+        var details = [
+            "actualImageWidth": String(Int(resolution.width)),
+            "actualImageHeight": String(Int(resolution.height)),
+            "sceneDepthPresent": String(frame.sceneDepth != nil),
+            "worldMappingStatus": worldMappingSummary(frame.worldMappingStatus)
+        ]
+        if let depthMap = frame.sceneDepth?.depthMap {
+            details["depthWidth"] = String(CVPixelBufferGetWidth(depthMap))
+            details["depthHeight"] = String(CVPixelBufferGetHeight(depthMap))
+        }
+        eventHandler?(AcquisitionEvent(
+            kind: "first-frame-observed",
+            message: "Delivered \(Int(resolution.width))x\(Int(resolution.height)) frame.",
+            details: details))
     }
 
     private func makeObservation(from frame: ARFrame) -> CaptureObservation {
@@ -239,6 +390,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
             meshAnchorCount: meshAnchors.count,
             trackingSummary: trackingSummary(frame.camera.trackingState),
             cameraSnapshotFilename: nil,
+            imageOrientation: storedImageOrientation(),
             depthSnapshotFilename: nil,
             rawDepthFilename: nil,
             rawDepthFormat: nil,
@@ -285,6 +437,18 @@ final class ARScanViewModel: NSObject, ObservableObject {
         let elevation = asin(max(-1, min(1, direction.y))) * 180 / .pi
         let elevationBin = elevation > 20 ? "upper" : elevation < -20 ? "lower" : "level"
         return "azimuth-\(azimuthBin)-\(elevationBin)"
+    }
+
+    /// ARKit supplies sensor-native landscape pixels. Record the EXIF transform
+    /// consumers must apply to display those pixels in the interface orientation.
+    private func storedImageOrientation() -> String {
+        switch arView?.window?.windowScene?.interfaceOrientation {
+        case .portrait: "right"
+        case .portraitUpsideDown: "left"
+        case .landscapeLeft: "up"
+        case .landscapeRight: "down"
+        default: "up"
+        }
     }
 
     private func imageQuality(_ pixelBuffer: CVPixelBuffer) -> (
@@ -358,6 +522,38 @@ final class ARScanViewModel: NSObject, ObservableObject {
 struct LiDARMeshSnapshot {
     var vertices: [SIMD3<Float>]
     var triangleIndices: [UInt32]
+
+    func cropped(to bounds: HeadBoundingBox) -> LiDARMeshSnapshot {
+        let center = SIMD3<Float>(
+            Float(bounds.center.x), Float(bounds.center.y), Float(bounds.center.z))
+        let half = SIMD3<Float>(
+            Float(bounds.widthMeters / 2), Float(bounds.heightMeters / 2),
+            Float(bounds.depthMeters / 2))
+        func isInside(_ index: UInt32) -> Bool {
+            guard Int(index) < vertices.count else { return false }
+            let delta = abs(vertices[Int(index)] - center)
+            return delta.x <= half.x && delta.y <= half.y && delta.z <= half.z
+        }
+
+        var remap = [UInt32: UInt32]()
+        var croppedVertices = [SIMD3<Float>]()
+        var croppedIndices = [UInt32]()
+        for face in stride(from: 0, to: triangleIndices.count - 2, by: 3) {
+            let source = [triangleIndices[face], triangleIndices[face + 1], triangleIndices[face + 2]]
+            guard source.allSatisfy(isInside) else { continue }
+            for index in source {
+                if let mapped = remap[index] {
+                    croppedIndices.append(mapped)
+                } else {
+                    let mapped = UInt32(croppedVertices.count)
+                    remap[index] = mapped
+                    croppedVertices.append(vertices[Int(index)])
+                    croppedIndices.append(mapped)
+                }
+            }
+        }
+        return LiDARMeshSnapshot(vertices: croppedVertices, triangleIndices: croppedIndices)
+    }
 }
 
 extension ARScanViewModel: ARSessionDelegate {
@@ -392,6 +588,27 @@ extension ARScanViewModel: ARSessionDelegate {
             self.status.meshAnchorCount = self.meshAnchors.count
         }
     }
+
+    nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+        Task { @MainActor in
+            self.eventHandler?(AcquisitionEvent(
+                kind: "ar-session-failed", message: error.localizedDescription))
+        }
+    }
+
+    nonisolated func sessionWasInterrupted(_ session: ARSession) {
+        Task { @MainActor in
+            self.eventHandler?(AcquisitionEvent(
+                kind: "ar-session-interrupted", message: "AR session was interrupted."))
+        }
+    }
+
+    nonisolated func sessionInterruptionEnded(_ session: ARSession) {
+        Task { @MainActor in
+            self.eventHandler?(AcquisitionEvent(
+                kind: "ar-session-interruption-ended", message: "AR session interruption ended."))
+        }
+    }
 }
 
 private extension simd_float4x4 {
@@ -423,11 +640,18 @@ private extension SIMD4 where Scalar == Float {
 final class ARScanViewModel: ObservableObject {
     @Published var status = LiveScanStatus(message: "ARKit is unavailable in this build.")
     @Published var observations: [CaptureObservation] = []
+    var eventHandler: ((AcquisitionEvent) -> Void)?
 
     func start(captureMode: CaptureMode = .both) {}
     func pause() {}
-    func sampleCurrentFrame(artifactStore: CaptureArtifactStore, session: ScanSession) throws -> CaptureObservation? { nil }
+    func sampleCurrentFrame(
+        artifactStore: CaptureArtifactStore, session: ScanSession,
+        includeCompressedImage: Bool = false
+    ) throws -> CaptureObservation? { nil }
     func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] { [] }
-    func raycastToWorld(viewPoint: CGPoint) -> SIMD3<Float>? { nil }
+    func raycastToWorld(viewPoint: CGPoint) -> FiducialRaycastResult? { nil }
+    func raycastMesh(origin: SIMD3<Float>, direction: SIMD3<Float>) -> SIMD3<Float>? { nil }
+    func fullMeshSnapshot() -> LiDARMeshSnapshot { LiDARMeshSnapshot(vertices: [], triangleIndices: []) }
+    func currentCameraTransform() -> simd_float4x4? { nil }
 }
 #endif

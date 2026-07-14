@@ -11,7 +11,10 @@ struct MANTADeterministicZIP {
         self.fileManager = fileManager
     }
 
-    func write(directory: URL, to destination: URL) throws {
+    func write(
+        directory: URL, to destination: URL,
+        precomputedCRC32: [String: UInt32] = [:]
+    ) throws {
         let files = try regularFiles(in: directory)
         guard fileManager.createFile(atPath: destination.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
@@ -25,7 +28,7 @@ struct MANTADeterministicZIP {
             let name = Data(item.path.utf8)
             let values = try item.url.resourceValues(forKeys: [.fileSizeKey])
             let byteCount = values.fileSize ?? 0
-            let crc = try CRC32.checksum(file: item.url)
+            let crc = try precomputedCRC32[item.path] ?? MANTACRC32.checksum(file: item.url)
             let size = try uint32(byteCount)
 
             var local = Data()
@@ -114,7 +117,7 @@ struct MANTADeterministicZIP {
     private func copy(_ source: URL, to handle: FileHandle) throws {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
-        while let chunk = try input.read(upToCount: 64 * 1024), !chunk.isEmpty {
+        while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
             try handle.write(contentsOf: chunk)
         }
     }
@@ -134,23 +137,6 @@ struct MANTADeterministicZIP {
             throw MANTAZIPError.archiveTooLarge
         }
         return lhs + value
-    }
-}
-
-private enum CRC32 {
-    static func checksum(file: URL) throws -> UInt32 {
-        var crc = UInt32.max
-        let input = try FileHandle(forReadingFrom: file)
-        defer { try? input.close() }
-        while let chunk = try input.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            for byte in chunk {
-                crc ^= UInt32(byte)
-                for _ in 0..<8 {
-                    crc = (crc >> 1) ^ (0xedb88320 & (0 &- (crc & 1)))
-                }
-            }
-        }
-        return crc ^ UInt32.max
     }
 }
 

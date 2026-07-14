@@ -1,5 +1,9 @@
 # MANTA
 
+<p align="center">
+  <img src="Docs/Assets/MANTA-Icon.png" alt="MANTA icon: a manta ray carrying an EEG net" width="240">
+</p>
+
 MANTA is a work-in-progress iPhone and iPad application for capturing EGI
 HydroCel 128- and 256-channel EEG nets with LiDAR and photogrammetry. The goal
 is to locate and label electrodes, anchor them to nasion/LPA/RPA fiducials,
@@ -35,8 +39,11 @@ MANTACore/             local cross-platform Swift package
 MANTATests/            iOS application tests and synthetic scan harness
 Fixtures/              EGI layouts and future capture fixtures
 Docs/                  architecture, format, validation, and roadmap
-MANTA.xcodeproj/       iOS project; planned home of the macOS target
+MANTA.xcodeproj/       iOS and macOS Receiver application targets
 ```
+
+The project now also contains a `MANTA Receiver` macOS scheme for importing,
+validating, and inspecting local `.manta` archives.
 
 See [Architecture](Docs/ARCHITECTURE.md), [Capture format](Docs/CAPTURE_FORMAT.md),
 [Data privacy](Docs/DATA_PRIVACY.md), [Validation](Docs/VALIDATION.md), and

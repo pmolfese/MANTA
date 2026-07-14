@@ -14,10 +14,11 @@ import Compression
 import CoreGraphics
 import CoreImage
 import CoreVideo
+import ImageIO
 import UIKit
 #endif
 
-struct CaptureArtifactStore {
+struct CaptureArtifactStore: @unchecked Sendable {
     private let fileManager: FileManager
     let rootDirectory: URL
 
@@ -64,6 +65,70 @@ struct CaptureArtifactStore {
             .appendingPathComponent("diagnostics.json")
     }
 
+    func acquisitionDirectory(for session: ScanSession) -> URL {
+        rootDirectory
+            .appendingPathComponent(session.id.uuidString, isDirectory: true)
+            .appendingPathComponent("acquisition", isDirectory: true)
+    }
+
+    @discardableResult
+    func appendAcquisitionEvent(_ event: AcquisitionEvent, for session: ScanSession) throws -> URL {
+        let directory = acquisitionDirectory(for: session)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("events.jsonl")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var data = try encoder.encode(event)
+        data.append(0x0A)
+        if fileManager.fileExists(atPath: url.path) {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+        } else {
+            try data.write(to: url, options: .atomic)
+        }
+        return url
+    }
+
+    @discardableResult
+    func writeAcquisitionContext(for session: ScanSession) throws -> URL? {
+        let context = session.acquisitionContext ?? AcquisitionContext(netModel: session.layout.name)
+        let directory = acquisitionDirectory(for: session)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("context.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(context).write(to: url, options: .atomic)
+        return url
+    }
+
+    @discardableResult
+    func writeFiducialPlacementEvidence(for session: ScanSession) throws -> URL? {
+        guard let evidence = session.fiducialPlacementEvidence, !evidence.isEmpty else { return nil }
+        let directory = acquisitionDirectory(for: session)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("fiducial-placements.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(evidence).write(to: url, options: .atomic)
+        return url
+    }
+
+    @discardableResult
+    func writeCaptureReceipt(for session: ScanSession) throws -> (url: URL, receipt: CaptureReceipt) {
+        let directory = try sessionDirectory(for: session)
+        let receipt = CaptureReceiptBuilder.build(session: session, sessionDirectory: directory)
+        let url = directory.appendingPathComponent("capture-receipt.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(receipt).write(to: url, options: .atomic)
+        return (url, receipt)
+    }
+
     func sessionMetadataURL(for id: UUID) -> URL {
         rootDirectory
             .appendingPathComponent(id.uuidString, isDirectory: true)
@@ -99,28 +164,94 @@ struct CaptureArtifactStore {
         }
     }
 
-    /// Finalizes an immutable, validated `.manta` snapshot for off-device hand-off.
-    /// Mutable working-session files are adapted into the public capture contract;
-    /// `session.json` and diagnostics are intentionally not copied into the bundle.
-    func exportSessionBundle(id: UUID) throws -> MANTAStoreExportResult {
+    /// Creates paired immutable snapshots: acquisition evidence without solver
+    /// outputs, and the complete solved/reviewed state. Both are deeply checked
+    /// before finalization and independently re-imported afterward.
+    func exportSessionBundles(id: UUID) throws -> MANTAStoreExportPair {
         let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
         guard fileManager.fileExists(atPath: directory.path) else {
             throw CaptureArtifactStoreError.sessionNotFound
         }
         let session = try loadSession(id: id)
         let finalizedAt = Date()
+        _ = try writeAcquisitionContext(for: session)
+        _ = try writeFiducialPlacementEvidence(for: session)
+        let receiptResult = try writeCaptureReceipt(for: session)
+        guard receiptResult.receipt.status != .failed else {
+            throw CaptureArtifactStoreError.captureReceiptFailed
+        }
+
+        let raw = try finalizeSessionBundle(
+            session, directory: directory, finalizedAt: finalizedAt, variant: .raw)
+        let solved = try finalizeSessionBundle(
+            session, directory: directory, finalizedAt: finalizedAt, variant: .solved)
+        return MANTAStoreExportPair(raw: raw, solved: solved, receipt: receiptResult.receipt)
+    }
+
+    /// Seals acquisition evidence without requiring or including any solver,
+    /// reconstruction, review, or final-coordinate output.
+    func exportRawSessionBundle(
+        id: UUID,
+        progress: (@Sendable (Double, String) -> Void)? = nil
+    ) throws -> MANTAStoreValidatedExportResult {
+        progress?(0.01, "Preparing acquisition")
+        let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        guard fileManager.fileExists(atPath: directory.path) else {
+            throw CaptureArtifactStoreError.sessionNotFound
+        }
+        let session = try loadSession(id: id)
+        progress?(0.04, "Writing acquisition metadata")
+        _ = try writeAcquisitionContext(for: session)
+        _ = try writeFiducialPlacementEvidence(for: session)
+        let receiptResult = try writeCaptureReceipt(for: session)
+        progress?(0.10, "Capture validation complete")
+        guard receiptResult.receipt.status != .failed else {
+            throw CaptureArtifactStoreError.captureReceiptFailed
+        }
+        let export = try finalizeSessionBundle(
+            session, directory: directory, finalizedAt: Date(), variant: .raw,
+            progress: progress, verifyFinalArchive: false)
+        return MANTAStoreValidatedExportResult(export: export, receipt: receiptResult.receipt)
+    }
+
+    /// Single solved export retained for programmatic callers and compatibility.
+    /// The acquisition UI uses `exportSessionBundles`, which adds the deep gate
+    /// and paired raw snapshot.
+    func exportSessionBundle(id: UUID) throws -> MANTAStoreExportResult {
+        let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        guard fileManager.fileExists(atPath: directory.path) else {
+            throw CaptureArtifactStoreError.sessionNotFound
+        }
+        let session = try loadSession(id: id)
+        _ = try writeAcquisitionContext(for: session)
+        _ = try writeFiducialPlacementEvidence(for: session)
+        return try finalizeSessionBundle(
+            session, directory: directory, finalizedAt: Date(), variant: .solved)
+    }
+
+    private func finalizeSessionBundle(
+        _ session: ScanSession, directory: URL, finalizedAt: Date,
+        variant: MANTAExportVariant,
+        progress: (@Sendable (Double, String) -> Void)? = nil,
+        verifyFinalArchive: Bool = true
+    ) throws -> MANTAStoreExportResult {
         let bundleID = UUID()
-        let capture = makeCaptureDocument(session)
-        let sources = bundleFileSources(session, in: directory)
+        let capture = makeCaptureDocument(session, variant: variant)
+        let layout = layoutReferenceSources(for: session)
+        let sources = bundleFileSources(session, in: directory, variant: variant) + layout.sources
+        let parentBundleID = variant == .raw
+            ? session.lastRawExportedBundleID : session.lastExportedBundleID
         let changes: [MANTAChangeRecord]
-        if session.lastExportedBundleID == nil {
+        if parentBundleID == nil {
             changes = []
         } else {
             changes = [
                 MANTAChangeRecord(
                     changedAt: finalizedAt,
-                    category: "session-export",
-                    summary: "Exported a revised capture or processing snapshot.",
+                    category: variant == .raw ? "raw-capture-export" : "solved-session-export",
+                    summary: variant == .raw
+                        ? "Exported a revised immutable acquisition snapshot."
+                        : "Exported a revised capture and processing snapshot.",
                     targets: ["capture.json"])
             ]
         }
@@ -130,22 +261,44 @@ struct CaptureArtifactStore {
             createdAt: session.createdAt,
             finalizedAt: finalizedAt,
             bundleID: bundleID,
-            parentBundleID: session.lastExportedBundleID,
+            parentBundleID: parentBundleID,
             changes: changes,
-            files: sources)
+            files: sources,
+            layoutPath: layout.layoutPath,
+            filenameTag: variant.rawValue)
         let outputDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("MANTA Exports", isDirectory: true)
             .appendingPathComponent(bundleID.uuidString, isDirectory: true)
         let finalized = try MANTABundleFinalizer(fileManager: fileManager).finalize(
-            request, in: outputDirectory)
-        let verificationDirectory = outputDirectory.appendingPathComponent("verified", isDirectory: true)
-        _ = try MANTAArchiveImporter(fileManager: fileManager).importBundle(
-            at: finalized.archiveURL, to: verificationDirectory)
-        try fileManager.removeItem(at: verificationDirectory)
+            request, in: outputDirectory
+        ) { fraction, stage in
+            progress?(0.10 + fraction * 0.70, stage)
+        }
+        if verifyFinalArchive {
+            progress?(0.82, "Verifying archive")
+            let verificationDirectory = outputDirectory.appendingPathComponent(
+                "verified", isDirectory: true)
+            _ = try MANTAArchiveImporter(fileManager: fileManager).importBundle(
+                at: finalized.archiveURL, to: verificationDirectory)
+            try fileManager.removeItem(at: verificationDirectory)
+        } else {
+            progress?(0.92, "Sealing archive")
+        }
+        progress?(1.0, "Raw bundle ready")
         return MANTAStoreExportResult(url: finalized.archiveURL, bundleID: bundleID)
     }
 
-    private func makeCaptureDocument(_ session: ScanSession) -> MANTACaptureDocument {
+    private func makeCaptureDocument(
+        _ session: ScanSession, variant: MANTAExportVariant = .solved
+    ) -> MANTACaptureDocument {
+        let coverageCenter: Coordinate3D? = session.headBoundingBox?.center ?? {
+            let points = session.fiducials.compactMap(\.coordinate)
+            guard points.count == 3 else { return nil }
+            return Coordinate3D(
+                x: points.map(\.x).reduce(0, +) / 3,
+                y: points.map(\.y).reduce(0, +) / 3,
+                z: points.map(\.z).reduce(0, +) / 3)
+        }()
         let observations = session.captureObservations.map { observation in
             let depth: MANTADepthArtifact?
             if let path = observation.rawDepthFilename, let format = observation.rawDepthFormat {
@@ -162,21 +315,28 @@ struct CaptureArtifactStore {
             } else {
                 depth = nil
             }
+            var quality = observation.quality
+            if let coverageCenter, observation.cameraTransform.count == 16 {
+                quality?.headCenteredCoverageSector = Self.headCenteredCoverageSector(
+                    transform: observation.cameraTransform, center: coverageCenter)
+            }
             return MANTACaptureObservation(
                 id: observation.id,
                 capturedAt: observation.capturedAt,
                 imagePath: observation.cameraSnapshotFilename,
+                losslessImagePath: observation.losslessCameraSnapshotFilename,
+                compressedImagePath: observation.compressedCameraSnapshotFilename,
                 imageDimensions: MANTAImageDimensions(
                     width: observation.imageResolution.width,
                     height: observation.imageResolution.height),
                 imageOrigin: "top-left",
-                imageOrientation: "up",
+                imageOrientation: observation.imageOrientation ?? "up",
                 intrinsics: observation.cameraIntrinsics.map(Double.init),
                 cameraToWorld: observation.cameraTransform.map(Double.init),
                 worldCoordinateSystem: "arkit-world",
                 depth: depth,
                 trackingState: observation.trackingSummary,
-                quality: observation.quality)
+                quality: quality)
         }
         let mode: String
         switch session.captureMode {
@@ -184,6 +344,42 @@ struct CaptureArtifactStore {
         case .photogrammetry: mode = "photogrammetry"
         case .both: mode = "both"
         }
+        // Fiducials and electrodes are persisted in the ARKit world frame (meters),
+        // matching the declared coordinate system, so a receiver can re-derive the
+        // head frame from the same landmarks the operator placed.
+        let fiducials = variant == .solved ? session.fiducials.map({ fiducial in
+            MANTAFiducialSolution(
+                kind: fiducial.kind.rawValue,
+                coordinateSystem: "arkit-world",
+                coordinate: fiducial.coordinate.map { [$0.x, $0.y, $0.z] },
+                state: fiducial.state.rawValue)
+        }) : []
+        let electrodes = variant == .solved ? session.electrodes.map({ electrode in
+            MANTAElectrodeSolution(
+                label: electrode.label,
+                role: electrode.role.rawValue,
+                coordinateSystem: "arkit-world",
+                coordinate: [electrode.coordinate.x, electrode.coordinate.y, electrode.coordinate.z],
+                confidence: electrode.confidence,
+                state: electrode.state.rawValue)
+        }) : []
+        let reconstruction: MANTAReconstructionReference? = {
+            let objectModel = variant == .solved ? session.photogrammetryModelFilename : nil
+            guard session.lidarMeshFilename != nil
+                    || session.headCroppedLidarMeshFilename != nil
+                    || objectModel != nil
+                    || session.headBoundingBox != nil else {
+                return nil
+            }
+            return MANTAReconstructionReference(
+                lidarMeshPath: session.lidarMeshFilename,
+                headCroppedLidarMeshPath: session.headCroppedLidarMeshFilename,
+                objectCaptureModelPath: objectModel,
+                headBoundingBox: session.headBoundingBox,
+                modelToWorld: variant == .solved ? session.worldAlignmentTransform?.map(Double.init) : nil,
+                worldCoordinateSystem: "arkit-world")
+        }()
+
         return MANTACaptureDocument(
             schema: MANTABundleFormat.captureSchema,
             sessionID: session.id,
@@ -196,14 +392,26 @@ struct CaptureArtifactStore {
                     units: .meters,
                     description: "Right-handed ARKit world frame; camera looks down negative Z.")
             ],
-            observations: observations)
+            observations: observations,
+            fiducials: fiducials.isEmpty ? nil : fiducials,
+            electrodes: electrodes.isEmpty ? nil : electrodes,
+            reconstruction: reconstruction)
     }
 
-    private func bundleFileSources(_ session: ScanSession, in directory: URL) -> [MANTABundleFileSource] {
+    private func bundleFileSources(
+        _ session: ScanSession, in directory: URL, variant: MANTAExportVariant
+    ) -> [MANTABundleFileSource] {
         var items = [String: (mediaType: String, role: String)]()
         for observation in session.captureObservations {
             if let path = observation.cameraSnapshotFilename {
-                items[path] = ("image/jpeg", "camera-image")
+                let mediaType = imageMediaType(for: path)
+                items[path] = (mediaType, "camera-image")
+            }
+            if let path = observation.losslessCameraSnapshotFilename {
+                items[path] = ("image/png", "camera-image-lossless-reference")
+            }
+            if let path = observation.compressedCameraSnapshotFilename {
+                items[path] = (imageMediaType(for: path), "camera-image-compressed-reference")
             }
             if let path = observation.depthSnapshotFilename {
                 items[path] = ("image/png", "depth-preview")
@@ -218,16 +426,20 @@ struct CaptureArtifactStore {
         if let path = session.lidarMeshFilename {
             items[path] = ("application/octet-stream", "lidar-mesh")
         }
-        if let path = session.photogrammetryModelFilename {
+        if let path = session.headCroppedLidarMeshFilename {
+            items[path] = ("application/octet-stream", "lidar-head-mesh")
+        }
+        if variant == .solved, let path = session.photogrammetryModelFilename {
             items[path] = ("model/vnd.usdz+zip", "photogrammetry-model")
         }
-        for path in ["reconstruction/poses.json", "reconstruction/diagnostics.json"] {
+        for path in variant == .solved
+            ? ["reconstruction/poses.json", "reconstruction/diagnostics.json"] : [] {
             if fileManager.fileExists(atPath: directory.appendingPathComponent(path).path) {
                 items[path] = ("application/json", "reconstruction-metadata")
             }
         }
         let runsDirectory = directory.appendingPathComponent("runs", isDirectory: true)
-        if let enumerator = fileManager.enumerator(
+        if variant == .solved, let enumerator = fileManager.enumerator(
             at: runsDirectory, includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]) {
             for case let file as URL in enumerator where file.pathExtension.lowercased() == "json" {
@@ -236,6 +448,14 @@ struct CaptureArtifactStore {
                 items["runs/\(relative)"] =
                     ("application/json", "electrode-detection-run")
             }
+        }
+        for (path, mediaType, role) in [
+            ("capture-receipt.json", "application/json", "capture-validation-receipt"),
+            ("acquisition/context.json", "application/json", "acquisition-context"),
+            ("acquisition/events.jsonl", "application/x-ndjson", "acquisition-event-log"),
+            ("acquisition/fiducial-placements.json", "application/json", "fiducial-placement-evidence")
+        ] where fileManager.fileExists(atPath: directory.appendingPathComponent(path).path) {
+            items[path] = (mediaType, role)
         }
         return items.map { path, metadata in
             MANTABundleFileSource(
@@ -246,12 +466,41 @@ struct CaptureArtifactStore {
         }
     }
 
+    private func imageMediaType(for path: String) -> String {
+        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+        case "png": "image/png"
+        case "heic", "heif": "image/heic"
+        default: "image/jpeg"
+        }
+    }
+
+    private func layoutReferenceSources(
+        for session: ScanSession, bundle: Bundle = .main
+    ) -> (sources: [MANTABundleFileSource], layoutPath: String?) {
+        guard session.layout.hasElectrodeNet else { return ([], nil) }
+        let filenames = ["coordinates_128.xml", "coordinates_256.xml", "HydroCelLayoutMetadata.json"]
+        let sources = filenames.compactMap { filename -> MANTABundleFileSource? in
+            let components = filename.split(separator: ".", maxSplits: 1).map(String.init)
+            guard components.count == 2 else { return nil }
+            let source = ["Layouts", "Resources/Layouts"].compactMap { subdirectory in
+                bundle.url(forResource: components[0], withExtension: components[1], subdirectory: subdirectory)
+            }.first ?? bundle.url(forResource: components[0], withExtension: components[1])
+            guard let source else { return nil }
+            return MANTABundleFileSource(
+                path: "layouts/source/\(filename)", sourceURL: source,
+                mediaType: components[1] == "xml" ? "application/xml" : "application/json",
+                role: components[1] == "xml" ? "layout-coordinate-reference" : "layout-metadata")
+        }
+        let selected = "layouts/source/coordinates_\(session.layout.channelCount).xml"
+        return (sources, sources.contains(where: { $0.path == selected }) ? selected : nil)
+    }
+
     private func producerMetadata() -> MANTAProducer {
         let info = Bundle.main.infoDictionary ?? [:]
         #if canImport(UIKit)
         let platform = UIDevice.current.userInterfaceIdiom == .pad ? "iPadOS" : "iOS"
         let operatingSystemVersion = UIDevice.current.systemVersion
-        let deviceModel = UIDevice.current.model
+        let deviceModel = DeviceHardwareIdentifier.current
         #else
         let platform = "Apple"
         let operatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersionString
@@ -264,6 +513,24 @@ struct CaptureArtifactStore {
             platform: platform,
             operatingSystemVersion: operatingSystemVersion,
             deviceModel: deviceModel)
+    }
+
+    private static func headCenteredCoverageSector(
+        transform: [Float], center: Coordinate3D
+    ) -> String? {
+        guard transform.count == 16 else { return nil }
+        let offset = SIMD3<Double>(
+            Double(transform[12]) - center.x,
+            Double(transform[13]) - center.y,
+            Double(transform[14]) - center.z)
+        let distance = simd_length(offset)
+        guard distance > 0.01 else { return nil }
+        var azimuth = atan2(offset.x, -offset.z) * 180 / .pi
+        if azimuth < 0 { azimuth += 360 }
+        let azimuthBin = Int((azimuth + 22.5) / 45) % 8
+        let elevation = asin(max(-1, min(1, offset.y / distance))) * 180 / .pi
+        let elevationBin = elevation > 20 ? "upper" : elevation < -20 ? "lower" : "level"
+        return "azimuth-\(azimuthBin)-\(elevationBin)"
     }
 
     /// Lightweight summaries of all persisted sessions, newest first. Sorting is
@@ -366,7 +633,10 @@ struct CaptureArtifactStore {
     /// Persists the complete ARKit mesh as binary little-endian PLY so deferred
     /// solvers retain both world-space vertices and triangle topology.
     @discardableResult
-    func writeLiDARMeshSnapshot(_ snapshot: LiDARMeshSnapshot, for session: ScanSession) throws -> String {
+    func writeLiDARMeshSnapshot(
+        _ snapshot: LiDARMeshSnapshot, for session: ScanSession,
+        filename: String = "lidar_mesh.ply"
+    ) throws -> String {
         _ = try sessionDirectory(for: session)
         let reconstruction = reconstructionDirectory(for: session)
         try fileManager.createDirectory(at: reconstruction, withIntermediateDirectories: true)
@@ -396,9 +666,74 @@ struct CaptureArtifactStore {
             data.appendLittleEndian(snapshot.triangleIndices[face * 3 + 1])
             data.appendLittleEndian(snapshot.triangleIndices[face * 3 + 2])
         }
-        let filename = "lidar_mesh.ply"
         try data.write(to: reconstruction.appendingPathComponent(filename), options: .atomic)
         return "reconstruction/\(filename)"
+    }
+
+    /// Reads back a mesh persisted by `writeLiDARMeshSnapshot`, so the head
+    /// surface can be shown (and tapped for fiducials) after a session is
+    /// reopened with the cameras off. Returns nil when no mesh was persisted or
+    /// the file cannot be parsed.
+    func loadLiDARMeshSnapshot(for session: ScanSession) -> LiDARMeshSnapshot? {
+        guard let relativePath = session.lidarMeshFilename else { return nil }
+        let sessionDir = rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
+        let url = sessionDir.appendingPathComponent(relativePath)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return Self.parseBinaryLittleEndianPLY(data)
+    }
+
+    /// Parses the specific binary-little-endian PLY layout written above:
+    /// float32 xyz vertices followed by `uchar(3) + uint32×3` faces.
+    static func parseBinaryLittleEndianPLY(_ data: Data) -> LiDARMeshSnapshot? {
+        let marker = Data("end_header\n".utf8)
+        guard let headerRange = data.range(of: marker) else { return nil }
+        let header = String(decoding: data[data.startIndex..<headerRange.lowerBound], as: UTF8.self)
+
+        var vertexCount = 0
+        var faceCount = 0
+        for line in header.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: " ")
+            guard fields.count == 3, fields[0] == "element" else { continue }
+            if fields[1] == "vertex" { vertexCount = Int(fields[2]) ?? 0 }
+            if fields[1] == "face" { faceCount = Int(fields[2]) ?? 0 }
+        }
+        guard vertexCount > 0 else { return nil }
+
+        let bytes = [UInt8](data[headerRange.upperBound...])
+        var offset = 0
+
+        func readFloat() -> Float? {
+            guard offset + 4 <= bytes.count else { return nil }
+            let bits = UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+            offset += 4
+            return Float(bitPattern: bits)
+        }
+        func readUInt32() -> UInt32? {
+            guard offset + 4 <= bytes.count else { return nil }
+            let value = UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24
+            offset += 4
+            return value
+        }
+
+        var vertices = [SIMD3<Float>]()
+        vertices.reserveCapacity(vertexCount)
+        for _ in 0..<vertexCount {
+            guard let x = readFloat(), let y = readFloat(), let z = readFloat() else { return nil }
+            vertices.append(SIMD3(x, y, z))
+        }
+
+        var triangleIndices = [UInt32]()
+        triangleIndices.reserveCapacity(faceCount * 3)
+        for _ in 0..<faceCount {
+            guard offset < bytes.count, bytes[offset] == 3 else { break }
+            offset += 1
+            guard let a = readUInt32(), let b = readUInt32(), let c = readUInt32() else { break }
+            triangleIndices.append(contentsOf: [a, b, c])
+        }
+
+        return LiDARMeshSnapshot(vertices: vertices, triangleIndices: triangleIndices)
     }
 
     /// Collects the captured RGB frames into a dedicated input folder and writes the pose manifest.
@@ -451,10 +786,11 @@ struct CaptureArtifactStore {
     }
 
     #if canImport(CoreImage) && canImport(UIKit)
-    func writeCameraSnapshot(pixelBuffer: CVPixelBuffer, observationID: UUID, for session: ScanSession) throws -> String {
+    func writeCameraSnapshot(
+        pixelBuffer: CVPixelBuffer, observationID: UUID, for session: ScanSession,
+        includeCompressedImage: Bool = false
+    ) throws -> CameraSnapshotArtifact {
         _ = try sessionDirectory(for: session)
-        let filename = "camera_\(observationID.uuidString).jpg"
-        let url = assetsDirectory(for: session).appendingPathComponent(filename)
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let context = CIContext()
 
@@ -462,10 +798,62 @@ struct CaptureArtifactStore {
             throw CaptureArtifactStoreError.imageEncodingFailed
         }
 
-        guard let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.88) else {
+        // The permanent solver input is lossless. HEIC is an optional comparison
+        // encoding; JPEG remains its automatic fallback when HEIC is unavailable.
+        let primaryPath = try writeLosslessPNGSnapshot(
+            cgImage: cgImage, observationID: observationID, for: session)
+        let compressedPath = includeCompressedImage
+            ? try writeCompressedSnapshot(
+                cgImage: cgImage, observationID: observationID, for: session)
+            : nil
+        return CameraSnapshotArtifact(
+            primaryFilename: primaryPath, compressedFilename: compressedPath)
+    }
+
+    /// Writes the frame as HEIC at the highest quality the encoder exposes.
+    /// Returns `nil` (rather than throwing) when HEIC is unsupported so the caller
+    /// can fall back to JPEG.
+    private func writeHEICSnapshot(
+        cgImage: CGImage, observationID: UUID, for session: ScanSession
+    ) throws -> String? {
+        let filename = "camera_\(observationID.uuidString).heic"
+        let url = assetsDirectory(for: session).appendingPathComponent(filename)
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data as CFMutableData, "public.heic" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(
+            destination, cgImage,
+            [kCGImageDestinationLossyCompressionQuality: 1.0] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        try data.write(to: url, options: .atomic)
+        return "assets/\(filename)"
+    }
+
+    private func writeLosslessPNGSnapshot(
+        cgImage: CGImage, observationID: UUID, for session: ScanSession
+    ) throws -> String {
+        let filename = "camera_\(observationID.uuidString).png"
+        let url = assetsDirectory(for: session).appendingPathComponent(filename)
+        guard let data = UIImage(cgImage: cgImage).pngData() else {
             throw CaptureArtifactStoreError.imageEncodingFailed
         }
+        try data.write(to: url, options: .atomic)
+        return "assets/\(filename)"
+    }
 
+    private func writeCompressedSnapshot(
+        cgImage: CGImage, observationID: UUID, for session: ScanSession
+    ) throws -> String {
+        if let heicPath = try writeHEICSnapshot(
+            cgImage: cgImage, observationID: observationID, for: session
+        ) {
+            return heicPath
+        }
+        let filename = "camera_\(observationID.uuidString)_compressed.jpg"
+        let url = assetsDirectory(for: session).appendingPathComponent(filename)
+        guard let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.95) else {
+            throw CaptureArtifactStoreError.imageEncodingFailed
+        }
         try data.write(to: url, options: .atomic)
         return "assets/\(filename)"
     }
@@ -737,6 +1125,7 @@ enum CaptureArtifactStoreError: LocalizedError {
     case compressionFailed
     case sessionNotFound
     case exportFailed
+    case captureReceiptFailed
 
     var errorDescription: String? {
         switch self {
@@ -754,13 +1143,31 @@ enum CaptureArtifactStoreError: LocalizedError {
             return "That session could not be found on disk."
         case .exportFailed:
             return "The session bundle could not be created."
+        case .captureReceiptFailed:
+            return "Deep capture validation failed. Review capture-receipt.json before exporting."
         }
     }
 }
 
-struct MANTAStoreExportResult {
+enum MANTAExportVariant: String {
+    case raw
+    case solved
+}
+
+struct MANTAStoreExportResult: Sendable {
     var url: URL
     var bundleID: UUID
+}
+
+struct MANTAStoreExportPair: Sendable {
+    var raw: MANTAStoreExportResult
+    var solved: MANTAStoreExportResult
+    var receipt: CaptureReceipt
+}
+
+struct MANTAStoreValidatedExportResult: Sendable {
+    var export: MANTAStoreExportResult
+    var receipt: CaptureReceipt
 }
 
 /// Lightweight, list-friendly view of a persisted session (no observation array).
@@ -794,6 +1201,11 @@ struct DepthSnapshotArtifact {
     var rawConfidenceFormat: RawConfidenceFormat?
     var confidenceSummary: ConfidenceMapSummary?
     var summary: DepthSnapshotSummary
+}
+
+struct CameraSnapshotArtifact {
+    var primaryFilename: String
+    var compressedFilename: String?
 }
 
 struct RawDepthArtifact {

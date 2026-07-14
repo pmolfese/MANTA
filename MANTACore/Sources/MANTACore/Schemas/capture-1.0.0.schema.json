@@ -25,6 +25,44 @@
         "additionalProperties": true
       }
     },
+    "reconstruction": {
+      "type": "object",
+      "required": ["worldCoordinateSystem"],
+      "properties": {
+        "lidarMeshPath": { "type": "string", "minLength": 1 },
+        "headCroppedLidarMeshPath": { "type": "string", "minLength": 1 },
+        "objectCaptureModelPath": { "type": "string", "minLength": 1 },
+        "headBoundingBox": {
+          "type": "object",
+          "required": ["center", "widthMeters", "heightMeters", "depthMeters"],
+          "properties": {
+            "center": {
+              "type": "object",
+              "required": ["x", "y", "z"],
+              "properties": {
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "z": { "type": "number" }
+              },
+              "additionalProperties": false
+            },
+            "widthMeters": { "type": "number", "exclusiveMinimum": 0 },
+            "heightMeters": { "type": "number", "exclusiveMinimum": 0 },
+            "depthMeters": { "type": "number", "exclusiveMinimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "modelToWorld": { "type": "array", "minItems": 16, "maxItems": 16, "items": { "type": "number" } },
+        "worldCoordinateSystem": { "type": "string", "minLength": 1 }
+      },
+      "anyOf": [
+        { "required": ["lidarMeshPath"] },
+        { "required": ["headCroppedLidarMeshPath"] },
+        { "required": ["objectCaptureModelPath"] },
+        { "required": ["headBoundingBox"] }
+      ],
+      "additionalProperties": false
+    },
     "observations": {
       "type": "array",
       "items": {
@@ -72,6 +110,7 @@
         "translationFromPreviousSampleMeters": { "type": "number", "minimum": 0 },
         "rotationFromPreviousSampleDegrees": { "type": "number", "minimum": 0 },
         "coverageSector": { "type": "string", "minLength": 1 },
+        "headCenteredCoverageSector": { "type": "string", "minLength": 1 },
         "validDepthFraction": { "type": "number", "minimum": 0, "maximum": 1 },
         "highConfidenceDepthFraction": { "type": "number", "minimum": 0, "maximum": 1 },
         "warnings": { "type": "array", "items": { "type": "string" } }

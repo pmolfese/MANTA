@@ -4,6 +4,12 @@ import Testing
 @testable import MANTACore
 
 struct MANTABundleFinalizerTests {
+    @Test func tableCRC32MatchesZIPReferenceVector() {
+        var crc = MANTACRC32()
+        crc.update(Data("123456789".utf8))
+        #expect(crc.finalize() == 0xcbf4_3926)
+    }
+
     @Test func identicalRequestsProduceByteIdenticalArchives() throws {
         let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data("camera-bytes".utf8).write(to: source)

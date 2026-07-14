@@ -12,6 +12,7 @@ struct ContentView: View {
     @StateObject private var viewModel = ScanSessionViewModel()
     @State private var showSidebar = false
     @State private var showLibrary = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -26,9 +27,21 @@ struct ContentView: View {
                 SidebarView(viewModel: viewModel)
                     .frame(width: 320)
                     .frame(maxHeight: .infinity)
-                    .background(.regularMaterial)
+                    // The underlying scan header has a fixed horizontal Divider.
+                    // A translucent material allowed it to show through while the
+                    // sidebar List scrolled, appearing as a stuck display line.
+                    .background(Color(uiColor: .systemBackground).ignoresSafeArea())
                     .overlay(alignment: .trailing) { Divider() }
                     .transition(.move(edge: .leading))
+            }
+
+            if viewModel.isExporting {
+                ExportProgressOverlay(
+                    progress: viewModel.exportProgress,
+                    stage: viewModel.exportStage,
+                    startedAt: viewModel.exportStartedAt)
+                .transition(.opacity)
+                .zIndex(10)
             }
         }
         .animation(.easeInOut(duration: 0.22), value: showSidebar)
@@ -37,6 +50,51 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showLibrary) {
             SessionLibraryView(viewModel: viewModel)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            viewModel.recordAppLifecycle(String(describing: phase))
+        }
+    }
+}
+
+private struct ExportProgressOverlay: View {
+    var progress: Double
+    var stage: String
+    var startedAt: Date?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.5).ignoresSafeArea()
+            VStack(spacing: 16) {
+                Image(systemName: "archivebox.fill")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.teal)
+                Text("Exporting Raw Acquisition")
+                    .font(.title3.weight(.semibold))
+                Text(stage)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .frame(maxWidth: 520)
+                Text("\(Int((progress * 100).rounded()))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if let startedAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text("\(max(0, Int(context.date.timeIntervalSince(startedAt)))) s elapsed")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Keep MANTA open until the share sheet appears.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(28)
+            .frame(maxWidth: 620)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+            .padding(24)
         }
     }
 }
@@ -60,33 +118,92 @@ private struct SidebarView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Picker("Layout", selection: $viewModel.selectedLayoutName) {
+                Picker("Net", selection: layoutSelection) {
                     ForEach(viewModel.availableLayouts, id: \.name) { layout in
-                        Text("\(layout.channelCount)").tag(layout.name)
+                        Text(layout.hasElectrodeNet
+                             ? "\(layout.channelCount) channels · \(layout.name)"
+                             : "No Net · Head Mesh Only")
+                            .tag(layout.name)
                     }
                 }
-                .onChange(of: viewModel.selectedLayoutName) { _, newValue in
-                    viewModel.selectLayout(named: newValue)
+
+                if viewModel.session.layout.hasElectrodeNet {
+                    Toggle("Live Electrode Detection", isOn: $viewModel.liveDetectionEnabled)
+                        .onChange(of: viewModel.liveDetectionEnabled) { _, enabled in
+                            viewModel.setLiveDetectionEnabled(enabled)
+                        }
+                } else {
+                    Label(
+                        "Mesh-only capture; electrode detection and net solving are off.",
+                        systemImage: "person.crop.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
 
-                Toggle("Live Electrode Detection", isOn: $viewModel.liveDetectionEnabled)
-                    .onChange(of: viewModel.liveDetectionEnabled) { _, enabled in
-                        viewModel.setLiveDetectionEnabled(enabled)
-                    }
+                Toggle(
+                    "Also Save HEIC",
+                    isOn: $viewModel.captureCompressedImageReferences
+                )
+                .disabled(!viewModel.session.captureObservations.isEmpty)
 
-                LabeledContent("Live results", value: "\(viewModel.liveDirectElectrodeCount)")
-                Text(viewModel.liveDetectionStatus)
+                Text("Lossless PNG is always saved as the primary image. This debug option also saves HEIC, with high-quality JPEG fallback. Set before the first sample.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                if viewModel.session.layout.hasElectrodeNet {
+                    LabeledContent("Live results", value: "\(viewModel.liveDirectElectrodeCount)")
+                    Text(viewModel.liveDetectionStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        Task {
+                            await viewModel.finalizeElectrodeDetection()
+                        }
+                    } label: {
+                        Label("Finalize Electrode Detection", systemImage: "viewfinder")
+                    }
+                    .disabled(viewModel.isDetecting || viewModel.session.captureObservations.isEmpty)
+                }
+            }
+
+            Section("Head Region") {
+                Toggle(
+                    "Ask for Head Region on Start",
+                    isOn: $viewModel.requestHeadRegionOnScanStart)
+                    .disabled(viewModel.scanViewModel.status.isRunning)
+
                 Button {
-                    Task {
-                        await viewModel.finalizeElectrodeDetection()
+                    if viewModel.isHeadBoundsPlacementActive {
+                        viewModel.isHeadBoundsPlacementActive = false
+                    } else {
+                        viewModel.startHeadBoundsPlacement()
                     }
                 } label: {
-                    Label("Finalize Electrode Detection", systemImage: "viewfinder")
+                    Label(
+                        viewModel.isHeadBoundsPlacementActive ? "Cancel Head Region" : "Set Head Region",
+                        systemImage: "cube.transparent")
                 }
-                .disabled(viewModel.isDetecting || viewModel.session.captureObservations.isEmpty)
+                .disabled(!viewModel.scanViewModel.status.isRunning)
+
+                if viewModel.session.headBoundingBox != nil {
+                    LabeledContent("Width", value: String(
+                        format: "%.0f cm", (viewModel.session.headBoundingBox?.widthMeters ?? 0) * 100))
+                    Slider(value: boundsBinding(\.widthMeters), in: 0.25...0.60, step: 0.01)
+                    LabeledContent("Height", value: String(
+                        format: "%.0f cm", (viewModel.session.headBoundingBox?.heightMeters ?? 0) * 100))
+                    Slider(value: boundsBinding(\.heightMeters), in: 0.30...0.65, step: 0.01)
+                    LabeledContent("Depth", value: String(
+                        format: "%.0f cm", (viewModel.session.headBoundingBox?.depthMeters ?? 0) * 100))
+                    Slider(value: boundsBinding(\.depthMeters), in: 0.25...0.60, step: 0.01)
+                    Button("Show Full Environment", role: .destructive) {
+                        viewModel.clearHeadBoundingBox()
+                    }
+                }
+
+                Text("Tap the visible head once. MANTA keeps the full raw mesh but focuses the live and derived mesh on this adjustable box.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if !viewModel.liveElectrodes.isEmpty || !viewModel.session.electrodes.isEmpty {
@@ -173,42 +290,86 @@ private struct SidebarView: View {
             }
 
             Section("Session") {
-                LabeledContent("Layout", value: viewModel.session.layout.name)
+                LabeledContent(
+                    "Net",
+                    value: viewModel.session.layout.hasElectrodeNet
+                        ? viewModel.session.layout.name : "None · Head Mesh Only")
                 LabeledContent("AR Samples", value: "\(viewModel.session.captureObservations.count)")
                 if !viewModel.diagnosticsPath.isEmpty {
                     LabeledContent("Diagnostics", value: URL(fileURLWithPath: viewModel.diagnosticsPath).lastPathComponent)
                 }
-                LabeledContent("Detected", value: "\(viewModel.session.detectedElectrodeCount)")
-                LabeledContent("Reviewed", value: "\(viewModel.session.reviewedElectrodeCount)")
-                LabeledContent("Fiducials", value: viewModel.session.fiducialsReady ? "Placed" : "Needed")
+                if viewModel.session.layout.hasElectrodeNet {
+                    LabeledContent("Detected", value: "\(viewModel.session.detectedElectrodeCount)")
+                    LabeledContent("Reviewed", value: "\(viewModel.session.reviewedElectrodeCount)")
+                }
+                LabeledContent(
+                    "Fiducials",
+                    value: viewModel.session.fiducialsReady
+                        ? "Placed"
+                        : viewModel.session.layout.hasElectrodeNet ? "Needed" : "Optional")
+                ForEach(viewModel.fiducialPlausibilityWarnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Section("Export") {
-                Picker("Format", selection: $viewModel.selectedFormat) {
-                    ForEach(ElectrodeExportFormat.allCases) { format in
-                        Text(format.rawValue).tag(format)
-                    }
-                }
-                .onChange(of: viewModel.selectedFormat) { _, newValue in
-                    viewModel.updateFormat(newValue)
-                }
-
                 Button {
-                    showExportPreview.toggle()
+                    viewModel.exportRawSession(id: viewModel.session.id)
                 } label: {
-                    Label(showExportPreview ? "Hide Preview" : "Preview", systemImage: "doc.text.magnifyingglass")
+                    Label("Export Raw", systemImage: "archivebox")
                 }
+                .disabled(viewModel.session.captureObservations.isEmpty)
 
-                if showExportPreview {
-                    ScrollView(.horizontal) {
-                        Text(viewModel.exportPreview.isEmpty ? "Finalize detection to preview an export." : viewModel.exportPreview)
-                            .font(.system(.caption2, design: .monospaced))
-                            .textSelection(.enabled)
+                Text("Creates a validated acquisition-only .manta for later solving on iPad or macOS.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if viewModel.session.layout.hasElectrodeNet {
+                    Picker("Format", selection: $viewModel.selectedFormat) {
+                        ForEach(ElectrodeExportFormat.allCases) { format in
+                            Text(format.rawValue).tag(format)
+                        }
                     }
-                    .frame(maxHeight: 180)
+                    .onChange(of: viewModel.selectedFormat) { _, newValue in
+                        viewModel.updateFormat(newValue)
+                    }
+
+                    Button {
+                        showExportPreview.toggle()
+                    } label: {
+                        Label(showExportPreview ? "Hide Preview" : "Preview", systemImage: "doc.text.magnifyingglass")
+                    }
+
+                    if showExportPreview {
+                        ScrollView(.horizontal) {
+                            Text(viewModel.exportPreview.isEmpty ? "Finalize detection to preview an export." : viewModel.exportPreview)
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxHeight: 180)
+                    }
                 }
             }
         }
+        .sheet(item: $viewModel.exportedBundle) { bundle in
+            ShareSheet(items: bundle.urls)
+        }
+    }
+
+    private var layoutSelection: Binding<String> {
+        Binding(
+            get: { viewModel.selectedLayoutName },
+            set: { viewModel.selectLayout(named: $0) })
+    }
+
+    private func boundsBinding(_ keyPath: WritableKeyPath<HeadBoundingBox, Double>) -> Binding<Double> {
+        Binding(
+            get: { viewModel.session.headBoundingBox?[keyPath: keyPath] ?? 0.40 },
+            set: { value in
+                viewModel.updateHeadBoundingBox { $0[keyPath: keyPath] = value }
+            })
     }
 }
 
@@ -217,19 +378,40 @@ private struct ScanReviewView: View {
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
     @State private var visualMode: CaptureVisualMode = .split
+    @State private var showPhoneReview = false
+
+    private var isPhone: Bool { UIDevice.current.userInterfaceIdiom == .phone }
 
     var body: some View {
         VStack(spacing: 0) {
             ScanHeaderView(
                 viewModel: viewModel,
                 showSidebar: $showSidebar,
-                showLibrary: $showLibrary
+                showLibrary: $showLibrary,
+                compact: isPhone
             )
 
             Divider()
 
             GeometryReader { geometry in
-                if geometry.size.width > geometry.size.height {
+                if isPhone {
+                    VStack(spacing: 0) {
+                        CaptureVisualTabs(
+                            viewModel: viewModel,
+                            selection: $visualMode,
+                            splitHorizontally: geometry.size.width > geometry.size.height
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        Divider()
+
+                        PhoneCaptureBar(
+                            viewModel: viewModel,
+                            scanViewModel: viewModel.scanViewModel,
+                            showReview: { showPhoneReview = true }
+                        )
+                    }
+                } else if geometry.size.width > geometry.size.height {
                     HStack(spacing: 0) {
                         CaptureVisualTabs(
                             viewModel: viewModel,
@@ -275,6 +457,22 @@ private struct ScanReviewView: View {
             }
         }
         .navigationTitle(viewModel.session.name)
+        .onAppear {
+            if isPhone, visualMode == .split { visualMode = .camera }
+        }
+        .sheet(isPresented: $showPhoneReview) {
+            NavigationStack {
+                PortraitReviewTabs(viewModel: viewModel)
+                    .navigationTitle("Capture Review")
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showPhoneReview = false }
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
     }
 }
 
@@ -282,9 +480,10 @@ private struct ScanHeaderView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Binding var showSidebar: Bool
     @Binding var showLibrary: Bool
+    var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: compact ? 6 : 12) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 12) {
@@ -299,9 +498,10 @@ private struct ScanHeaderView: View {
                         Button {
                             showLibrary = true
                         } label: {
-                            Label("Subjects", systemImage: "person.crop.rectangle.stack")
+                            Image(systemName: "person.crop.rectangle.stack")
                         }
                         .buttonStyle(.bordered)
+                        .accessibilityLabel("Subjects")
                         .help("Subject library")
                     }
 
@@ -310,21 +510,46 @@ private struct ScanHeaderView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
-                        .frame(maxWidth: 230, alignment: .leading)
-                        .padding(.leading, 48)
+                        .frame(maxWidth: compact ? 150 : 230, alignment: .leading)
+                        .padding(.leading, compact ? 0 : 48)
                 }
 
                 Spacer(minLength: 12)
 
-                VStack(spacing: 6) {
-                    ScanStatusOverlay(viewModel: viewModel)
-                    SessionStatusOverlay(viewModel: viewModel)
+                if compact {
+                    CompactPhoneStatus(viewModel: viewModel)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    VStack(spacing: 6) {
+                        ScanStatusOverlay(viewModel: viewModel)
+                        SessionStatusOverlay(viewModel: viewModel)
+                    }
+                    .frame(maxWidth: 520)
+                    .layoutPriority(1)
                 }
-                .frame(maxWidth: 520)
-                .layoutPriority(1)
             }
         }
-        .padding()
+        .padding(compact ? 10 : 16)
+    }
+}
+
+private struct CompactPhoneStatus: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(viewModel.scanViewModel.status.trackingSummary, systemImage: "location.viewfinder")
+            Divider().frame(height: 18)
+            Label("\(viewModel.session.captureObservations.count)", systemImage: "camera")
+            Divider().frame(height: 18)
+            Label("\(viewModel.captureCoverageSectorCount)/24", systemImage: "circle.grid.3x3")
+        }
+        .font(.caption.weight(.semibold))
+        .lineLimit(1)
+        .minimumScaleFactor(0.65)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
     }
 }
 
@@ -333,21 +558,30 @@ private struct SessionStatusOverlay: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            StatusPill(
-                title: "Electrodes",
-                value: "\(viewModel.session.detectedElectrodeCount)",
-                systemImage: "point.3.connected.trianglepath.dotted")
-            StatusPill(
-                title: "Live",
-                value: "\(viewModel.liveDirectElectrodeCount)",
-                systemImage: "dot.radiowaves.left.and.right")
-            StatusPill(
-                title: "Reviewed",
-                value: "\(viewModel.session.reviewedElectrodeCount)",
-                systemImage: "checkmark.seal")
+            if viewModel.session.layout.hasElectrodeNet {
+                StatusPill(
+                    title: "Electrodes",
+                    value: "\(viewModel.session.detectedElectrodeCount)",
+                    systemImage: "point.3.connected.trianglepath.dotted")
+                StatusPill(
+                    title: "Live",
+                    value: "\(viewModel.liveDirectElectrodeCount)",
+                    systemImage: "dot.radiowaves.left.and.right")
+                StatusPill(
+                    title: "Reviewed",
+                    value: "\(viewModel.session.reviewedElectrodeCount)",
+                    systemImage: "checkmark.seal")
+            } else {
+                StatusPill(
+                    title: "Acquisition",
+                    value: "Head Mesh",
+                    systemImage: "person.crop.circle")
+            }
             StatusPill(
                 title: "Fiducials",
-                value: viewModel.session.fiducialsReady ? "3/3" : "0/3",
+                value: viewModel.session.fiducialsReady
+                    ? "3/3"
+                    : viewModel.session.layout.hasElectrodeNet ? "0/3" : "Optional",
                 systemImage: "scope")
             StatusPill(
                 title: "AR Samples",
@@ -367,7 +601,7 @@ private struct LiveCameraSurface: View {
                 viewModel.handleScanTap(viewPoint: point)
             }
 
-            if let prompt = viewModel.fiducialPlacementPrompt {
+            if let prompt = viewModel.scanPlacementPrompt {
                 Label(prompt, systemImage: "hand.tap.fill")
                     .font(.headline)
                     .padding(.horizontal, 14)
@@ -568,6 +802,107 @@ private struct CompactCaptureControls: View {
         .padding()
         .frame(minWidth: 240)
         .presentationCompactAdaptation(.popover)
+    }
+}
+
+private struct PhoneCaptureBar: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+    @ObservedObject var scanViewModel: ARScanViewModel
+    var showReview: () -> Void
+    @State private var showRatePopover = false
+
+    var body: some View {
+        VStack(spacing: 7) {
+            HStack(spacing: 0) {
+                PhoneActionButton(
+                    title: scanViewModel.status.isRunning ? "Pause" : "Start",
+                    systemImage: scanViewModel.status.isRunning ? "pause.fill" : "play.fill",
+                    tint: scanViewModel.status.isRunning ? .orange : .blue
+                ) {
+                    scanViewModel.status.isRunning
+                        ? viewModel.pauseLiveScan() : viewModel.startLiveScan()
+                }
+                .disabled(!scanViewModel.status.isSupported)
+
+                PhoneActionButton(
+                    title: viewModel.isAutoSampling ? "Stop Auto" : "Auto",
+                    systemImage: viewModel.isAutoSampling ? "stop.fill" : "camera.metering.matrix",
+                    tint: viewModel.isAutoSampling ? .red : .blue
+                ) {
+                    viewModel.isAutoSampling
+                        ? viewModel.stopAutoSampling() : viewModel.startAutoSampling()
+                }
+                .disabled(!scanViewModel.status.isSupported || viewModel.isGuidedFiducialPlacementActive)
+                .simultaneousGesture(LongPressGesture().onEnded { _ in showRatePopover = true })
+                .popover(isPresented: $showRatePopover) { ratePopover }
+
+                PhoneActionButton(title: "Sample", systemImage: "camera.badge.ellipsis", tint: .teal) {
+                    viewModel.sampleCurrentARFrame()
+                }
+                .disabled(!scanViewModel.status.isRunning || viewModel.isGuidedFiducialPlacementActive)
+
+                PhoneActionButton(
+                    title: viewModel.isGuidedFiducialPlacementActive ? "Cancel" : "Fiducials",
+                    systemImage: viewModel.isGuidedFiducialPlacementActive ? "xmark" : "scope",
+                    tint: viewModel.isGuidedFiducialPlacementActive ? .orange : .purple
+                ) {
+                    viewModel.isGuidedFiducialPlacementActive
+                        ? viewModel.cancelGuidedFiducialPlacement()
+                        : viewModel.startGuidedFiducialPlacement()
+                }
+                .disabled(!scanViewModel.status.isRunning)
+
+                PhoneActionButton(title: "Review", systemImage: "point.3.connected.trianglepath.dotted", tint: .indigo) {
+                    showReview()
+                }
+            }
+
+            Text(scanViewModel.status.message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 7)
+        .background(Color(.secondarySystemBackground))
+    }
+
+    private var ratePopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Auto Sample Rate").font(.headline)
+            Stepper(
+                "\(viewModel.autoSamplingInterval, specifier: "%.2f")s per sample",
+                value: $viewModel.autoSamplingInterval, in: 0.25...3, step: 0.25)
+        }
+        .padding().frame(minWidth: 240)
+        .presentationCompactAdaptation(.popover)
+    }
+}
+
+private struct PhoneActionButton: View {
+    var title: String
+    var systemImage: String
+    var tint: Color
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(height: 22)
+                Text(title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity, minHeight: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

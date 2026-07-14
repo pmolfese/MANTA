@@ -24,6 +24,8 @@ public struct MANTABundleFinalizationRequest: Sendable {
     public var parentBundleID: UUID?
     public var changes: [MANTAChangeRecord]
     public var files: [MANTABundleFileSource]
+    public var layoutPath: String?
+    public var filenameTag: String?
 
     public init(
         capture: MANTACaptureDocument,
@@ -33,7 +35,8 @@ public struct MANTABundleFinalizationRequest: Sendable {
         bundleID: UUID = UUID(),
         parentBundleID: UUID? = nil,
         changes: [MANTAChangeRecord] = [],
-        files: [MANTABundleFileSource] = []
+        files: [MANTABundleFileSource] = [], layoutPath: String? = nil,
+        filenameTag: String? = nil
     ) {
         self.capture = capture
         self.producer = producer
@@ -43,6 +46,8 @@ public struct MANTABundleFinalizationRequest: Sendable {
         self.parentBundleID = parentBundleID
         self.changes = changes
         self.files = files
+        self.layoutPath = layoutPath
+        self.filenameTag = filenameTag
     }
 }
 
@@ -85,15 +90,17 @@ public struct MANTABundleFinalizer {
 
     public func finalize(
         _ request: MANTABundleFinalizationRequest,
-        in outputDirectory: URL
+        in outputDirectory: URL,
+        progress: (@Sendable (Double, String) -> Void)? = nil
     ) throws -> MANTAFinalizedBundle {
+        progress?(0.01, "Preparing archive")
         guard (request.parentBundleID == nil) == request.changes.isEmpty else {
             throw MANTABundleFinalizationError.invalidLineage
         }
 
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let archiveURL = outputDirectory.appendingPathComponent(
-            MANTABundleFilename.timestamped(for: request.finalizedAt))
+            MANTABundleFilename.timestamped(for: request.finalizedAt, tag: request.filenameTag))
         guard !fileManager.fileExists(atPath: archiveURL.path) else {
             throw MANTABundleFinalizationError.destinationExists(archiveURL.lastPathComponent)
         }
@@ -130,7 +137,8 @@ public struct MANTABundleFinalizer {
         }
 
         var paths = Set(metadata.map(\.path))
-        for source in request.files.sorted(by: { $0.path < $1.path }) {
+        let sortedSources = request.files.sorted(by: { $0.path < $1.path })
+        for (index, source) in sortedSources.enumerated() {
             try validate(path: source.path)
             guard source.path != MANTABundleFormat.manifestFilename,
                   source.path != "capture.json", source.path != "log_manta.json" else {
@@ -149,17 +157,28 @@ public struct MANTABundleFinalizer {
                 at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fileManager.copyItem(at: source.sourceURL, to: destination)
             metadata.append((source.path, source.mediaType, source.role))
+            progress?(
+                0.05 + 0.30 * Double(index + 1) / Double(max(1, sortedSources.count)),
+                "Staging files")
         }
 
-        let entries = try metadata.sorted(by: { $0.path < $1.path }).map { item in
+        let sortedMetadata = metadata.sorted(by: { $0.path < $1.path })
+        var crc32ByPath = [String: UInt32]()
+        let entries = try sortedMetadata.enumerated().map { index, item in
             let url = staging.appendingPathComponent(item.path)
             let values = try url.resourceValues(forKeys: [.fileSizeKey])
-            return MANTAFileEntry(
+            let digests = try digests(of: url)
+            crc32ByPath[item.path] = digests.crc32
+            let entry = MANTAFileEntry(
                 path: item.path,
                 mediaType: item.mediaType,
                 role: item.role,
                 size: Int64(values.fileSize ?? 0),
-                sha256: try sha256(of: url))
+                sha256: digests.sha256)
+            progress?(
+                0.35 + 0.25 * Double(index + 1) / Double(max(1, sortedMetadata.count)),
+                "Hashing files")
+            return entry
         }
 
         let manifest = MANTABundleManifest(
@@ -172,14 +191,21 @@ public struct MANTABundleFinalizer {
             producer: request.producer,
             content: MANTAContentReferences(
                 capture: "capture.json",
+                layout: request.layoutPath,
                 changeLog: request.parentBundleID == nil ? nil : "log_manta.json"),
             files: entries)
         try MANTAJSON.canonicalData(manifest).write(
             to: staging.appendingPathComponent(MANTABundleFormat.manifestFilename), options: .atomic)
 
-        _ = try MANTABundleValidator(fileManager: fileManager).validate(directory: staging)
+        progress?(0.64, "Validating staged bundle")
+        // SHA-256 was just computed from every staged byte above. Repeating the
+        // hashes here adds a full payload pass without increasing assurance.
+        _ = try MANTABundleValidator(fileManager: fileManager).validate(
+            directory: staging, verifyFileHashes: false)
+        progress?(0.76, "Creating archive")
         try MANTADeterministicZIP(fileManager: fileManager).write(
-            directory: staging, to: archiveURL)
+            directory: staging, to: archiveURL, precomputedCRC32: crc32ByPath)
+        progress?(1.0, "Archive created")
         try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: archiveURL.path)
         return MANTAFinalizedBundle(archiveURL: archiveURL, manifest: manifest)
     }
@@ -207,13 +233,17 @@ public struct MANTABundleFinalizer {
         }
     }
 
-    private func sha256(of url: URL) throws -> String {
+    private func digests(of url: URL) throws -> (sha256: String, crc32: UInt32) {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
         var hasher = SHA256()
-        while let chunk = try input.read(upToCount: 64 * 1024), !chunk.isEmpty {
+        var crc = MANTACRC32()
+        while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
             hasher.update(data: chunk)
+            crc.update(chunk)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return (
+            hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            crc.finalize())
     }
 }

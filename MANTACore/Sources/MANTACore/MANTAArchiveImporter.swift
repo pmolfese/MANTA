@@ -273,7 +273,7 @@ public struct MANTAArchiveImporter {
         }
         var crc = MANTACRC32()
         while remaining > 0 {
-            let count = min(remaining, 64 * 1024)
+            let count = min(remaining, 1024 * 1024)
             let chunk = try read(handle, offset: offset, count: count)
             try output.write(contentsOf: chunk)
             crc.update(chunk)
@@ -317,21 +317,6 @@ private struct ZIPEntry {
     var localHeaderOffset: UInt32
     var archiveDataEnd: UInt32
     var isDirectory: Bool
-}
-
-private struct MANTACRC32 {
-    private var value = UInt32.max
-
-    mutating func update(_ data: Data) {
-        for byte in data {
-            value ^= UInt32(byte)
-            for _ in 0..<8 {
-                value = (value >> 1) ^ (0xedb88320 & (0 &- (value & 1)))
-            }
-        }
-    }
-
-    func finalize() -> UInt32 { value ^ UInt32.max }
 }
 
 private extension Data {

@@ -32,6 +32,9 @@ are in the root [README](../README.md).
   and PHI-free UTC `yyyyMMdd_HHmmss.manta` filenames.
 - [x] Implement deterministic encoding, hashing, validation, immutable archive
   creation, and bundle finalization.
+- [x] Preserve one immutable, validated RAW archive and one mutable directory-backed
+  PROCESSED package. Reconstruction, alignment, fiducial review, and later solves
+  replace only their changed assets/JSON and append to a lightweight audit log.
 - [x] Make iOS **Export** finalize the current working session as `.manta`; keep
   the most recently exported bundle ID so subsequent exports form a logged
   lineage without exposing Save As in the iOS UI.
@@ -76,8 +79,13 @@ are in the root [README](../README.md).
 
 ## macOS receiver
 
-- [ ] Add a separate empty SwiftUI macOS target to `MANTA.xcodeproj`.
-- [ ] Import, validate, and inspect local `.manta` files before adding networking.
+- [x] Add a separate SwiftUI macOS receiver target to `MANTA.xcodeproj`.
+- [~] Import, validate, and inspect local `.manta` files before adding networking;
+  local file import now preserves the source archive in app-managed storage,
+  performs hardened extraction/validation, and shows capture metadata, saved
+  camera frames with projected annotations, an interactive LiDAR/ObjectCapture
+  surface with solution markers, and the manifest inventory. A persistent
+  import library and depth/confidence previews remain.
 - [ ] Keep imported `.manta` snapshots read-only on macOS and expose **Save As…**
   for derived MANTA snapshots.
 - [ ] Run offline detection, reconstruction, comparison, review, and export using
@@ -126,3 +134,52 @@ are in the root [README](../README.md).
   macOS receiver.
 - [ ] Define retention, de-identification, encryption-at-rest, access-control,
   and audit policy for captures containing PHI.
+
+## Reflective Assist and mesh-raycast localization
+
+- [ ] Prototype optional Reflective Assist capture using paired ambient and
+  flash-illuminated AR frames; retain the flash frame only as detection evidence
+  and explicitly exclude it from photogrammetry reconstruction inputs.
+- [ ] Verify on target iOS 26 LiDAR devices that customized high-resolution AR
+  capture fires the flash as requested, preserves usable camera intrinsics and
+  pose, and determine whether the returned frame includes scene depth.
+- [ ] Persist each ambient and flash image as a separately calibrated observation
+  linked by a capture-group ID, with illumination, image purpose, flash-requested,
+  and flash-fired provenance.
+- [ ] Collect normal/flash pairs from real HydroCel 128- and 256-channel nets
+  under varied lighting, range, viewing-angle, hair, gel/moisture, and motion
+  conditions before selecting detection thresholds.
+- [ ] Detect flash-responsive disk candidates using exposure-normalized local
+  contrast, connected components, and plausible disk geometry; measure false
+  responses from cables, hair, skin, moisture, glasses, and nearby equipment.
+- [ ] Use flash response to seed the electrode region, then refine the physical
+  disk center from the ambient image using rim/contour or ellipse fitting rather
+  than treating the OCR text center as the electrode center.
+- [ ] Add `PinholeCamera.ray(through:)` so any calibrated image pixel can produce
+  a world-space camera origin and direction.
+- [ ] Add a reusable electrode spatial localizer that tries robust depth-neighborhood
+  sampling first, falls back to the nearest LiDAR mesh intersection, and records
+  the selected method and confidence with every result.
+- [ ] Use mesh raycasting to localize flash detections when the flash observation
+  has no usable depth, and associate ambient OCR and flash disk evidence in ARKit
+  world space instead of requiring exact pixel registration between the pair.
+- [ ] Reject or reduce confidence for reflective candidates whose rays miss the
+  reconstructed head, land outside the cap region, disagree materially with
+  synchronized depth, or intersect the surface at a grazing angle.
+- [ ] Define whether exported electrode coordinates represent the visible disk
+  center, sensor housing center, scalp contact, or projection onto the head
+  surface; validate any surface-normal offset on real hardware before applying it.
+- [ ] Separate position provenance from label provenance so a directly observed
+  disk with a geometrically inferred identity remains distinguishable from both
+  an OCR-labeled observation and a wholly template-predicted electrode.
+- [ ] Fuse repeated raycast hits across views, favoring sharp frames, strong
+  reflection evidence, high-confidence depth, and near-normal surface incidence.
+- [ ] Benchmark the existing brute-force triangle raycaster for full-session
+  electrode detection; add a cached BVH/AABB acceleration structure if candidate
+  count and mesh size prevent responsive live or offline solving.
+- [ ] Add an operator-controlled Reflective Assist toggle and conservative flash
+  cadence, capability/thermal fallback, exposure-settling behavior, and participant
+  comfort guidance; do not implement continuous strobing.
+- [ ] Validate the feature by reporting disk precision/recall, center error,
+  directly localized electrode yield, final 3D error, and any effect on capture
+  time, thermal state, participant comfort, and reconstruction quality.

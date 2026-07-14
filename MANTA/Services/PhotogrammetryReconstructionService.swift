@@ -45,6 +45,8 @@ struct ReconstructionDiagnostics: Codable, Equatable {
     var requestedDetail: String
     var skippedSampleIDs: [String]
     var automaticDownsampling: Bool
+    var producer: [String: String]? = nil
+    var parameters: [String: String]? = nil
 }
 
 /// One captured frame's pose in the ARKit world, persisted next to the input images.

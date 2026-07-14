@@ -81,8 +81,19 @@ struct SessionLibraryView: View {
                                     Label("Export", systemImage: "square.and.arrow.up")
                                 }
                                 .tint(.green)
+                                Button {
+                                    viewModel.exportRawSession(id: summary.id)
+                                } label: {
+                                    Label("Raw", systemImage: "archivebox")
+                                }
+                                .tint(.teal)
                             }
                             .contextMenu {
+                                Button {
+                                    viewModel.exportRawSession(id: summary.id)
+                                } label: {
+                                    Label("Export raw acquisition", systemImage: "archivebox")
+                                }
                                 Button {
                                     viewModel.exportSession(id: summary.id)
                                 } label: {
@@ -112,7 +123,7 @@ struct SessionLibraryView: View {
             }
             .onAppear { viewModel.refreshSessions() }
             .sheet(item: $viewModel.exportedBundle) { bundle in
-                ShareSheet(items: [bundle.url])
+                ShareSheet(items: bundle.urls)
             }
             .alert("Rename subject", isPresented: renameIsPresented) {
                 TextField("Subject / MRN", text: $renameText)
@@ -189,7 +200,7 @@ private struct SessionRow: View {
 #if canImport(UIKit)
 /// Wraps `UIActivityViewController` so exported bundles can be shared
 /// (AirDrop, Files, Mail, …).
-private struct ShareSheet: UIViewControllerRepresentable {
+struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -199,7 +210,7 @@ private struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 #else
-private struct ShareSheet: View {
+struct ShareSheet: View {
     let items: [Any]
     var body: some View { EmptyView() }
 }

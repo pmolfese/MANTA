@@ -20,12 +20,19 @@ public enum MANTABundleFormat {
 public enum MANTABundleFilename {
     /// PHI-safe archive name in UTC, for example `20260711_133022.manta`.
     public static func timestamped(for date: Date) -> String {
+        timestamped(for: date, tag: nil)
+    }
+
+    /// Adds a PHI-free semantic tag for paired snapshots such as `raw` and
+    /// `solved`, while preserving the stable timestamp naming convention.
+    public static func timestamped(for date: Date, tag: String?) -> String {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd_HHmmss"
-        return "\(formatter.string(from: date)).manta"
+        let suffix = tag.map { "_\($0)" } ?? ""
+        return "\(formatter.string(from: date))\(suffix).manta"
     }
 }
 
@@ -223,6 +230,15 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     public var layoutID: String
     public var coordinateSystems: [MANTACoordinateSystem]
     public var observations: [MANTACaptureObservation]
+    /// Placed anatomical landmarks (nasion/LPA/RPA) in a declared coordinate
+    /// system. Optional and additive: older bundles omit it.
+    public var fiducials: [MANTAFiducialSolution]?
+    /// Solved electrode positions in a declared coordinate system. Optional and
+    /// additive so the receiver can re-read the solution alongside raw capture.
+    public var electrodes: [MANTAElectrodeSolution]?
+    /// Optional reconstructed surfaces and the transform required to display
+    /// model-space ObjectCapture assets with ARKit-world annotations.
+    public var reconstruction: MANTAReconstructionReference?
 
     public init(
         schema: String,
@@ -231,7 +247,10 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         captureMode: String,
         layoutID: String,
         coordinateSystems: [MANTACoordinateSystem],
-        observations: [MANTACaptureObservation]
+        observations: [MANTACaptureObservation],
+        fiducials: [MANTAFiducialSolution]? = nil,
+        electrodes: [MANTAElectrodeSolution]? = nil,
+        reconstruction: MANTAReconstructionReference? = nil
     ) {
         self.schema = schema
         self.schemaVersion = schemaVersion
@@ -240,11 +259,82 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         self.layoutID = layoutID
         self.coordinateSystems = coordinateSystems
         self.observations = observations
+        self.fiducials = fiducials
+        self.electrodes = electrodes
+        self.reconstruction = reconstruction
     }
 
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case schemaVersion, sessionID, captureMode, layoutID, coordinateSystems, observations
+        case fiducials, electrodes, reconstruction
+    }
+}
+
+public struct MANTAReconstructionReference: Codable, Equatable, Sendable {
+    public var lidarMeshPath: String?
+    public var headCroppedLidarMeshPath: String?
+    public var objectCaptureModelPath: String?
+    /// Exact world-space region used for live focus and the derived head mesh.
+    /// The full LiDAR mesh remains available independently.
+    public var headBoundingBox: HeadBoundingBox?
+    /// Column-major 4x4 transform from ObjectCapture model coordinates to the
+    /// coordinate system identified by `worldCoordinateSystem`.
+    public var modelToWorld: [Double]?
+    public var worldCoordinateSystem: String
+
+    public init(
+        lidarMeshPath: String? = nil,
+        headCroppedLidarMeshPath: String? = nil,
+        objectCaptureModelPath: String? = nil,
+        headBoundingBox: HeadBoundingBox? = nil,
+        modelToWorld: [Double]? = nil,
+        worldCoordinateSystem: String = "arkit-world"
+    ) {
+        self.lidarMeshPath = lidarMeshPath
+        self.headCroppedLidarMeshPath = headCroppedLidarMeshPath
+        self.objectCaptureModelPath = objectCaptureModelPath
+        self.headBoundingBox = headBoundingBox
+        self.modelToWorld = modelToWorld
+        self.worldCoordinateSystem = worldCoordinateSystem
+    }
+}
+
+/// A placed anatomical landmark in a declared coordinate system. `coordinate`
+/// is nil when the landmark has not been marked.
+public struct MANTAFiducialSolution: Codable, Equatable, Sendable {
+    public var kind: String
+    public var coordinateSystem: String
+    public var coordinate: [Double]?
+    public var state: String
+
+    public init(kind: String, coordinateSystem: String, coordinate: [Double]?, state: String) {
+        self.kind = kind
+        self.coordinateSystem = coordinateSystem
+        self.coordinate = coordinate
+        self.state = state
+    }
+}
+
+/// A solved electrode position in a declared coordinate system.
+public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
+    public var label: String
+    public var role: String
+    public var coordinateSystem: String
+    public var coordinate: [Double]
+    public var confidence: Double
+    public var state: String
+
+    public init(
+        label: String, role: String, coordinateSystem: String,
+        coordinate: [Double], confidence: Double, state: String
+    ) {
+        self.label = label
+        self.role = role
+        self.coordinateSystem = coordinateSystem
+        self.coordinate = coordinate
+        self.confidence = confidence
+        self.state = state
     }
 }
 
@@ -276,6 +366,10 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
     public var id: UUID
     public var capturedAt: Date
     public var imagePath: String?
+    /// Optional lossless encoding of the same pixels represented by `imagePath`.
+    public var losslessImagePath: String?
+    /// Optional HEIC/JPEG encoding of the same pixels as the primary image.
+    public var compressedImagePath: String?
     public var imageDimensions: MANTAImageDimensions
     public var imageOrigin: String
     public var imageOrientation: String
@@ -290,6 +384,8 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         id: UUID,
         capturedAt: Date,
         imagePath: String? = nil,
+        losslessImagePath: String? = nil,
+        compressedImagePath: String? = nil,
         imageDimensions: MANTAImageDimensions,
         imageOrigin: String = "top-left",
         imageOrientation: String = "up",
@@ -303,6 +399,8 @@ public struct MANTACaptureObservation: Codable, Equatable, Sendable {
         self.id = id
         self.capturedAt = capturedAt
         self.imagePath = imagePath
+        self.losslessImagePath = losslessImagePath
+        self.compressedImagePath = compressedImagePath
         self.imageDimensions = imageDimensions
         self.imageOrigin = imageOrigin
         self.imageOrientation = imageOrientation

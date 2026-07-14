@@ -84,6 +84,83 @@ public struct FiducialAnnotation: Identifiable, Codable, Equatable, Hashable, Se
     }
 }
 
+/// Evidence retained for every fiducial placement or replacement. The final
+/// annotation remains convenient for consumers, while this history preserves
+/// how the point was obtained so alternative head-frame solvers can audit it.
+public struct FiducialPlacementEvidence: Identifiable, Codable, Equatable, Hashable, Sendable {
+    public var id: UUID
+    public var kind: FiducialKind
+    public var placedAt: Date
+    public var source: String
+    public var hitMethod: String
+    public var coordinateSystem: String
+    public var coordinate: Coordinate3D
+    public var observationID: UUID?
+    public var imagePoint: Coordinate2D?
+    public var pointCoordinateSpace: String?
+    public var rayOrigin: Coordinate3D?
+    public var rayDirection: Coordinate3D?
+
+    public init(
+        id: UUID = UUID(), kind: FiducialKind, placedAt: Date = Date(),
+        source: String, hitMethod: String, coordinateSystem: String,
+        coordinate: Coordinate3D, observationID: UUID? = nil,
+        imagePoint: Coordinate2D? = nil, pointCoordinateSpace: String? = nil,
+        rayOrigin: Coordinate3D? = nil,
+        rayDirection: Coordinate3D? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.placedAt = placedAt
+        self.source = source
+        self.hitMethod = hitMethod
+        self.coordinateSystem = coordinateSystem
+        self.coordinate = coordinate
+        self.observationID = observationID
+        self.imagePoint = imagePoint
+        self.pointCoordinateSpace = pointCoordinateSpace
+        self.rayOrigin = rayOrigin
+        self.rayDirection = rayDirection
+    }
+}
+
+/// Structured context collected with every scan. All fields are optional so a
+/// technical capture can begin immediately and be annotated as details become
+/// available without inventing placeholder values.
+public struct AcquisitionContext: Codable, Equatable, Hashable, Sendable {
+    public var site: String?
+    public var operatorID: String?
+    public var netModel: String?
+    public var netIdentifier: String?
+    public var capSize: String?
+    public var acquisitionEquipment: String?
+    public var deviceSetup: String?
+    public var lighting: String?
+    public var capCondition: String?
+    public var participantFactors: String?
+    public var notes: String?
+
+    public init(
+        site: String? = nil, operatorID: String? = nil, netModel: String? = nil,
+        netIdentifier: String? = nil, capSize: String? = nil,
+        acquisitionEquipment: String? = nil, deviceSetup: String? = nil,
+        lighting: String? = nil, capCondition: String? = nil,
+        participantFactors: String? = nil, notes: String? = nil
+    ) {
+        self.site = site
+        self.operatorID = operatorID
+        self.netModel = netModel
+        self.netIdentifier = netIdentifier
+        self.capSize = capSize
+        self.acquisitionEquipment = acquisitionEquipment
+        self.deviceSetup = deviceSetup
+        self.lighting = lighting
+        self.capCondition = capCondition
+        self.participantFactors = participantFactors
+        self.notes = notes
+    }
+}
+
 public struct ElectrodeDefinition: Identifiable, Codable, Equatable, Hashable, Sendable {
     public var number: Int
     public var label: String
@@ -148,6 +225,24 @@ public struct ElectrodeLayout: Identifiable, Codable, Equatable, Hashable, Senda
         self.coordinateSpace = coordinateSpace
     }
 
+    /// Explicit acquisition mode for head geometry without an electrode net.
+    /// Keeping this as a real, zero-channel layout avoids optional-layout
+    /// migrations while making `layoutID: "none"` unambiguous to consumers.
+    public static let headMeshOnly = ElectrodeLayout(
+        id: "none",
+        name: "No Net / Head Mesh Only",
+        channelCount: 0,
+        labels: [],
+        cardinalLabels: [],
+        electrodes: [],
+        fiducialCoordinatePriors: [:],
+        fiducialSensorHints: [:],
+        referenceSensor: nil,
+        referenceLabel: nil,
+        coordinateSpace: .arkitWorldMeters)
+
+    public var hasElectrodeNet: Bool { channelCount > 0 }
+
     public static let fallback128 = ElectrodeLayout(
         id: "hydrocel-128",
         name: "HydroCel GSN 128",
@@ -186,7 +281,12 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
     public var modelFiducials: [FiducialAnnotation]
     public var modelCoordinateSpace: CoordinateSpace
     public var lidarMeshFilename: String?
+    public var headCroppedLidarMeshFilename: String?
+    public var headBoundingBox: HeadBoundingBox?
     public var lastExportedBundleID: UUID?
+    public var lastRawExportedBundleID: UUID?
+    public var acquisitionContext: AcquisitionContext?
+    public var fiducialPlacementEvidence: [FiducialPlacementEvidence]?
 
     public init(
         id: UUID = UUID(), name: String, createdAt: Date, subjectLabel: String? = nil,
@@ -198,7 +298,12 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
         modelFiducials: [FiducialAnnotation] = FiducialKind.allCases.map {
             FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview)
         }, modelCoordinateSpace: CoordinateSpace = .photogrammetryModelMeters,
-        lidarMeshFilename: String? = nil, lastExportedBundleID: UUID? = nil
+        lidarMeshFilename: String? = nil, lastExportedBundleID: UUID? = nil,
+        headCroppedLidarMeshFilename: String? = nil,
+        headBoundingBox: HeadBoundingBox? = nil,
+        lastRawExportedBundleID: UUID? = nil,
+        acquisitionContext: AcquisitionContext? = nil,
+        fiducialPlacementEvidence: [FiducialPlacementEvidence]? = nil
     ) {
         self.id = id
         self.name = name
@@ -217,7 +322,12 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
         self.modelFiducials = modelFiducials
         self.modelCoordinateSpace = modelCoordinateSpace
         self.lidarMeshFilename = lidarMeshFilename
+        self.headCroppedLidarMeshFilename = headCroppedLidarMeshFilename
+        self.headBoundingBox = headBoundingBox
         self.lastExportedBundleID = lastExportedBundleID
+        self.lastRawExportedBundleID = lastRawExportedBundleID
+        self.acquisitionContext = acquisitionContext
+        self.fiducialPlacementEvidence = fiducialPlacementEvidence
     }
 
     public var modelFiducialsReady: Bool {
@@ -263,5 +373,25 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
             }, electrodes: [], captureObservations: [])
         session.name = session.displayName
         return session
+    }
+}
+
+/// Axis-aligned region of interest in the ARKit world frame. The complete mesh
+/// remains raw evidence; this box produces the focused head mesh used for live
+/// review and downstream head-specific processing.
+public struct HeadBoundingBox: Codable, Equatable, Sendable {
+    public var center: Coordinate3D
+    public var widthMeters: Double
+    public var heightMeters: Double
+    public var depthMeters: Double
+
+    public init(
+        center: Coordinate3D, widthMeters: Double = 0.40,
+        heightMeters: Double = 0.46, depthMeters: Double = 0.40
+    ) {
+        self.center = center
+        self.widthMeters = widthMeters
+        self.heightMeters = heightMeters
+        self.depthMeters = depthMeters
     }
 }

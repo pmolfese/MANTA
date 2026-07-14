@@ -1,5 +1,26 @@
 import Foundation
 
+/// Append-only acquisition lifecycle evidence. JSON-lines encoding is used by
+/// the app so a crash or interruption cannot invalidate earlier records.
+public struct AcquisitionEvent: Identifiable, Codable, Equatable, Hashable, Sendable {
+    public var id: UUID
+    public var occurredAt: Date
+    public var kind: String
+    public var message: String
+    public var details: [String: String]
+
+    public init(
+        id: UUID = UUID(), occurredAt: Date = Date(), kind: String,
+        message: String, details: [String: String] = [:]
+    ) {
+        self.id = id
+        self.occurredAt = occurredAt
+        self.kind = kind
+        self.message = message
+        self.details = details
+    }
+}
+
 public struct ImageResolution: Codable, Equatable, Hashable, Sendable {
     public var width: Int
     public var height: Int
@@ -102,6 +123,13 @@ public struct CaptureObservation: Identifiable, Codable, Equatable, Hashable, Se
     public var meshAnchorCount: Int
     public var trackingSummary: String
     public var cameraSnapshotFilename: String?
+    /// Legacy optional lossless companion used by early comparison captures.
+    public var losslessCameraSnapshotFilename: String?
+    /// Optional HEIC/JPEG encoding of the same pixels as the primary lossless
+    /// PNG. This is enabled explicitly for codec comparison.
+    public var compressedCameraSnapshotFilename: String?
+    /// EXIF-style orientation of the stored sensor-native pixels.
+    public var imageOrientation: String?
     public var depthSnapshotFilename: String?
     public var rawDepthFilename: String?
     public var rawDepthFormat: RawDepthFormat?
@@ -115,6 +143,9 @@ public struct CaptureObservation: Identifiable, Codable, Equatable, Hashable, Se
         id: UUID = UUID(), capturedAt: Date, cameraTransform: [Float], cameraIntrinsics: [Float],
         imageResolution: ImageResolution, hasSceneDepth: Bool, meshAnchorCount: Int,
         trackingSummary: String, cameraSnapshotFilename: String? = nil,
+        losslessCameraSnapshotFilename: String? = nil,
+        compressedCameraSnapshotFilename: String? = nil,
+        imageOrientation: String? = "up",
         depthSnapshotFilename: String? = nil, rawDepthFilename: String? = nil,
         rawDepthFormat: RawDepthFormat? = nil, rawConfidenceFilename: String? = nil,
         rawConfidenceFormat: RawConfidenceFormat? = nil,
@@ -131,6 +162,9 @@ public struct CaptureObservation: Identifiable, Codable, Equatable, Hashable, Se
         self.meshAnchorCount = meshAnchorCount
         self.trackingSummary = trackingSummary
         self.cameraSnapshotFilename = cameraSnapshotFilename
+        self.losslessCameraSnapshotFilename = losslessCameraSnapshotFilename
+        self.compressedCameraSnapshotFilename = compressedCameraSnapshotFilename
+        self.imageOrientation = imageOrientation
         self.depthSnapshotFilename = depthSnapshotFilename
         self.rawDepthFilename = rawDepthFilename
         self.rawDepthFormat = rawDepthFormat
@@ -153,6 +187,9 @@ public struct CaptureQualityMetrics: Codable, Equatable, Hashable, Sendable {
     public var sharpnessScore: Double
     public var translationFromPreviousSampleMeters: Double?
     public var rotationFromPreviousSampleDegrees: Double?
+    /// Camera-position sector around the declared head center. This differs
+    /// from `coverageSector`, which describes the camera optical-axis direction.
+    public var headCenteredCoverageSector: String?
     public var coverageSector: String
     public var validDepthFraction: Double?
     public var highConfidenceDepthFraction: Double?
@@ -164,6 +201,7 @@ public struct CaptureQualityMetrics: Codable, Equatable, Hashable, Sendable {
         meanLuminance: Double, darkPixelFraction: Double, brightPixelFraction: Double,
         sharpnessScore: Double, translationFromPreviousSampleMeters: Double?,
         rotationFromPreviousSampleDegrees: Double?, coverageSector: String,
+        headCenteredCoverageSector: String? = nil,
         validDepthFraction: Double? = nil, highConfidenceDepthFraction: Double? = nil,
         warnings: [String] = []
     ) {
@@ -178,6 +216,7 @@ public struct CaptureQualityMetrics: Codable, Equatable, Hashable, Sendable {
         self.translationFromPreviousSampleMeters = translationFromPreviousSampleMeters
         self.rotationFromPreviousSampleDegrees = rotationFromPreviousSampleDegrees
         self.coverageSector = coverageSector
+        self.headCenteredCoverageSector = headCenteredCoverageSector
         self.validDepthFraction = validDepthFraction
         self.highConfidenceDepthFraction = highConfidenceDepthFraction
         self.warnings = warnings
