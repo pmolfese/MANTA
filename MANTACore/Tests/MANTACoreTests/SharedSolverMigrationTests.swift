@@ -45,6 +45,37 @@ struct SharedSolverMigrationTests {
         #expect(validation.suspectLabels.isEmpty)
     }
 
+    @Test func robustCapOrientationRejectsAMislabeledAnchor() throws {
+        let points = [
+            SIMD3<Float>(0, 0, 0), SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(1, 1, 0), SIMD3<Float>(0.5, 0.5, 1), SIMD3<Float>(0.2, 0.8, 0.6)
+        ]
+        let electrodes = points.enumerated().map { index, point in
+            ElectrodeDefinition(
+                number: index + 1, label: "E\(index + 1)", role: .regular,
+                coordinatePrior: Coordinate3D(
+                    x: Double(point.x), y: Double(point.y), z: Double(point.z)),
+                displayPosition: nil, neighbors: [])
+        }
+        let layout = ElectrodeLayout(
+            id: "robust-6", name: "Robust", channelCount: 6,
+            labels: electrodes.map(\.label), cardinalLabels: [], electrodes: electrodes,
+            fiducialCoordinatePriors: [:], fiducialSensorHints: [:],
+            referenceSensor: nil, referenceLabel: nil)
+        var detected = Dictionary(uniqueKeysWithValues: points.enumerated().map {
+            ("E\($0.offset + 1)", $0.element * 0.01 + SIMD3<Float>(0.1, 0.2, 0.3))
+        })
+        detected["E6"] = SIMD3<Float>(0.7, -0.4, 0.9)
+
+        let fit = try #require(ElectrodeCapOrientation.estimateRobust(
+            detected: detected, layout: layout, maxRMSMeters: 0.002,
+            inlierThresholdMeters: 0.003))
+
+        #expect(fit.isReliable)
+        #expect(fit.anchorCount == 5)
+        #expect(fit.rmsError < 0.001)
+    }
+
     @Test func portableDetectionConsumesTextDepthSamplesWithoutAppleFrameworks() {
         let camera = PinholeCamera(
             fx: 100, fy: 100, cx: 50, cy: 50,

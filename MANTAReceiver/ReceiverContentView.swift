@@ -15,7 +15,9 @@ struct ReceiverContentView: View {
                     Button("Import MANTA Capture…", systemImage: "square.and.arrow.down") {
                         showsImporter = true
                     }
-                    .disabled(store.isImporting || store.isReconstructing || store.isApplyingAlignment)
+                    .disabled(
+                        store.isImporting || store.isReconstructing || store.isApplyingAlignment
+                            || store.isDetectingElectrodes || store.isSavingElectrodes)
                 }
 
                 if let bundle = store.bundle {
@@ -78,7 +80,7 @@ struct ReceiverContentView: View {
                 ContentUnavailableView(
                     "Import a Capture",
                     systemImage: "wave.3.right.circle",
-                    description: Text("Drop a RAW .manta archive or a PROCESSED .manta package here.")
+                    description: Text("Drop a RAW .manta archive, recovered .manta package, PROCESSED package, or iPad session folder here.")
                 )
             }
         }
@@ -86,7 +88,8 @@ struct ReceiverContentView: View {
             handleDrop(urls)
         } isTargeted: { targeted in
             isDropTargeted = targeted && !store.isImporting && !store.isReconstructing
-                && !store.isApplyingAlignment
+                && !store.isApplyingAlignment && !store.isDetectingElectrodes
+                && !store.isSavingElectrodes
         }
         .overlay {
             if isDropTargeted {
@@ -131,6 +134,7 @@ struct ReceiverContentView: View {
 
     private func handleDrop(_ urls: [URL]) -> Bool {
         guard !store.isImporting, !store.isReconstructing, !store.isApplyingAlignment,
+              !store.isDetectingElectrodes, !store.isSavingElectrodes,
               let url = urls.first(where: Self.isMANTAArchive) else { return false }
         Task { await store.importArchive(from: url) }
         return true
@@ -138,6 +142,9 @@ struct ReceiverContentView: View {
 
     nonisolated private static func isMANTAArchive(_ url: URL) -> Bool {
         guard url.isFileURL else { return false }
+        if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            return true
+        }
         let name = url.lastPathComponent.lowercased()
         return url.pathExtension.lowercased() == "manta" || name.hasSuffix(".manta.zip")
     }
@@ -159,6 +166,8 @@ private struct BundleInspector: View {
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
+            ReceiverElectrodeWorkspace(store: store, bundle: bundle)
+                .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
             ReceiverExportView(
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)

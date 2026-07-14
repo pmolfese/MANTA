@@ -348,7 +348,9 @@ final class ScanSessionViewModel: ObservableObject {
                 try artifactStore.writeSession(exportedSession)
             }
             exportedBundle = ExportedBundle(urls: [result.raw.url, result.solved.url])
-            statusMessage = "Raw + solved bundles ready · receipt \(result.receipt.status.rawValue)."
+            let rawKind = result.raw.container == .archive ? "RAW archive" : "RAW directory package"
+            let solvedKind = result.solved.container == .archive ? "solved archive" : "solved directory package"
+            statusMessage = "\(rawKind) + \(solvedKind) ready · receipt \(result.receipt.status.rawValue)."
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -396,13 +398,15 @@ final class ScanSessionViewModel: ObservableObject {
                 }
                 exportedBundle = ExportedBundle(urls: [result.export.url])
                 let elapsed = Date().timeIntervalSince(startedAt)
+                let container = result.export.container == .archive ? "archive" : "directory package"
                 statusMessage = String(
-                    format: "Raw bundle ready in %.1f s · receipt %@.",
-                    elapsed, result.receipt.status.rawValue)
+                    format: "Raw %@ ready in %.1f s · receipt %@.",
+                    container, elapsed, result.receipt.status.rawValue)
                 recordAcquisitionEvent(AcquisitionEvent(
                     kind: "raw-export-completed", message: "Raw acquisition snapshot is ready.",
                     details: [
                         "bundleID": result.export.bundleID.uuidString,
+                        "container": result.export.container.rawValue,
                         "durationSeconds": String(format: "%.3f", elapsed)
                     ]))
             } catch {

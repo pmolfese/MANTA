@@ -102,6 +102,65 @@ public enum ElectrodeCapOrientation {
             cardinalConsistency: cardinal, isReliable: reliable)
     }
 
+    /// Fits the cap while tolerating a minority of mislabeled detections.
+    /// Candidate subsets are deterministic so repeated processing is reproducible.
+    public static func estimateRobust(
+        detected: [String: SIMD3<Float>], layout: ElectrodeLayout,
+        minAnchors: Int = 4, minSpreadRatio: Float = 0.4,
+        maxRMSMeters: Float = 0.02, inlierThresholdMeters: Float = 0.018,
+        iterations: Int = 512
+    ) -> Result? {
+        if let direct = estimate(
+            detected: detected, layout: layout, minAnchors: minAnchors,
+            minSpreadRatio: minSpreadRatio, maxRMSMeters: maxRMSMeters),
+           direct.isReliable {
+            return direct
+        }
+
+        let priors = layout.electrodes.reduce(into: [String: SIMD3<Float>]()) {
+            $0[$1.label] = vector($1.coordinatePrior)
+        }
+        let labels = detected.keys.filter { priors[$0] != nil }.sorted()
+        guard labels.count > minAnchors, minAnchors >= 3 else { return nil }
+
+        var state: UInt64 = 0x4D41_4E54_41
+        var best: (result: Result, inliers: Int)?
+        for _ in 0..<max(1, iterations) {
+            var indices = Set<Int>()
+            while indices.count < minAnchors {
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                indices.insert(Int(state % UInt64(labels.count)))
+            }
+            let sample = Dictionary(uniqueKeysWithValues: indices.map {
+                (labels[$0], detected[labels[$0]]!)
+            })
+            guard let candidate = estimate(
+                detected: sample, layout: layout, minAnchors: minAnchors,
+                minSpreadRatio: minSpreadRatio * 0.5,
+                maxRMSMeters: maxRMSMeters) else { continue }
+
+            let inlierLabels = labels.filter { label in
+                guard let prior = priors[label], let target = detected[label] else { return false }
+                let predicted = (candidate.transform * SIMD4(prior, 1)).xyz
+                return simd_distance(predicted, target) <= inlierThresholdMeters
+            }
+            guard inlierLabels.count >= minAnchors else { continue }
+            let inliers = Dictionary(uniqueKeysWithValues: inlierLabels.map {
+                ($0, detected[$0]!)
+            })
+            guard let refined = estimate(
+                detected: inliers, layout: layout, minAnchors: minAnchors,
+                minSpreadRatio: minSpreadRatio, maxRMSMeters: maxRMSMeters),
+                  refined.isReliable else { continue }
+            if best == nil || inlierLabels.count > best!.inliers
+                || (inlierLabels.count == best!.inliers
+                    && refined.rmsError < best!.result.rmsError) {
+                best = (refined, inlierLabels.count)
+            }
+        }
+        return best?.result
+    }
+
     private static func vector(_ value: Coordinate3D) -> SIMD3<Float> {
         SIMD3(Float(value.x), Float(value.y), Float(value.z))
     }

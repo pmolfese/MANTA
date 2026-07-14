@@ -26,7 +26,7 @@ struct ReceiverOrientedFrameImage {
     }
 }
 
-enum ReceiverStoredImageOrientation: String, Sendable {
+nonisolated enum ReceiverStoredImageOrientation: String, Sendable {
     case up
     case down
     case left

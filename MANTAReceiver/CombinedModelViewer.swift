@@ -20,6 +20,10 @@ struct CombinedModelViewer: View {
     private let onFiducialsSaved: (([MANTAFiducialSolution]) -> Void)?
     private let fiducialSaveInProgress: Bool
     private let modelLandmarks: [ReceiverModelLandmark]
+    private let electrodesOverride: [MANTAElectrodeSolution]?
+    private let electrodePlacementLabel: String?
+    private let onWorldElectrodePointPicked: ((SIMD3<Double>) -> Void)?
+    private let includesFiducialAnnotations: Bool
 
     @State private var showLiDAR: Bool
     @State private var showPhotogrammetry: Bool
@@ -42,6 +46,11 @@ struct CombinedModelViewer: View {
         photogrammetryPlacementLabel: String? = nil,
         modelLandmarks: [ReceiverModelLandmark] = [],
         onPhotogrammetryPointPicked: ((SIMD3<Float>) -> Void)? = nil,
+        electrodesOverride: [MANTAElectrodeSolution]? = nil,
+        electrodePlacementLabel: String? = nil,
+        onWorldElectrodePointPicked: ((SIMD3<Double>) -> Void)? = nil,
+        annotationOnlyDefault: Bool = false,
+        includesFiducialAnnotations: Bool = true,
         fiducialSaveInProgress: Bool = false,
         onFiducialsSaved: (([MANTAFiducialSolution]) -> Void)? = nil
     ) {
@@ -57,13 +66,19 @@ struct CombinedModelViewer: View {
         self.photogrammetryPlacementLabel = photogrammetryPlacementLabel
         self.modelLandmarks = modelLandmarks
         self.onPhotogrammetryPointPicked = onPhotogrammetryPointPicked
+        self.electrodesOverride = electrodesOverride
+        self.electrodePlacementLabel = electrodePlacementLabel
+        self.onWorldElectrodePointPicked = onWorldElectrodePointPicked
+        self.includesFiducialAnnotations = includesFiducialAnnotations
         self.onFiducialsSaved = onFiducialsSaved
         self.fiducialSaveInProgress = fiducialSaveInProgress
         let initialLiDAR = assets.defaultLiDARChoice
         _lidarChoice = State(initialValue: initialLiDAR ?? .fullEnvironment)
-        _showLiDAR = State(initialValue: photogrammetryPlacementLabel == nil && initialLiDAR != nil)
+        _showLiDAR = State(
+            initialValue: !annotationOnlyDefault
+                && photogrammetryPlacementLabel == nil && initialLiDAR != nil)
         _showPhotogrammetry = State(
-            initialValue: assets.photogrammetryURL != nil
+            initialValue: !annotationOnlyDefault && assets.photogrammetryURL != nil
                 && (photogrammetryPlacementLabel != nil
                     || initialLiDAR == nil || assets.modelToWorld != nil))
     }
@@ -85,7 +100,7 @@ struct CombinedModelViewer: View {
                             showAnnotations: showAnnotations && annotationsAreSpatiallyValid,
                             lidarChoice: lidarChoice,
                             lidarStyle: lidarStyle),
-                        electrodes: bundle.capture.electrodes ?? [],
+                        electrodes: displayedElectrodes,
                         fiducials: displayedFiducials,
                         modelLandmarks: modelLandmarks,
                         selection: $selection,
@@ -94,7 +109,9 @@ struct CombinedModelViewer: View {
                         photogrammetryPlacementLabel: photogrammetryPlacementLabel,
                         onPhotogrammetryPointPicked: onPhotogrammetryPointPicked,
                         fiducialPlacementKind: fiducialPlacementKind,
-                        onWorldFiducialPointPicked: placeFiducial)
+                        worldPlacementLabel: electrodePlacementLabel
+                            ?? fiducialPlacementKind?.rawValue,
+                        onWorldPointPicked: onWorldElectrodePointPicked ?? placeFiducial)
                 } else {
                     ContentUnavailableView(
                         "No 3D surface in this bundle",
@@ -128,6 +145,9 @@ struct CombinedModelViewer: View {
         .onChange(of: bundle.manifest.bundleID) { _, _ in
             fiducialPlacementKind = nil
             fiducialOverrides.removeAll()
+        }
+        .onChange(of: photogrammetryTransformSignature) { _, _ in
+            selection = nil
         }
     }
 
@@ -288,7 +308,9 @@ struct CombinedModelViewer: View {
     }
 
     private var interactionHint: some View {
-        Text(fiducialPlacementKind.map {
+        Text(electrodePlacementLabel.map {
+            "Click the corrected \($0) location · drag to orbit · scroll to zoom"
+        } ?? fiducialPlacementKind.map {
             "Click the corrected \($0.rawValue) location · drag to orbit · scroll to zoom"
         } ?? photogrammetryPlacementLabel.map {
             "Click \($0) on the photogrammetry surface · drag to orbit · scroll to zoom"
@@ -302,15 +324,27 @@ struct CombinedModelViewer: View {
     }
 
     private var hasAnnotations: Bool {
-        !(bundle.capture.electrodes ?? []).isEmpty
-            || !assets.fiducials.isEmpty
+        !displayedElectrodes.isEmpty
+            || !displayedFiducials.isEmpty
     }
 
     private var hasWorldPlacementSurface: Bool {
         showLiDAR || showFusedDepth || (showPhotogrammetry && assets.modelToWorld != nil)
     }
 
+    private var photogrammetryTransformSignature: Int {
+        var hasher = Hasher()
+        hasher.combine(assets.photogrammetryURL)
+        if let transform = assets.modelToWorld {
+            for column in 0..<4 {
+                for row in 0..<4 { hasher.combine(transform[column][row]) }
+            }
+        }
+        return hasher.finalize()
+    }
+
     private var displayedFiducials: [MANTAFiducialSolution] {
+        guard includesFiducialAnnotations else { return [] }
         var values = Dictionary(uniqueKeysWithValues: assets.fiducials.map { ($0.kind, $0) })
         for (kind, point) in fiducialOverrides {
             values[kind.rawValue] = MANTAFiducialSolution(
@@ -320,6 +354,10 @@ struct CombinedModelViewer: View {
                 state: "Reviewed on macOS 3D surface")
         }
         return FiducialKind.allCases.compactMap { values[$0.rawValue] }
+    }
+
+    private var displayedElectrodes: [MANTAElectrodeSolution] {
+        electrodesOverride ?? bundle.capture.electrodes ?? []
     }
 
     private func placeFiducial(_ point: SIMD3<Double>) {
@@ -705,7 +743,8 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
     let photogrammetryPlacementLabel: String?
     let onPhotogrammetryPointPicked: ((SIMD3<Float>) -> Void)?
     let fiducialPlacementKind: FiducialKind?
-    let onWorldFiducialPointPicked: ((SIMD3<Double>) -> Void)?
+    let worldPlacementLabel: String?
+    let onWorldPointPicked: ((SIMD3<Double>) -> Void)?
 
     func makeNSView(context: Context) -> SCNView {
         let view = ReceiverInteractiveSCNView()
@@ -728,7 +767,8 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
         context.coordinator.photogrammetryPlacementLabel = photogrammetryPlacementLabel
         context.coordinator.onPhotogrammetryPointPicked = onPhotogrammetryPointPicked
         context.coordinator.fiducialPlacementKind = fiducialPlacementKind
-        context.coordinator.onWorldFiducialPointPicked = onWorldFiducialPointPicked
+        context.coordinator.worldPlacementLabel = worldPlacementLabel
+        context.coordinator.onWorldPointPicked = onWorldPointPicked
         let signature = sceneSignature
         if context.coordinator.sceneSignature != signature {
             let previousCamera = view.pointOfView?.simdTransform
@@ -756,8 +796,8 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                     view.pointOfView = camera
                     view.defaultCameraController.target = previousTarget
                 } else {
-                    ReceiverSceneBuilder.frame(view: view, surfaceRoot: built.surfaceRoot)
-                    context.coordinator.hasFramedOnce = true
+                    context.coordinator.hasFramedOnce = ReceiverSceneBuilder.frame(
+                        view: view, surfaceRoot: built.surfaceRoot)
                 }
                 if let interactiveView = view as? ReceiverInteractiveSCNView {
                     interactiveView.configureCameraInteraction()
@@ -770,7 +810,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
         if context.coordinator.frameRequest != frameRequest {
             context.coordinator.frameRequest = frameRequest
             if let root = context.coordinator.surfaceRoot {
-                ReceiverSceneBuilder.frame(view: view, surfaceRoot: root)
+                _ = ReceiverSceneBuilder.frame(view: view, surfaceRoot: root)
                 (view as? ReceiverInteractiveSCNView)?.configureCameraInteraction()
             }
         }
@@ -827,7 +867,8 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
         var photogrammetryPlacementLabel: String?
         var onPhotogrammetryPointPicked: ((SIMD3<Float>) -> Void)?
         var fiducialPlacementKind: FiducialKind?
-        var onWorldFiducialPointPicked: ((SIMD3<Double>) -> Void)?
+        var worldPlacementLabel: String?
+        var onWorldPointPicked: ((SIMD3<Double>) -> Void)?
         var metricPlacementPoints = [ReceiverMetricPlacementPoint]()
 
         init(
@@ -845,7 +886,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                 .ignoreHiddenNodes: true
             ])
 
-            if fiducialPlacementKind != nil {
+            if worldPlacementLabel != nil {
                 // Prefer the frontmost actual rendered surface. Previously the
                 // point-cloud fallback ran first, so clicking an aligned model
                 // could select a depth vertex hidden well behind that model.
@@ -854,7 +895,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                 )? in
                     placementSurface(for: hit).map { (hit, $0) }
                 }).first {
-                    acceptFiducialPlacement(
+                    acceptWorldPlacement(
                         worldCoordinates: surfaceHit.0.worldCoordinates,
                         surface: surfaceHit.1,
                         faceIndex: surfaceHit.0.faceIndex >= 0
@@ -870,7 +911,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                         "That click did not intersect a visible surface. Zoom in and click directly on the model, LiDAR mesh, or a fused-depth point."
                     return
                 }
-                acceptFiducialPlacement(
+                acceptWorldPlacement(
                     point: snapped.point,
                     surface: snapped.surface,
                     faceIndex: snapped.pointIndex)
@@ -898,10 +939,10 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                 surface = .lidar
             }
             let p = hit.worldCoordinates
-            if fiducialPlacementKind != nil,
+            if worldPlacementLabel != nil,
                surface == .lidar || surface == .fusedDepth
                     || surface == .photogrammetry(aligned: true) {
-                onWorldFiducialPointPicked?(
+                onWorldPointPicked?(
                     SIMD3(Double(p.x), Double(p.y), Double(p.z)))
             }
             if case .photogrammetry = surface,
@@ -954,12 +995,12 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
             }
         }
 
-        private func acceptFiducialPlacement(
+        private func acceptWorldPlacement(
             worldCoordinates: SCNVector3,
             surface: ReceiverSceneSelection.Surface,
             faceIndex: Int?
         ) {
-            acceptFiducialPlacement(
+            acceptWorldPlacement(
                 point: SIMD3(
                     Float(worldCoordinates.x), Float(worldCoordinates.y),
                     Float(worldCoordinates.z)),
@@ -967,7 +1008,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                 faceIndex: faceIndex)
         }
 
-        private func acceptFiducialPlacement(
+        private func acceptWorldPlacement(
             point: SIMD3<Float>,
             surface: ReceiverSceneSelection.Surface,
             faceIndex: Int?
@@ -978,7 +1019,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
             }
             loadError.wrappedValue = nil
             let world = SIMD3(Double(point.x), Double(point.y), Double(point.z))
-            onWorldFiducialPointPicked?(world)
+            onWorldPointPicked?(world)
             let result = ReceiverSceneSelection(
                 surface: surface,
                 worldPosition: world,
@@ -1129,7 +1170,7 @@ private enum ReceiverSceneBuilder {
         }
 
         if settings.showAnnotations {
-            addAnnotations(electrodes: electrodes, fiducials: fiducials, to: scene)
+            addAnnotations(electrodes: electrodes, fiducials: fiducials, to: surfaceRoot)
         }
 
         let ambient = SCNLight()
@@ -1167,8 +1208,9 @@ private enum ReceiverSceneBuilder {
         return node
     }
 
-    static func frame(view: SCNView, surfaceRoot: SCNNode) {
-        guard let bounds = worldBounds(of: surfaceRoot) else { return }
+    @discardableResult
+    static func frame(view: SCNView, surfaceRoot: SCNNode) -> Bool {
+        guard let bounds = worldBounds(of: surfaceRoot) else { return false }
         let center = (bounds.min + bounds.max) / 2
         let diagonal = simd_length(bounds.max - bounds.min)
         let distance = max(0.30, diagonal * 1.55)
@@ -1179,6 +1221,7 @@ private enum ReceiverSceneBuilder {
         view.scene?.rootNode.addChildNode(camera)
         view.pointOfView = camera
         view.defaultCameraController.target = SCNVector3(center)
+        return true
     }
 
     private static func worldBounds(of root: SCNNode) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
@@ -1237,7 +1280,7 @@ private enum ReceiverSceneBuilder {
     private static func addAnnotations(
         electrodes: [MANTAElectrodeSolution],
         fiducials: [MANTAFiducialSolution],
-        to scene: SCNScene
+        to root: SCNNode
     ) {
         for electrode in electrodes where electrode.coordinate.count == 3 {
             let color: NSColor
@@ -1245,6 +1288,8 @@ private enum ReceiverSceneBuilder {
                 color = .systemGray
             } else if electrode.state == "Reviewed" {
                 color = .systemGreen
+            } else if electrode.state == "Guessed" {
+                color = .systemYellow
             } else {
                 color = .systemOrange
             }
@@ -1252,16 +1297,16 @@ private enum ReceiverSceneBuilder {
                 electrode.coordinate,
                 label: electrode.label,
                 color: color,
-                to: scene)
+                to: root)
         }
         for fiducial in fiducials {
             guard let coordinate = fiducial.coordinate, coordinate.count == 3 else { continue }
-            addMarker(coordinate, label: fiducial.kind, color: .systemPurple, to: scene)
+            addMarker(coordinate, label: fiducial.kind, color: .systemPurple, to: root)
         }
     }
 
     private static func addMarker(
-        _ coordinate: [Double], label: String, color: NSColor, to scene: SCNScene
+        _ coordinate: [Double], label: String, color: NSColor, to root: SCNNode
     ) {
         let sphere = SCNSphere(radius: 0.0035)
         sphere.segmentCount = 16
@@ -1273,7 +1318,7 @@ private enum ReceiverSceneBuilder {
         node.name = label
         node.categoryBitMask = ReceiverSceneCategory.annotation
         node.simdPosition = SIMD3(coordinate.map(Float.init))
-        scene.rootNode.addChildNode(node)
+        root.addChildNode(node)
     }
 }
 

@@ -17,13 +17,25 @@ final class ReceiverStore: ObservableObject {
     @Published private(set) var ephemeralReconstruction: ReceiverEphemeralReconstruction?
     @Published private(set) var isApplyingAlignment = false
     @Published private(set) var alignmentStage = ""
+    @Published private(set) var isDetectingElectrodes = false
+    @Published private(set) var electrodeDetectionProgress = 0.0
+    @Published private(set) var electrodeDetectionStage = ""
+    @Published private(set) var electrodeDraft: ReceiverElectrodeDetectionResult?
+    @Published private(set) var isUpdatingElectrodeGuesses = false
+    @Published private(set) var isSavingElectrodes = false
     @Published var errorMessage: String?
 
     private let reconstructionRunner = ReceiverPhotogrammetryRunner()
     private var reconstructionTask: Task<Void, Never>?
+    private var electrodeDetectionTask: Task<Void, Never>?
+    private var electrodeGuessTask: Task<Void, Never>?
+    private var electrodeGuessGeneration: UUID?
+    private var electrodeModelMesh: ReceiverTriangleMesh?
     private var ephemeralWorkspace: URL?
 
     deinit {
+        electrodeDetectionTask?.cancel()
+        electrodeGuessTask?.cancel()
         if let ephemeralWorkspace {
             try? FileManager.default.removeItem(at: ephemeralWorkspace)
         }
@@ -34,7 +46,8 @@ final class ReceiverStore: ObservableObject {
     }
 
     func importArchive(from sourceURL: URL) async {
-        guard !isReconstructing, !isApplyingAlignment else { return }
+        guard !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
+              !isSavingElectrodes else { return }
         let previousRoot = bundle?.rootDirectory
         isImporting = true
         errorMessage = nil
@@ -56,6 +69,10 @@ final class ReceiverStore: ObservableObject {
                 ? result.bundle.rootDirectory : nil
             reconstructionAlignmentRMSMeters = nil
             reconstructionAlignmentAccepted = false
+            electrodeDraft = nil
+            electrodeModelMesh = nil
+            electrodeDetectionProgress = 0
+            electrodeDetectionStage = ""
             if let previousRoot {
                 Self.removeImportedWorkspace(containing: previousRoot)
             }
@@ -75,7 +92,8 @@ final class ReceiverStore: ObservableObject {
         detail: ReceiverPhotogrammetryDetail,
         outputMode: ReceiverReconstructionOutputMode
     ) {
-        guard !isReconstructing, let sourceBundle = bundle else { return }
+        guard !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
+              let sourceBundle = bundle else { return }
         clearEphemeralReconstruction()
         reconstructionTask = Task { [weak self] in
             await self?.performReconstruction(
@@ -101,7 +119,8 @@ final class ReceiverStore: ObservableObject {
         _ outcome: ReceiverManualAlignmentOutcome,
         ephemeralReconstruction: ReceiverEphemeralReconstruction? = nil
     ) async {
-        guard !isApplyingAlignment, !isReconstructing, let sourceBundle = bundle else { return }
+        guard !isApplyingAlignment, !isReconstructing, !isDetectingElectrodes,
+              !isSavingElectrodes, let sourceBundle = bundle else { return }
         isApplyingAlignment = true
         alignmentStage = "Updating changed files in PROCESSED"
         errorMessage = nil
@@ -118,6 +137,8 @@ final class ReceiverStore: ObservableObject {
             processedPackageURL = updated.packageURL
             reconstructionAlignmentRMSMeters = updated.alignmentRMSMeters
             reconstructionAlignmentAccepted = updated.alignmentAccepted
+            electrodeDraft = nil
+            electrodeModelMesh = nil
             if ephemeralReconstruction != nil {
                 clearEphemeralReconstruction()
             }
@@ -129,7 +150,8 @@ final class ReceiverStore: ObservableObject {
     }
 
     func applyFiducialCorrections(_ fiducials: [MANTAFiducialSolution]) async {
-        guard !isApplyingAlignment, !isReconstructing, let sourceBundle = bundle else { return }
+        guard !isApplyingAlignment, !isReconstructing, !isDetectingElectrodes,
+              !isSavingElectrodes, let sourceBundle = bundle else { return }
         isApplyingAlignment = true
         alignmentStage = "Writing reviewed fiducials"
         errorMessage = nil
@@ -146,6 +168,132 @@ final class ReceiverStore: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
             alignmentStage = "Fiducial correction export failed"
+        }
+    }
+
+    func detectElectrodes() {
+        guard !isDetectingElectrodes, !isReconstructing, !isApplyingAlignment,
+              !isSavingElectrodes, let sourceBundle = bundle else { return }
+        isDetectingElectrodes = true
+        electrodeDetectionProgress = 0
+        electrodeDetectionStage = "Loading aligned photogrammetry surface"
+        errorMessage = nil
+
+        electrodeDetectionTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                isDetectingElectrodes = false
+                electrodeDetectionTask = nil
+            }
+            do {
+                let mesh = try Self.loadElectrodeMesh(bundle: sourceBundle)
+                let progressStore = self
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try ReceiverElectrodeDetector.detect(
+                        bundle: sourceBundle, modelMesh: mesh
+                    ) { fraction, stage in
+                        Task { @MainActor in
+                            progressStore.electrodeDetectionProgress = fraction
+                            progressStore.electrodeDetectionStage = stage
+                        }
+                    }
+                }.value
+                electrodeModelMesh = mesh
+                electrodeDraft = result
+                electrodeDetectionProgress = 1
+                electrodeDetectionStage = "Electrode candidates ready for review"
+            } catch is CancellationError {
+                electrodeDetectionStage = "Electrode detection cancelled"
+            } catch {
+                errorMessage = error.localizedDescription
+                electrodeDetectionStage = "Electrode detection failed"
+            }
+        }
+    }
+
+    func cancelElectrodeDetection() {
+        guard isDetectingElectrodes else { return }
+        electrodeDetectionStage = "Cancelling electrode detection"
+        electrodeDetectionTask?.cancel()
+    }
+
+    func replaceElectrodeDraft(
+        electrodes: [MANTAElectrodeSolution],
+        evidence: ReceiverElectrodeEvidenceDocument
+    ) {
+        electrodeDraft = ReceiverElectrodeDetectionResult(
+            electrodes: electrodes, evidence: evidence)
+    }
+
+    func recalculateElectrodeGuesses(
+        electrodes: [MANTAElectrodeSolution],
+        evidence: ReceiverElectrodeEvidenceDocument
+    ) {
+        guard !isDetectingElectrodes, !isSavingElectrodes,
+              let sourceBundle = bundle else { return }
+        electrodeGuessTask?.cancel()
+        let generation = UUID()
+        electrodeGuessGeneration = generation
+        isUpdatingElectrodeGuesses = true
+        electrodeDetectionStage = "Updating layout guesses"
+        let cachedMesh = electrodeModelMesh
+
+        electrodeGuessTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if electrodeGuessGeneration == generation {
+                    isUpdatingElectrodeGuesses = false
+                    electrodeGuessTask = nil
+                }
+            }
+            do {
+                let mesh = try cachedMesh ?? Self.loadElectrodeMesh(bundle: sourceBundle)
+                try Task.checkCancellation()
+                let result = await Task.detached(priority: .userInitiated) {
+                    ReceiverElectrodeGuessSolver.recalculate(
+                        bundle: sourceBundle, electrodes: electrodes,
+                        evidence: evidence, modelMesh: mesh)
+                }.value
+                try Task.checkCancellation()
+                guard electrodeGuessGeneration == generation else { return }
+                electrodeModelMesh = mesh
+                electrodeDraft = result
+                electrodeDetectionStage = "Layout guesses updated"
+            } catch is CancellationError {
+                return
+            } catch {
+                guard electrodeGuessGeneration == generation else { return }
+                errorMessage = error.localizedDescription
+                electrodeDetectionStage = "Guess update failed"
+            }
+        }
+    }
+
+    func saveElectrodes(
+        _ electrodes: [MANTAElectrodeSolution],
+        evidence: ReceiverElectrodeEvidenceDocument
+    ) async {
+        guard !isSavingElectrodes, !isDetectingElectrodes,
+              !isUpdatingElectrodeGuesses, !isReconstructing,
+              !isApplyingAlignment, let sourceBundle = bundle else { return }
+        isSavingElectrodes = true
+        electrodeDetectionStage = "Writing reviewed electrodes"
+        errorMessage = nil
+        defer { isSavingElectrodes = false }
+        do {
+            let updated = try await Task.detached(priority: .userInitiated) {
+                try ReceiverProcessedPackage.updateElectrodes(
+                    bundle: sourceBundle, electrodes: electrodes, evidence: evidence)
+            }.value
+            bundle = updated.bundle
+            importedArchiveURL = updated.packageURL
+            processedPackageURL = updated.packageURL
+            electrodeDraft = nil
+            electrodeModelMesh = nil
+            electrodeDetectionStage = "PROCESSED package updated"
+        } catch {
+            errorMessage = error.localizedDescription
+            electrodeDetectionStage = "Electrode save failed"
         }
     }
 
@@ -232,6 +380,8 @@ final class ReceiverStore: ObservableObject {
             }.value
 
             self.bundle = updated.bundle
+            electrodeDraft = nil
+            electrodeModelMesh = nil
             importedArchiveURL = updated.packageURL
             processedPackageURL = updated.packageURL
             reconstructionAlignmentRMSMeters = updated.alignmentRMSMeters
@@ -261,6 +411,19 @@ final class ReceiverStore: ObservableObject {
         }
     }
 
+    private static func loadElectrodeMesh(
+        bundle: MANTAValidatedBundle
+    ) throws -> ReceiverTriangleMesh? {
+        guard let reconstruction = bundle.capture.reconstruction,
+              let path = reconstruction.objectCaptureModelPath,
+              let transform = ReceiverSurfaceExporter.modelToWorld(reconstruction) else {
+            return nil
+        }
+        return try ReceiverSurfaceExporter.loadSceneMesh(
+            bundle.rootDirectory.appendingPathComponent(path),
+            modelToWorld: transform)
+    }
+
     private nonisolated static func persistAndValidate(
         _ sourceURL: URL,
         copyArchive: Bool = true
@@ -271,19 +434,17 @@ final class ReceiverStore: ObservableObject {
             throw ReceiverImportError.unsupportedExtension
         }
 
-        // A directory is accepted only when it is an already-extracted logical
-        // bundle (contains manifest.json). A raw working-session folder copied off
-        // a device is not a bundle and is rejected with a specific explanation.
+        let isRawSessionDirectory = isDirectory.boolValue
+            && fileManager.fileExists(atPath: sourceURL.appendingPathComponent("session.json").path)
+            && !fileManager.fileExists(
+                atPath: sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename).path)
         if isDirectory.boolValue {
             if ReceiverProcessedPackage.isPackage(sourceURL) {
                 return (try ReceiverProcessedPackage.load(at: sourceURL), sourceURL)
             }
             let manifestURL = sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename)
-            guard fileManager.fileExists(atPath: manifestURL.path) else {
-                let sessionURL = sourceURL.appendingPathComponent("session.json")
-                throw fileManager.fileExists(atPath: sessionURL.path)
-                    ? ReceiverImportError.rawSessionFolder
-                    : ReceiverImportError.notALogicalBundle
+            if !fileManager.fileExists(atPath: manifestURL.path) && !isRawSessionDirectory {
+                throw ReceiverImportError.notALogicalBundle
             }
         } else {
             guard sourceURL.pathExtension.lowercased() == "manta" ||
@@ -308,6 +469,13 @@ final class ReceiverStore: ObservableObject {
         do {
             let contents = receipt.appendingPathComponent("Contents", isDirectory: true)
             if isDirectory.boolValue {
+                if isRawSessionDirectory {
+                    let recovered = try MANTARawSessionRecovery().recoverDirectoryPackage(
+                        from: sourceURL,
+                        to: contents,
+                        producer: recoveryProducer())
+                    return (recovered.bundle, recovered.packageURL)
+                }
                 // Copy the extracted bundle in, then validate the copy in place so
                 // the imported record survives if the source folder is later moved.
                 try fileManager.copyItem(at: sourceURL, to: contents)
@@ -345,25 +513,29 @@ final class ReceiverStore: ObservableObject {
         try? fileManager.removeItem(at: receipt)
     }
 
+    private nonisolated static func recoveryProducer() -> MANTAProducer {
+        let info = Bundle.main.infoDictionary ?? [:]
+        return MANTAProducer(
+            application: info["CFBundleDisplayName"] as? String ?? "MANTAReceiver",
+            version: info["CFBundleShortVersionString"] as? String ?? "0",
+            build: info["CFBundleVersion"] as? String ?? "0",
+            platform: "macOS",
+            operatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            deviceModel: Host.current().localizedName ?? "Mac")
+    }
+
 }
 
 private enum ReceiverImportError: LocalizedError {
     case unsupportedExtension
-    case rawSessionFolder
     case notALogicalBundle
 
     var errorDescription: String? {
         switch self {
         case .unsupportedExtension:
-            return "Choose a .manta archive, or a folder containing an extracted .manta bundle."
-        case .rawSessionFolder:
-            return """
-            This is a raw working-session folder, not a .manta bundle (it has \
-            session.json but no manifest.json). On the capturing iPad, tap Export \
-            to produce a .manta archive, then import that file or its extracted folder.
-            """
+            return "Choose a .manta archive, a recovered .manta package, or a MANTA working-session folder."
         case .notALogicalBundle:
-            return "This folder is missing manifest.json, so it is not a MANTA capture bundle."
+            return "This folder is missing manifest.json and session.json, so it is not a MANTA capture bundle or recoverable session."
         }
     }
 }

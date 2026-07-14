@@ -59,11 +59,18 @@ struct CaptureVisualizationView: View {
                     Button("Previous", systemImage: "chevron.left") {
                         observationIndex = max(0, observationIndex - 1)
                     }.disabled(observationIndex == 0)
-                    Slider(
-                        value: Binding(
-                            get: { Double(observationIndex) },
-                            set: { observationIndex = Int($0.rounded()) }),
-                        in: 0...Double(max(0, bundle.capture.observations.count - 1)), step: 1)
+                    if bundle.capture.observations.count > 1 {
+                        Slider(
+                            value: Binding(
+                                get: { Double(observationIndex) },
+                                set: { observationIndex = Int($0.rounded()) }),
+                            in: 0...Double(bundle.capture.observations.count - 1), step: 1)
+                    } else {
+                        Capsule()
+                            .fill(.quaternary)
+                            .frame(height: 4)
+                            .accessibilityHidden(true)
+                    }
                     Text("Frame \(observationIndex + 1) of \(bundle.capture.observations.count)")
                         .monospacedDigit()
                     Button("Next", systemImage: "chevron.right") {

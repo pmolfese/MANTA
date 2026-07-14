@@ -220,6 +220,32 @@ struct ReceiverAlignmentWorkspace: View {
                 .disabled(observationIndex >= observations.count - 1)
             }
 
+            HStack(spacing: 8) {
+                Text("1")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 26, alignment: .leading)
+                if observations.count > 1 {
+                    Slider(
+                        value: Binding(
+                            get: { Double(observationIndex) },
+                            set: { observationIndex = Int($0.rounded()) }),
+                        in: 0...Double(observations.count - 1),
+                        step: 1)
+                    .help("Scrub through depth frames")
+                } else {
+                    Capsule()
+                        .fill(.quaternary)
+                        .frame(height: 4)
+                        .accessibilityHidden(true)
+                }
+                Text("\(observations.count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 34, alignment: .trailing)
+            }
+            .accessibilityLabel("Depth frame scrubber")
+
             Text("Click \(selectedKind.rawValue) in the image, then click the same landmark on the 3D photogrammetry model. Repeat the image click in another view to check depth consistency.")
                 .font(.caption)
                 .foregroundStyle(.secondary)

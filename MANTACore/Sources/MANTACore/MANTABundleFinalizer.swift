@@ -52,12 +52,22 @@ public struct MANTABundleFinalizationRequest: Sendable {
 }
 
 public struct MANTAFinalizedBundle: Sendable {
+    public enum Container: String, Sendable {
+        case archive
+        case directoryPackage
+    }
+
     public var archiveURL: URL
     public var manifest: MANTABundleManifest
+    public var container: Container
 
-    public init(archiveURL: URL, manifest: MANTABundleManifest) {
+    public init(
+        archiveURL: URL, manifest: MANTABundleManifest,
+        container: Container = .archive
+    ) {
         self.archiveURL = archiveURL
         self.manifest = manifest
+        self.container = container
     }
 }
 
@@ -105,10 +115,15 @@ public struct MANTABundleFinalizer {
             throw MANTABundleFinalizationError.destinationExists(archiveURL.lastPathComponent)
         }
 
+        var shouldRemoveStaging = true
         let staging = outputDirectory.appendingPathComponent(
             ".manta-\(UUID().uuidString).partial", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: staging) }
+        defer {
+            if shouldRemoveStaging {
+                try? fileManager.removeItem(at: staging)
+            }
+        }
 
         var metadata = [(path: String, mediaType: String, role: String)]()
         try write(
@@ -203,11 +218,23 @@ public struct MANTABundleFinalizer {
         _ = try MANTABundleValidator(fileManager: fileManager).validate(
             directory: staging, verifyFileHashes: false)
         progress?(0.76, "Creating archive")
-        try MANTADeterministicZIP(fileManager: fileManager).write(
-            directory: staging, to: archiveURL, precomputedCRC32: crc32ByPath)
-        progress?(1.0, "Archive created")
-        try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: archiveURL.path)
-        return MANTAFinalizedBundle(archiveURL: archiveURL, manifest: manifest)
+        do {
+            try MANTADeterministicZIP(fileManager: fileManager).write(
+                directory: staging, to: archiveURL, precomputedCRC32: crc32ByPath)
+            progress?(1.0, "Archive created")
+            try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: archiveURL.path)
+            return MANTAFinalizedBundle(archiveURL: archiveURL, manifest: manifest)
+        } catch {
+            progress?(0.90, "Saving directory package")
+            if fileManager.fileExists(atPath: archiveURL.path) {
+                try fileManager.removeItem(at: archiveURL)
+            }
+            try fileManager.moveItem(at: staging, to: archiveURL)
+            shouldRemoveStaging = false
+            progress?(1.0, "Directory package created")
+            return MANTAFinalizedBundle(
+                archiveURL: archiveURL, manifest: manifest, container: .directoryPackage)
+        }
     }
 
     private func write(

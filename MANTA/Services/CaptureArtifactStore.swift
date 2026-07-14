@@ -278,14 +278,20 @@ struct CaptureArtifactStore: @unchecked Sendable {
             progress?(0.82, "Verifying archive")
             let verificationDirectory = outputDirectory.appendingPathComponent(
                 "verified", isDirectory: true)
-            _ = try MANTAArchiveImporter(fileManager: fileManager).importBundle(
-                at: finalized.archiveURL, to: verificationDirectory)
-            try fileManager.removeItem(at: verificationDirectory)
+            if finalized.container == .archive {
+                _ = try MANTAArchiveImporter(fileManager: fileManager).importBundle(
+                    at: finalized.archiveURL, to: verificationDirectory)
+                try fileManager.removeItem(at: verificationDirectory)
+            } else {
+                _ = try MANTABundleValidator(fileManager: fileManager).validate(
+                    directory: finalized.archiveURL)
+            }
         } else {
             progress?(0.92, "Sealing archive")
         }
         progress?(1.0, "Raw bundle ready")
-        return MANTAStoreExportResult(url: finalized.archiveURL, bundleID: bundleID)
+        return MANTAStoreExportResult(
+            url: finalized.archiveURL, bundleID: bundleID, container: finalized.container)
     }
 
     private func makeCaptureDocument(
@@ -478,7 +484,11 @@ struct CaptureArtifactStore: @unchecked Sendable {
         for session: ScanSession, bundle: Bundle = .main
     ) -> (sources: [MANTABundleFileSource], layoutPath: String?) {
         guard session.layout.hasElectrodeNet else { return ([], nil) }
-        let filenames = ["coordinates_128.xml", "coordinates_256.xml", "HydroCelLayoutMetadata.json"]
+        let filenames = [
+            "coordinates_128.xml", "coordinates_256.xml",
+            "sensorLayout_128.xml", "sensorLayout_256.xml",
+            "HydroCelLayoutMetadata.json"
+        ]
         let sources = filenames.compactMap { filename -> MANTABundleFileSource? in
             let components = filename.split(separator: ".", maxSplits: 1).map(String.init)
             guard components.count == 2 else { return nil }
@@ -489,7 +499,9 @@ struct CaptureArtifactStore: @unchecked Sendable {
             return MANTABundleFileSource(
                 path: "layouts/source/\(filename)", sourceURL: source,
                 mediaType: components[1] == "xml" ? "application/xml" : "application/json",
-                role: components[1] == "xml" ? "layout-coordinate-reference" : "layout-metadata")
+                role: filename.hasPrefix("sensorLayout")
+                    ? "layout-topology-reference"
+                    : (components[1] == "xml" ? "layout-coordinate-reference" : "layout-metadata"))
         }
         let selected = "layouts/source/coordinates_\(session.layout.channelCount).xml"
         return (sources, sources.contains(where: { $0.path == selected }) ? selected : nil)
@@ -1157,6 +1169,7 @@ enum MANTAExportVariant: String {
 struct MANTAStoreExportResult: Sendable {
     var url: URL
     var bundleID: UUID
+    var container: MANTAFinalizedBundle.Container = .archive
 }
 
 struct MANTAStoreExportPair: Sendable {

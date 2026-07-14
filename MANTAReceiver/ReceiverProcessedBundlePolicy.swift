@@ -28,6 +28,7 @@ struct ReceiverProcessedUpdate: Sendable {
 nonisolated enum ReceiverProcessedPackage {
     static let metadataFilename = "processed.json"
     private static let logFilename = "log_manta.json"
+    private static let electrodeEvidencePath = "analysis/electrode_evidence.json"
 
     static func isPackage(_ url: URL) -> Bool {
         FileManager.default.fileExists(
@@ -67,6 +68,15 @@ nonisolated enum ReceiverProcessedPackage {
             changeLog: changeLog)
     }
 
+    static func loadElectrodeEvidence(
+        from bundle: MANTAValidatedBundle
+    ) -> ReceiverElectrodeEvidenceDocument? {
+        let url = bundle.rootDirectory.appendingPathComponent(electrodeEvidencePath)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? MANTAJSON.makeDecoder().decode(
+            ReceiverElectrodeEvidenceDocument.self, from: data)
+    }
+
     static func updateReconstruction(
         bundle source: MANTAValidatedBundle,
         preparation: ReceiverReconstructionPreparation,
@@ -84,6 +94,7 @@ nonisolated enum ReceiverProcessedPackage {
         try replaceFile(preparation.posesURL, at: posesPath, in: state.root)
 
         var capture = state.bundle.capture
+        let invalidatedElectrodes = invalidateElectrodes(in: &state, capture: &capture)
         var reconstruction = capture.reconstruction ?? MANTAReconstructionReference()
         reconstruction.objectCaptureModelPath = modelPath
         reconstruction.modelToWorld = preview.modelToWorld.map(flattened)
@@ -92,7 +103,8 @@ nonisolated enum ReceiverProcessedPackage {
         let change = MANTAChangeRecord(
             changedAt: Date(),
             category: "photogrammetry-reconstruction",
-            summary: "Generated a macOS \(preparation.detail.rawValue.capitalized) Object Capture model and attempted ARKit-world alignment.",
+            summary: "Generated a macOS \(preparation.detail.rawValue.capitalized) Object Capture model and attempted ARKit-world alignment."
+                + (invalidatedElectrodes ? " Invalidated the previous electrode solution." : ""),
             targets: [modelPath, diagnosticsPath, posesPath, "capture.json"])
         let changed = [
             FileDescription(path: modelPath, mediaType: "model/vnd.usdz+zip", role: "photogrammetry-model-macos"),
@@ -117,6 +129,7 @@ nonisolated enum ReceiverProcessedPackage {
         try writeJSON(outcome.diagnostics, to: state.root.appendingPathComponent(diagnosticsPath))
 
         var capture = state.bundle.capture
+        let invalidatedElectrodes = invalidateElectrodes(in: &state, capture: &capture)
         var reconstruction = capture.reconstruction ?? MANTAReconstructionReference()
         reconstruction.modelToWorld = flattened(outcome.result.transform)
         reconstruction.worldCoordinateSystem = "arkit-world"
@@ -145,7 +158,9 @@ nonisolated enum ReceiverProcessedPackage {
             category: "manual-world-alignment",
             summary: outcome.diagnostics.userOverrideAccepted
                 ? "Accepted a macOS model-to-world alignment with an explicit plausibility-warning override."
-                : "Accepted a macOS landmark-guided model-to-world alignment.",
+                    + (invalidatedElectrodes ? " Invalidated the previous electrode solution." : "")
+                : "Accepted a macOS landmark-guided model-to-world alignment."
+                    + (invalidatedElectrodes ? " Invalidated the previous electrode solution." : ""),
             targets: targets)
         state.bundle = try commit(state: state, capture: capture, change: change, changedFiles: changed)
         return ReceiverProcessedUpdate(
@@ -168,6 +183,34 @@ nonisolated enum ReceiverProcessedPackage {
             summary: "Reviewed and repositioned fiducials on macOS against metric 3D evidence.",
             targets: ["capture.json"])
         state.bundle = try commit(state: state, capture: capture, change: change, changedFiles: [])
+        return ReceiverProcessedUpdate(
+            bundle: state.bundle, packageURL: state.root,
+            alignmentRMSMeters: nil, alignmentAccepted: false)
+    }
+
+    static func updateElectrodes(
+        bundle source: MANTAValidatedBundle,
+        electrodes: [MANTAElectrodeSolution],
+        evidence: ReceiverElectrodeEvidenceDocument
+    ) throws -> ReceiverProcessedUpdate {
+        var state = try ensurePackage(for: source)
+        let evidenceURL = state.root.appendingPathComponent(electrodeEvidencePath)
+        try writeJSON(evidence, to: evidenceURL)
+        var capture = state.bundle.capture
+        capture.electrodes = electrodes
+        let reviewedCount = electrodes.filter { $0.state == "Reviewed" }.count
+        let change = MANTAChangeRecord(
+            changedAt: Date(),
+            category: "electrode-identification",
+            summary: "Saved \(electrodes.count) electrode coordinates from macOS OCR, multi-view geometry, and manual review (\(reviewedCount) reviewed).",
+            targets: ["capture.json", electrodeEvidencePath])
+        state.bundle = try commit(
+            state: state, capture: capture, change: change,
+            changedFiles: [
+                FileDescription(
+                    path: electrodeEvidencePath, mediaType: "application/json",
+                    role: "electrode-detection-evidence")
+            ])
         return ReceiverProcessedUpdate(
             bundle: state.bundle, packageURL: state.root,
             alignmentRMSMeters: nil, alignmentAccepted: false)
@@ -248,6 +291,24 @@ nonisolated enum ReceiverProcessedPackage {
             rootDirectory: destination, manifest: manifest,
             capture: source.capture, changeLog: source.changeLog)
         return State(root: destination, bundle: initial, metadata: metadata)
+    }
+
+    private static func invalidateElectrodes(
+        in state: inout State,
+        capture: inout MANTACaptureDocument
+    ) -> Bool {
+        guard !(capture.electrodes ?? []).isEmpty else { return false }
+        capture.electrodes = nil
+        try? FileManager.default.removeItem(
+            at: state.root.appendingPathComponent(electrodeEvidencePath))
+        var manifest = state.bundle.manifest
+        manifest.files.removeAll { $0.path == electrodeEvidencePath }
+        state.bundle = MANTAValidatedBundle(
+            rootDirectory: state.bundle.rootDirectory,
+            manifest: manifest,
+            capture: state.bundle.capture,
+            changeLog: state.bundle.changeLog)
+        return true
     }
 
     private static func commit(
