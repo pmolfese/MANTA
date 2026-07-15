@@ -165,6 +165,7 @@ private struct BundleInspector: View {
                 store: store,
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
+                .id(alignmentWorkspaceID)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
             ReceiverElectrodeWorkspace(store: store, bundle: bundle)
                 .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
@@ -176,6 +177,17 @@ private struct BundleInspector: View {
                 .tabItem { Label("Metadata", systemImage: "list.bullet.rectangle") }
         }
         .navigationTitle("Capture Inspector")
+    }
+
+    /// Landmark clicks belong to one specific bundle and photogrammetry model.
+    /// Reset the Align tab when either changes so picks from a recovered archive,
+    /// an earlier reconstruction, or a newly saved PROCESSED child cannot leak
+    /// into the next registration.
+    private var alignmentWorkspaceID: String {
+        let modelIdentity = store.ephemeralReconstruction?.modelURL.standardizedFileURL.path
+            ?? bundle.capture.reconstruction?.objectCaptureModelPath
+            ?? "no-model"
+        return "\(bundle.manifest.bundleID.uuidString)|\(modelIdentity)"
     }
 
     private var metadata: some View {
@@ -351,6 +363,56 @@ private struct ReceiverReconstructionView: View {
                 }
             }
 
+            if !store.reconstructionLog.isEmpty {
+                Section {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 7) {
+                                ForEach(store.reconstructionLog) { entry in
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Image(systemName: logIcon(entry.level))
+                                            .foregroundStyle(logColor(entry.level))
+                                            .frame(width: 14)
+                                        Text(entry.timestamp, format: .dateTime
+                                            .hour().minute().second())
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                        Text(entry.message)
+                                            .font(.caption.monospaced())
+                                            .textSelection(.enabled)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .id(entry.id)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                        }
+                        .frame(minHeight: 120, maxHeight: 260)
+                        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 6))
+                        .onChange(of: store.reconstructionLog.count) { _, _ in
+                            guard let id = store.reconstructionLog.last?.id else { return }
+                            withAnimation { proxy.scrollTo(id, anchor: .bottom) }
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("Reconstruction Log")
+                        Spacer()
+                        Button("Copy", systemImage: "doc.on.doc") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(
+                                reconstructionLogText, forType: .string)
+                        }
+                        .labelStyle(.titleAndIcon)
+                        Button("Clear", systemImage: "trash") {
+                            store.clearReconstructionLog()
+                        }
+                        .labelStyle(.titleAndIcon)
+                    }
+                }
+            }
+
             if let preview = store.ephemeralReconstruction {
                 Section("Session Preview") {
                     Label(
@@ -406,6 +468,31 @@ private struct ReceiverReconstructionView: View {
 
     private func bytes(_ value: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+
+    private var reconstructionLogText: String {
+        let formatter = ISO8601DateFormatter()
+        return store.reconstructionLog.map {
+            "[\(formatter.string(from: $0.timestamp))] [\($0.level.rawValue.uppercased())] \($0.message)"
+        }.joined(separator: "\n")
+    }
+
+    private func logIcon(_ level: ReceiverReconstructionLogLevel) -> String {
+        switch level {
+        case .info: "info.circle.fill"
+        case .warning: "exclamationmark.triangle.fill"
+        case .error: "xmark.octagon.fill"
+        case .success: "checkmark.circle.fill"
+        }
+    }
+
+    private func logColor(_ level: ReceiverReconstructionLogLevel) -> Color {
+        switch level {
+        case .info: .secondary
+        case .warning: .orange
+        case .error: .red
+        case .success: .green
+        }
     }
 
     private func elapsed(from start: Date, to end: Date) -> String {

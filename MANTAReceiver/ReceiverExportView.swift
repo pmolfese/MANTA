@@ -729,6 +729,10 @@ nonisolated enum ReceiverCoordinateExporter {
                 case FiducialKind.nasion.rawValue: metadata = ("Nasion", 2002, 2)
                 case FiducialKind.leftPreauricular.rawValue: metadata = ("Left periauricular point", 2011, 2)
                 case FiducialKind.rightPreauricular.rawValue: metadata = ("Right periauricular point", 2010, 2)
+                case "Cz":
+                    let referenceNumber = bundle.capture.layoutID
+                        .localizedCaseInsensitiveContains("256") ? 257 : 129
+                    metadata = ("VREF", referenceNumber, 1)
                 default:
                     metadata = ("", Int(item.label.drop(while: { !$0.isNumber })) ?? index + 1, 0)
                 }

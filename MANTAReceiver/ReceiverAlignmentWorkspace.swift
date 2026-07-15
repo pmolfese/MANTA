@@ -40,13 +40,10 @@ struct ReceiverAlignmentWorkspace: View {
         }
     }
 
-    private var savedTargetLandmarks: [FiducialKind: SIMD3<Float>] {
-        Dictionary(uniqueKeysWithValues: (bundle.capture.fiducials ?? []).compactMap { item in
-            guard let kind = FiducialKind(rawValue: item.kind),
-                  item.coordinateSystem == "arkit-world",
-                  let coordinate = item.coordinate, coordinate.count == 3 else { return nil }
-            return (kind, SIMD3(Float(coordinate[0]), Float(coordinate[1]), Float(coordinate[2])))
-        })
+    private var hasArchivedCaptureFiducials: Bool {
+        (bundle.capture.fiducials ?? []).contains {
+            $0.coordinateSystem == "arkit-world" && $0.coordinate?.count == 3
+        }
     }
 
     var body: some View {
@@ -266,6 +263,14 @@ struct ReceiverAlignmentWorkspace: View {
             VStack(alignment: .leading, spacing: 12) {
                 landmarkStatus
 
+                if hasArchivedCaptureFiducials {
+                    Label(
+                        "Saved capture fiducials are reference data and are not counted as photo review. Place Nasion, LPA, and RPA in the RGB-D images for this alignment.",
+                        systemImage: "info.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 GroupBox("Purpose of Align") {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Align estimates one scale, rotation, and translation that places the photogrammetry model into the metric ARKit/LiDAR coordinate system.")
@@ -366,10 +371,11 @@ struct ReceiverAlignmentWorkspace: View {
                 ? "\(views) · \(target.outlierCount) ignored"
                 : "\(views) · center"
         } else {
-            targetLabel = savedTargetLandmarks[kind] == nil ? "Missing" : "3D reviewed"
+            targetLabel = "Missing"
         }
+        let optionalTag = kind.isCardinal ? "" : "  (optional, recommended)"
         return GridRow {
-            Text(kind.rawValue)
+            Text(kind.rawValue + optionalTag)
             Label(
                 targetLabel,
                 systemImage: target == nil ? "circle" : "checkmark.circle.fill")
@@ -456,23 +462,31 @@ struct ReceiverAlignmentWorkspace: View {
 
     private var canSolve: Bool {
         if strategy == .icp, seed != .landmarks { return true }
-        return FiducialKind.allCases.allSatisfy {
+        return FiducialKind.cardinal.allSatisfy {
             targetSummary(for: $0) != nil && sourceLandmarks[$0] != nil
         }
+    }
+
+    /// Whether Cz is placed on both the image and the model. When present it is
+    /// fed to the solver as an off-plane 4th correspondence.
+    private var hasVertexPair: Bool {
+        targetSummary(for: .vertex) != nil && sourceLandmarks[.vertex] != nil
     }
 
     private var solveReadinessMessage: String {
         if strategy == .icp, seed != .landmarks {
             return "Ready for surface alignment without landmark correspondences."
         }
-        let imageCount = FiducialKind.allCases.filter {
+        let imageCount = FiducialKind.cardinal.filter {
             targetSummary(for: $0) != nil
         }.count
-        let modelCount = FiducialKind.allCases.filter {
+        let modelCount = FiducialKind.cardinal.filter {
             sourceLandmarks[$0] != nil
         }.count
         if imageCount == 3, modelCount == 3 {
-            return "Ready: image landmarks 3/3 · model landmarks 3/3."
+            return hasVertexPair
+                ? "Ready: 3 cardinal landmarks + Cz. The off-plane Cz stabilizes the fit."
+                : "Ready: cardinal landmarks 3/3. Add Cz (below) to stabilize an otherwise coplanar, mirror-ambiguous fit."
         }
         if imageCount == 3, modelCount < 3 {
             return "Image landmarks 3/3 · model landmarks \(modelCount)/3. Select each landmark above, then click it on the 3D model."
@@ -552,11 +566,7 @@ struct ReceiverAlignmentWorkspace: View {
     private func targetSummary(
         for kind: FiducialKind
     ) -> RobustPointSetCenterResult? {
-        guard let values = targetEvidence[kind]?.values, !values.isEmpty else {
-            return savedTargetLandmarks[kind].flatMap {
-                RobustPointSetCenter.fit([$0])
-            }
-        }
+        guard let values = targetEvidence[kind]?.values, !values.isEmpty else { return nil }
         return RobustPointSetCenter.fit(values.map(\.worldPoint))
     }
 

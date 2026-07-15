@@ -706,7 +706,7 @@ final class ScanSessionViewModel: ObservableObject {
         }
         stopAutoSampling()
         isHeadBoundsPlacementActive = false
-        fiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.allCases.first
+        fiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.cardinal.first
         statusMessage = fiducialPlacementPrompt ?? "Mark the live fiducials."
     }
 
@@ -833,7 +833,7 @@ final class ScanSessionViewModel: ObservableObject {
         }
         stopAutoSampling()
         fiducialPlacementKind = nil
-        modelFiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.allCases.first
+        modelFiducialPlacementKind = firstUnplacedFiducialKind() ?? FiducialKind.cardinal.first
         statusMessage = modelFiducialPlacementPrompt ?? "Mark the fiducials on the head model."
     }
 
@@ -912,7 +912,7 @@ final class ScanSessionViewModel: ObservableObject {
     /// the live camera and the 3D model without redoing already-placed ones.
     private func firstUnplacedFiducialKind() -> FiducialKind? {
         let placed = Dictionary(uniqueKeysWithValues: session.fiducials.map { ($0.kind, $0.coordinate != nil) })
-        return FiducialKind.allCases.first { placed[$0] != true }
+        return FiducialKind.cardinal.first { placed[$0] != true }
     }
 
     func pauseLiveScan() {
@@ -1432,7 +1432,7 @@ final class ScanSessionViewModel: ObservableObject {
     private func orderedLandmarks(_ fiducials: [FiducialAnnotation]) -> [SIMD3<Float>] {
         let byKind = Dictionary(uniqueKeysWithValues: fiducials.map { ($0.kind, $0) })
         var result: [SIMD3<Float>] = []
-        for kind in FiducialKind.allCases {
+        for kind in FiducialKind.cardinal {
             guard let coordinate = byKind[kind]?.coordinate else { return [] }
             result.append(SIMD3<Float>(Float(coordinate.x), Float(coordinate.y), Float(coordinate.z)))
         }

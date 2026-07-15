@@ -66,7 +66,23 @@ public enum FiducialKind: String, CaseIterable, Codable, Identifiable, Sendable 
     case nasion = "Nasion"
     case leftPreauricular = "LPA"
     case rightPreauricular = "RPA"
+    /// Vertex / Cz. Off the nasion–LPA–RPA plane, so it is not an EEG cardinal
+    /// fiducial but an optional stabilizer for world alignment: three coplanar
+    /// landmarks admit a mirror-image fit and leave the off-plane rotation
+    /// under-constrained, which throws scalp points far off the surface. Cz
+    /// breaks that degeneracy. Excluded from capture gating and EEG fiducial
+    /// exports (see `cardinal`); used by the manual alignment solver when placed.
+    case vertex = "Cz"
     public var id: String { rawValue }
+
+    /// The three EEG cardinal fiducials. Use this — not `allCases` — wherever the
+    /// nasion/LPA/RPA anatomical basis is what is meant (capture completion,
+    /// head-coordinate frame, EEG fiducial exports). `allCases` additionally
+    /// includes `.vertex`, which is only an alignment aid.
+    public static let cardinal: [FiducialKind] = [.nasion, .leftPreauricular, .rightPreauricular]
+
+    /// Whether this landmark is one of the three EEG cardinal fiducials.
+    public var isCardinal: Bool { Self.cardinal.contains(self) }
 }
 
 public struct FiducialAnnotation: Identifiable, Codable, Equatable, Hashable, Sendable {
@@ -202,6 +218,10 @@ public struct ElectrodeLayout: Identifiable, Codable, Equatable, Hashable, Senda
     public var fiducialSensorHints: [FiducialKind: Int]
     public var referenceSensor: Int?
     public var referenceLabel: String?
+    /// Coordinate prior for the physical reference/vertex sensor (Cz for the
+    /// bundled HydroCel nets). Kept separate from the three anatomical
+    /// fiducials so head-coordinate readiness remains Nasion/LPA/RPA-only.
+    public var referenceCoordinatePrior: Coordinate3D?
     public var coordinateSpace: CoordinateSpace
 
     public init(
@@ -210,6 +230,7 @@ public struct ElectrodeLayout: Identifiable, Codable, Equatable, Hashable, Senda
         cardinalLabels: Set<String>, electrodes: [ElectrodeDefinition],
         fiducialCoordinatePriors: [FiducialKind: Coordinate3D],
         fiducialSensorHints: [FiducialKind: Int], referenceSensor: Int?, referenceLabel: String?,
+        referenceCoordinatePrior: Coordinate3D? = nil,
         coordinateSpace: CoordinateSpace = .egiLayoutCentimeters
     ) {
         self.id = id
@@ -222,6 +243,7 @@ public struct ElectrodeLayout: Identifiable, Codable, Equatable, Hashable, Senda
         self.fiducialSensorHints = fiducialSensorHints
         self.referenceSensor = referenceSensor
         self.referenceLabel = referenceLabel
+        self.referenceCoordinatePrior = referenceCoordinatePrior
         self.coordinateSpace = coordinateSpace
     }
 
@@ -295,7 +317,7 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
         coordinateSpace: CoordinateSpace = .arkitWorldMeters,
         photogrammetryModelFilename: String? = nil, worldAlignmentTransform: [Float]? = nil,
         alignmentStrategy: WorldAlignmentStrategy = .icp, alignmentSeed: AlignmentSeed = .coarsePCA,
-        modelFiducials: [FiducialAnnotation] = FiducialKind.allCases.map {
+        modelFiducials: [FiducialAnnotation] = FiducialKind.cardinal.map {
             FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview)
         }, modelCoordinateSpace: CoordinateSpace = .photogrammetryModelMeters,
         lidarMeshFilename: String? = nil, lastExportedBundleID: UUID? = nil,
@@ -368,7 +390,7 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
     public static func newSession(layout: ElectrodeLayout = .fallback128) -> ScanSession {
         var session = ScanSession(
             name: "", createdAt: Date(), captureMode: .both, layout: layout,
-            fiducials: FiducialKind.allCases.map {
+            fiducials: FiducialKind.cardinal.map {
                 FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview)
             }, electrodes: [], captureObservations: [])
         session.name = session.displayName

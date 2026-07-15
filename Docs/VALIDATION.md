@@ -81,11 +81,18 @@ For each run record:
 
 - Frames attempted/decoded and reasons for rejection.
 - OCR candidates, accepted labels, ambiguous reads, and label conflicts.
+- Unlabeled classical-CV cup proposals, per-frame false positives, multi-view
+  cluster support/spread, and the fraction rejected before assignment.
 - Depth availability/confidence and spatial refinement method.
+- Per-frame 3D-to-image reprojection error and electrode-to-surface distance;
+  report systematic registration offsets separately from individual detection
+  errors.
 - Supporting frames per electrode and fused spread.
 - Neighbor-validation findings.
 - Template-fit anchors, spatial coverage, scale, residual, and reliability.
 - Observed, inferred, manually placed, reviewed, and missing counts.
+- Globally assigned visual cups and assignment distance, kept separate from
+  OCR-labeled observations and template-only guesses.
 
 The target of at least 240 automatically labeled channels on a good 256 net is
 aspirational until real captures establish feasibility. Filled template

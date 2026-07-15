@@ -68,7 +68,10 @@ public struct HydroCelLayoutFileLoader {
                     if let kind = FiducialKind(metadataKey: $1.key) { $0[kind] = $1.value }
                 },
                 referenceSensor: definition.referenceSensor,
-                referenceLabel: definition.referenceLabel)
+                referenceLabel: definition.referenceLabel,
+                referenceCoordinatePrior: definition.referenceSensor.flatMap {
+                    coordinates.references[$0]?.coordinate
+                })
         }
     }
 
@@ -96,6 +99,11 @@ private struct MetadataDefinition: Decodable {
 private struct Coordinates {
     var electrodes = [Int: Coordinate3D]()
     var fiducials = [FiducialKind: Coordinate3D]()
+    var references = [Int: ReferenceCoordinate]()
+}
+private struct ReferenceCoordinate {
+    var name: String
+    var coordinate: Coordinate3D
 }
 private struct SensorLayout {
     var positions = [Int: Coordinate2D]()
@@ -153,6 +161,10 @@ private final class CoordinateParser: NSObject, XMLParserDelegate {
         }
         let coordinate = Coordinate3D(x: x, y: y, z: z)
         if type == 0 { result.electrodes[number] = coordinate }
+        if type == 1 {
+            result.references[number] = ReferenceCoordinate(
+                name: sensor.name, coordinate: coordinate)
+        }
         if type == 2, let kind = FiducialKind(coordinateName: sensor.name) {
             result.fiducials[kind] = coordinate
         }

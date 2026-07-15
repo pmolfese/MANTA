@@ -11,6 +11,7 @@ final class ReceiverStore: ObservableObject {
     @Published private(set) var reconstructionProgress = 0.0
     @Published private(set) var reconstructionStage = ""
     @Published private(set) var reconstructionStartedAt: Date?
+    @Published private(set) var reconstructionLog = [ReceiverReconstructionLogEntry]()
     @Published private(set) var processedPackageURL: URL?
     @Published private(set) var reconstructionAlignmentRMSMeters: Float?
     @Published private(set) var reconstructionAlignmentAccepted = false
@@ -95,6 +96,10 @@ final class ReceiverStore: ObservableObject {
         guard !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
               let sourceBundle = bundle else { return }
         clearEphemeralReconstruction()
+        reconstructionLog.removeAll(keepingCapacity: true)
+        appendReconstructionLog(
+            .info,
+            "Requested \(detail.title) reconstruction · \(outputMode.rawValue).")
         reconstructionTask = Task { [weak self] in
             await self?.performReconstruction(
                 bundle: sourceBundle, detail: detail, outputMode: outputMode)
@@ -104,8 +109,32 @@ final class ReceiverStore: ObservableObject {
     func cancelReconstruction() {
         guard reconstructionCanCancel else { return }
         reconstructionStage = "Cancelling reconstruction…"
+        appendReconstructionLog(.warning, "Cancellation requested by the user.")
         reconstructionTask?.cancel()
         reconstructionRunner.cancel()
+    }
+
+    func clearReconstructionLog() {
+        reconstructionLog.removeAll(keepingCapacity: true)
+    }
+
+    private func appendReconstructionLog(
+        _ level: ReceiverReconstructionLogLevel,
+        _ message: String
+    ) {
+        guard reconstructionLog.last?.message != message else { return }
+        reconstructionLog.append(ReceiverReconstructionLogEntry(
+            level: level, message: message))
+        if reconstructionLog.count > 1_000 {
+            reconstructionLog.removeFirst(reconstructionLog.count - 1_000)
+        }
+    }
+
+    private func updateReconstructionProgress(_ progress: Double, stage: String) {
+        reconstructionProgress = progress
+        guard reconstructionStage != stage else { return }
+        reconstructionStage = stage
+        appendReconstructionLog(.info, stage)
     }
 
     func discardReconstructionPreview() {
@@ -310,6 +339,9 @@ final class ReceiverStore: ObservableObject {
         reconstructionAlignmentRMSMeters = nil
         reconstructionAlignmentAccepted = false
         errorMessage = nil
+        appendReconstructionLog(
+            .info,
+            "Preflight: \(sourceBundle.capture.observations.count) captured observations available.")
 
         var preparation: ReceiverReconstructionPreparation?
         defer {
@@ -328,25 +360,35 @@ final class ReceiverStore: ObservableObject {
             }.value
             preparation = prepared
             try Task.checkCancellation()
-            reconstructionProgress = 0.03
+            updateReconstructionProgress(0.03, stage: "Prepared reconstruction inputs")
+            appendReconstructionLog(
+                .info,
+                "Prepared \(prepared.imageCount) images (\(ByteCountFormatter.string(fromByteCount: prepared.sourceImageBytes, countStyle: .file))).")
 
             let run = try await reconstructionRunner.reconstruct(
                 preparation: prepared
             ) { [weak self] fraction, stage in
-                self?.reconstructionProgress = 0.03 + fraction * 0.72
-                self?.reconstructionStage = stage
+                self?.updateReconstructionProgress(
+                    0.03 + fraction * 0.72, stage: stage)
+            } log: { [weak self] level, message in
+                self?.appendReconstructionLog(level, message)
             }
             try Task.checkCancellation()
 
             if outputMode == .preview {
                 reconstructionCanCancel = false
-                reconstructionProgress = 0.78
-                reconstructionStage = "Preparing interactive preview"
+                updateReconstructionProgress(0.78, stage: "Preparing interactive preview")
+                let progressStore = self
                 let preview = try await Task.detached(priority: .userInitiated) {
                     try ReceiverReconstructionWorkflow.makePreview(
                         bundle: sourceBundle,
                         preparation: prepared,
-                        run: run)
+                        run: run,
+                        log: { level, message in
+                            Task { @MainActor in
+                                progressStore.appendReconstructionLog(level, message)
+                            }
+                        })
                 }.value
                 ephemeralReconstruction = preview
                 ephemeralWorkspace = prepared.workspace
@@ -355,26 +397,35 @@ final class ReceiverStore: ObservableObject {
                 preparation = nil
                 reconstructionAlignmentRMSMeters = preview.alignmentRMSMeters
                 reconstructionAlignmentAccepted = preview.alignmentAccepted
-                reconstructionProgress = 1
-                reconstructionStage = "Interactive preview ready · no MANTA archive written"
+                updateReconstructionProgress(
+                    1, stage: "Interactive preview ready · no MANTA archive written")
+                appendReconstructionLog(
+                    preview.alignmentAccepted ? .success : .warning,
+                    preview.alignmentAccepted
+                        ? "Preview alignment accepted."
+                        : "Preview created, but automatic ARKit-world alignment was not accepted.")
                 return
             }
 
             reconstructionCanCancel = false
-            reconstructionProgress = 0.75
-            reconstructionStage = "Aligning and updating PROCESSED"
+            updateReconstructionProgress(0.75, stage: "Aligning and updating PROCESSED")
             let progressStore = self
             let updated = try await Task.detached(priority: .userInitiated) {
                 try ReceiverProcessedPackage.updateReconstruction(
                     bundle: sourceBundle,
                     preparation: prepared,
-                    run: run
+                    run: run,
+                    log: { level, message in
+                        Task { @MainActor in
+                            progressStore.appendReconstructionLog(level, message)
+                        }
+                    }
                 ) { fraction, stage in
                     let mappedProgress = 0.75 + fraction * 0.22
                     Task { @MainActor in
                         guard mappedProgress > progressStore.reconstructionProgress else { return }
-                        progressStore.reconstructionProgress = mappedProgress
-                        progressStore.reconstructionStage = stage
+                        progressStore.updateReconstructionProgress(
+                            mappedProgress, stage: stage)
                     }
                 }
             }.value
@@ -386,20 +437,32 @@ final class ReceiverStore: ObservableObject {
             processedPackageURL = updated.packageURL
             reconstructionAlignmentRMSMeters = updated.alignmentRMSMeters
             reconstructionAlignmentAccepted = updated.alignmentAccepted
-            reconstructionProgress = 1
-            reconstructionStage = "PROCESSED package updated"
+            updateReconstructionProgress(1, stage: "PROCESSED package updated")
+            appendReconstructionLog(
+                updated.alignmentAccepted ? .success : .warning,
+                updated.alignmentAccepted
+                    ? "Reconstruction saved and automatic alignment accepted."
+                    : "Reconstruction saved, but automatic ARKit-world alignment was not accepted.")
         } catch let error as ReceiverReconstructionError {
             if case .cancelled = error {
-                reconstructionStage = "Reconstruction cancelled"
+                updateReconstructionProgress(
+                    reconstructionProgress, stage: "Reconstruction cancelled")
+                appendReconstructionLog(.warning, error.localizedDescription)
             } else {
                 errorMessage = error.localizedDescription
-                reconstructionStage = "Reconstruction failed"
+                updateReconstructionProgress(
+                    reconstructionProgress, stage: "Reconstruction failed")
+                appendReconstructionLog(.error, error.localizedDescription)
             }
         } catch is CancellationError {
-            reconstructionStage = "Reconstruction cancelled"
+            updateReconstructionProgress(
+                reconstructionProgress, stage: "Reconstruction cancelled")
+            appendReconstructionLog(.warning, "Reconstruction task was cancelled.")
         } catch {
             errorMessage = error.localizedDescription
-            reconstructionStage = "Reconstruction failed"
+            updateReconstructionProgress(
+                reconstructionProgress, stage: "Reconstruction failed")
+            appendReconstructionLog(.error, error.localizedDescription)
         }
     }
 

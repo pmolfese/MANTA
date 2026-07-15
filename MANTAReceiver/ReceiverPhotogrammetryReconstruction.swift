@@ -9,6 +9,20 @@ enum ReceiverReconstructionOutputMode: String, CaseIterable, Identifiable, Senda
     var id: String { rawValue }
 }
 
+enum ReceiverReconstructionLogLevel: String, Codable, Sendable {
+    case info
+    case warning
+    case error
+    case success
+}
+
+struct ReceiverReconstructionLogEntry: Identifiable, Sendable {
+    var id = UUID()
+    var timestamp = Date()
+    var level: ReceiverReconstructionLogLevel
+    var message: String
+}
+
 enum ReceiverPhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
     case medium
     case full
@@ -155,7 +169,8 @@ final class ReceiverPhotogrammetryRunner {
 
     func reconstruct(
         preparation: ReceiverReconstructionPreparation,
-        progress: @escaping @MainActor (Double, String) -> Void
+        progress: @escaping @MainActor (Double, String) -> Void,
+        log: @escaping @MainActor (ReceiverReconstructionLogLevel, String) -> Void
     ) async throws -> ReceiverPhotogrammetryRun {
         guard PhotogrammetrySession.isSupported else {
             throw ReceiverReconstructionError.unsupported
@@ -174,7 +189,9 @@ final class ReceiverPhotogrammetryRunner {
         let startedAt = Date()
         var skipped = [String]()
         var automaticDownsampling = false
+        var currentProgress = 0.0
         progress(0, "Starting Object Capture")
+        log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
         try active.process(requests: [request])
 
         do {
@@ -185,19 +202,27 @@ final class ReceiverPhotogrammetryRunner {
                 }
                 switch output {
                 case .requestProgress(_, let fraction):
+                    currentProgress = fraction
                     progress(fraction, "Reconstructing \(preparation.detail.title) model")
                 case .skippedSample(let id):
-                    skipped.append(String(describing: id))
+                    let sample = String(describing: id)
+                    skipped.append(sample)
+                    log(.warning, "Object Capture skipped input sample \(sample).")
                 case .automaticDownsampling:
                     automaticDownsampling = true
+                    log(.warning, "Object Capture enabled automatic image downsampling.")
                 case .requestError(_, let error):
+                    log(.error, "Object Capture request failed: \(error.localizedDescription)")
                     throw ReceiverReconstructionError.processing(error.localizedDescription)
                 case .processingCancelled:
+                    log(.warning, "Object Capture reported cancellation at \(Int(currentProgress * 100))%.")
                     throw ReceiverReconstructionError.cancelled
                 case .processingComplete:
                     guard FileManager.default.fileExists(atPath: preparation.modelURL.path) else {
+                        log(.error, "Object Capture completed but did not produce a model file.")
                         throw ReceiverReconstructionError.missingOutput
                     }
+                    log(.success, "Object Capture model generation completed.")
                     return ReceiverPhotogrammetryRun(
                         startedAt: startedAt,
                         completedAt: Date(),
@@ -393,11 +418,14 @@ nonisolated enum ReceiverReconstructionWorkflow {
         bundle: MANTAValidatedBundle,
         preparation: ReceiverReconstructionPreparation,
         run: ReceiverPhotogrammetryRun,
-        progress: (@Sendable (Double, String) -> Void)? = nil
+        progress: (@Sendable (Double, String) -> Void)? = nil,
+        log: (@Sendable (ReceiverReconstructionLogLevel, String) -> Void)? = nil
     ) throws -> ReceiverEphemeralReconstruction {
         progress?(0.01, "Loading reconstruction geometry")
         let source = ModelPointCloudLoader.load(url: preparation.modelURL, maxPoints: 8_000)
         let target = alignmentTarget(bundle: bundle, maxPoints: 8_000)
+        log?(.info, "Loaded \(source.count) photogrammetry alignment points.")
+        log?(.info, "Loaded \(target.count) LiDAR/fused-depth alignment target points.")
         var alignment: WorldAlignmentResult?
         if source.count >= 100, target.count >= 100 {
             var input = WorldAlignmentInput()
@@ -406,6 +434,13 @@ nonisolated enum ReceiverReconstructionWorkflow {
             input.targetCloud = target
             input.icpMaxIterations = 40
             alignment = WorldAlignmentSolver.solve(strategy: .icp, input: input)
+        } else {
+            if source.count < 100 {
+                log?(.warning, "Photogrammetry model supplied only \(source.count) usable points; at least 100 are required for automatic alignment.")
+            }
+            if target.count < 100 {
+                log?(.warning, "Only \(target.count) usable LiDAR/fused-depth points were found; at least 100 are required for automatic alignment.")
+            }
         }
         let alignmentScale = alignment.map { uniformScale($0.transform) }
         let symmetricRMS = alignment.map {
@@ -419,6 +454,16 @@ nonisolated enum ReceiverReconstructionWorkflow {
         // directions to agree before declaring an automatic alignment usable.
         let alignmentAccepted = symmetricRMS?.isFinite == true
             && (symmetricRMS ?? .greatestFiniteMagnitude) <= 0.05
+        if let symmetricRMS, symmetricRMS.isFinite {
+            log?(
+                alignmentAccepted ? .success : .warning,
+                String(
+                    format: "Automatic alignment symmetric RMS: %.1f mm%@.",
+                    symmetricRMS * 1_000,
+                    alignmentAccepted ? " (accepted)" : " (not accepted)"))
+        } else {
+            log?(.warning, "Automatic alignment did not produce a finite RMS value.")
+        }
 
         let modelBytes = Int64((try? preparation.modelURL.resourceValues(
             forKeys: [.fileSizeKey]).fileSize) ?? 0)
@@ -441,6 +486,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
             alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp")
         try MANTAJSON.makeEncoder().encode(diagnostics).write(
             to: preparation.diagnosticsURL, options: .atomic)
+        log?(.info, "Wrote reconstruction diagnostics.")
         return ReceiverEphemeralReconstruction(
             modelURL: preparation.modelURL,
             posesURL: preparation.posesURL,

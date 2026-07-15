@@ -24,6 +24,7 @@ struct CombinedModelViewer: View {
     private let electrodePlacementLabel: String?
     private let onWorldElectrodePointPicked: ((SIMD3<Double>) -> Void)?
     private let includesFiducialAnnotations: Bool
+    private let autoShowsFusedDepth: Bool
 
     @State private var showLiDAR: Bool
     @State private var showPhotogrammetry: Bool
@@ -70,6 +71,7 @@ struct CombinedModelViewer: View {
         self.electrodePlacementLabel = electrodePlacementLabel
         self.onWorldElectrodePointPicked = onWorldElectrodePointPicked
         self.includesFiducialAnnotations = includesFiducialAnnotations
+        self.autoShowsFusedDepth = !annotationOnlyDefault
         self.onFiducialsSaved = onFiducialsSaved
         self.fiducialSaveInProgress = fiducialSaveInProgress
         let initialLiDAR = assets.defaultLiDARChoice
@@ -89,7 +91,8 @@ struct CombinedModelViewer: View {
             Divider()
 
             ZStack {
-                if assets.hasAnySurface || fusedDepth != nil || fusionState == .loading {
+                if assets.hasAnySurface || hasAnnotations || fusedDepth != nil
+                    || fusionState == .loading {
                     ReceiverCombinedSceneView(
                         assets: assets,
                         fusedDepth: fusedDepth,
@@ -148,6 +151,17 @@ struct CombinedModelViewer: View {
         }
         .onChange(of: photogrammetryTransformSignature) { _, _ in
             selection = nil
+            if photogrammetryPlacementLabel != nil {
+                // Placement begins in isolated model space. Once a candidate
+                // model-to-world transform exists, show the metric reference
+                // surface so the user can actually judge the overlay.
+                showLiDAR = assets.modelToWorld != nil
+                    && assets.defaultLiDARChoice != nil
+            }
+            // The previous camera target is in the coordinate frame that was
+            // just replaced. Keeping it makes a correctly transformed model
+            // appear tiny and far away, with the old pick marker left behind.
+            frameRequest &+= 1
         }
     }
 
@@ -189,6 +203,18 @@ struct CombinedModelViewer: View {
 
             Toggle("Annotations", isOn: $showAnnotations)
                 .disabled(!hasAnnotations || !annotationsAreSpatiallyValid)
+
+            if hasAnnotations {
+                Button("Sensors Only", systemImage: "dot.circle.and.hand.point.up.left.fill") {
+                    showLiDAR = false
+                    showPhotogrammetry = false
+                    showFusedDepth = false
+                    showAnnotations = true
+                    selection = nil
+                    frameRequest &+= 1
+                }
+                .help("Hide reconstructed surfaces and frame only sensor annotations")
+            }
 
             if onFiducialsSaved != nil {
                 Menu {
@@ -280,6 +306,9 @@ struct CombinedModelViewer: View {
                     assets.modelToWorld == nil ? "Photogrammetry · model space" : "Photogrammetry · ARKit world",
                     systemImage: "cube.fill")
                     .foregroundStyle(.indigo)
+            } else if showAnnotations, hasAnnotations {
+                Label("Sensors only · ARKit world", systemImage: "dot.circle.and.hand.point.up.left.fill")
+                    .foregroundStyle(.green)
             }
 
             if showFusedDepth, let fusedDepth {
@@ -369,7 +398,13 @@ struct CombinedModelViewer: View {
     }
 
     private var annotationsAreSpatiallyValid: Bool {
-        showLiDAR || showFusedDepth || (showPhotogrammetry && assets.modelToWorld != nil)
+        guard hasAnnotations else { return false }
+        // World annotations are meaningful on their own and with metric-world
+        // surfaces. They must not be drawn beside an unaligned photogrammetry
+        // model: sharing one SceneKit scene makes unrelated coordinate frames
+        // look like a failed or preloaded registration. Model-placement markers
+        // are separate nodes under the photogrammetry root and remain visible.
+        return !(showPhotogrammetry && assets.modelToWorld == nil)
     }
 
     @MainActor
@@ -385,7 +420,7 @@ struct CombinedModelViewer: View {
             }.value
             guard !Task.isCancelled else { return }
             fusedDepth = cloud
-            showFusedDepth = true
+            if autoShowsFusedDepth { showFusedDepth = true }
             fusionState = .ready
             frameRequest &+= 1
         } catch {
@@ -814,6 +849,11 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                 (view as? ReceiverInteractiveSCNView)?.configureCameraInteraction()
             }
         }
+
+        // Selection is not part of the expensive scene signature. Keep its
+        // lightweight marker synchronized independently so clearing a pick on
+        // alignment cannot leave a marker at the old model-space location.
+        context.coordinator.installSelectionMarker(selection)
     }
 
     func makeCoordinator() -> Coordinator {

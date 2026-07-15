@@ -28,4 +28,21 @@ struct ElectrodeExporterTests {
 
         #expect(ElectrodeExporters.elp(session) == "EEG\tCz\t0.000000\t45.000000")
     }
+
+    @Test func egiXMLExportsCzAsTheReferenceSensor() {
+        var session = ScanSession.newSession()
+        session.layout = .fallback128
+        session.electrodes = [
+            ElectrodeAnnotation(
+                label: "Cz", role: .cardinal,
+                coordinate: Coordinate3D(x: 0, y: 0.1, z: 0),
+                confidence: 1, state: .reviewed)
+        ]
+
+        let xml = ElectrodeExporters.egiCoordinatesXML(session)
+
+        #expect(xml.contains("<name>VREF</name>"))
+        #expect(xml.contains("<number>129</number>"))
+        #expect(xml.contains("<type>1</type>"))
+    }
 }

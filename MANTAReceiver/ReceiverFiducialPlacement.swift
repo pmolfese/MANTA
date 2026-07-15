@@ -74,29 +74,71 @@ enum ReceiverImageFiducialResolver {
         guard (0..<width).contains(centerX), (0..<height).contains(centerY) else {
             throw ReceiverFiducialPlacementError.noReliableDepth
         }
-        let candidates = samples(
-            centerX: centerX,
-            centerY: centerY,
-            width: width,
-            height: height,
-            depth: depthValues,
-            confidence: confidenceValues,
+        // Anatomical fiducials often lie on a silhouette. A 5x5 depth patch is
+        // tens of RGB pixels wide at ARKit's lower depth-map resolution, so its
+        // median can land on hair or background despite an accurate visible
+        // click. Prefer the reliable sample directly under the click and use a
+        // neighborhood only when that exact depth pixel is unavailable.
+        let direct = sample(
+            x: centerX, y: centerY, width: width,
+            depth: depthValues, confidence: confidenceValues,
             minimumConfidence: 2)
-        let resolved = candidates.isEmpty
-            ? samples(
-                centerX: centerX, centerY: centerY, width: width, height: height,
-                depth: depthValues, confidence: confidenceValues, minimumConfidence: 1)
-            : candidates
-        guard !resolved.isEmpty else { throw ReceiverFiducialPlacementError.noReliableDepth }
-        let sorted = resolved.sorted { $0.depth < $1.depth }
-        let median = sorted[sorted.count / 2]
-        let world = camera.unproject(pixel: rawImagePoint, depth: median.depth)
+            ?? sample(
+                x: centerX, y: centerY, width: width,
+                depth: depthValues, confidence: confidenceValues,
+                minimumConfidence: 1)
+
+        let resolvedDepth: Float
+        let resolvedConfidence: UInt8
+        let contributingDepthPixels: Int
+        if let direct {
+            resolvedDepth = direct.depth
+            resolvedConfidence = direct.confidence
+            contributingDepthPixels = 1
+        } else {
+            let candidates = samples(
+                centerX: centerX,
+                centerY: centerY,
+                width: width,
+                height: height,
+                depth: depthValues,
+                confidence: confidenceValues,
+                minimumConfidence: 2)
+            let resolved = candidates.isEmpty
+                ? samples(
+                    centerX: centerX, centerY: centerY, width: width, height: height,
+                    depth: depthValues, confidence: confidenceValues, minimumConfidence: 1)
+                : candidates
+            guard !resolved.isEmpty else {
+                throw ReceiverFiducialPlacementError.noReliableDepth
+            }
+            let sorted = resolved.sorted { $0.depth < $1.depth }
+            let median = sorted[sorted.count / 2]
+            resolvedDepth = median.depth
+            resolvedConfidence = median.confidence
+            contributingDepthPixels = sorted.count
+        }
+
+        let world = camera.unproject(pixel: rawImagePoint, depth: resolvedDepth)
         return ReceiverImageFiducialHit(
             worldPoint: world,
             rawImagePoint: rawImagePoint,
-            depthMeters: median.depth,
-            confidence: median.confidence,
-            contributingDepthPixels: sorted.count)
+            depthMeters: resolvedDepth,
+            confidence: resolvedConfidence,
+            contributingDepthPixels: contributingDepthPixels)
+    }
+
+    private static func sample(
+        x: Int, y: Int, width: Int,
+        depth: [Float], confidence: [UInt8]?, minimumConfidence: UInt8
+    ) -> (depth: Float, confidence: UInt8)? {
+        let index = y * width + x
+        guard depth.indices.contains(index) else { return nil }
+        let value = depth[index]
+        let quality = confidence?[index] ?? 2
+        guard quality >= minimumConfidence,
+              value.isFinite, value >= 0.20, value <= 2.0 else { return nil }
+        return (value, quality)
     }
 
     private static func samples(

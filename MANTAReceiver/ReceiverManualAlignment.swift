@@ -93,22 +93,28 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
         } else {
             throw ReceiverManualAlignmentError.noPhotogrammetry
         }
-        let orderedKinds = FiducialKind.allCases
-        let sourceLandmarks = orderedKinds.compactMap { request.sourceLandmarks[$0] }
-        let targetLandmarks = orderedKinds.compactMap { request.targetLandmarks[$0] }
-        let hasAllPairs = sourceLandmarks.count == orderedKinds.count
-            && targetLandmarks.count == orderedKinds.count
+        // Use every landmark placed on both the images and the model, in a
+        // fixed order. The three cardinal fiducials are required; Cz (vertex) is
+        // optional but, sitting off the nasion-LPA-RPA plane, it removes the
+        // coplanar degeneracy that otherwise lets a mirror-image fit look
+        // perfect and leaves the off-plane rotation under-constrained.
+        let orderedKinds = FiducialKind.allCases.filter {
+            request.sourceLandmarks[$0] != nil && request.targetLandmarks[$0] != nil
+        }
+        let sourceLandmarks = orderedKinds.map { request.sourceLandmarks[$0]! }
+        let targetLandmarks = orderedKinds.map { request.targetLandmarks[$0]! }
+        let hasCardinalPairs = FiducialKind.cardinal.allSatisfy(orderedKinds.contains)
 
-        if request.strategy != .icp || request.seed == .landmarks, !hasAllPairs {
+        if request.strategy != .icp || request.seed == .landmarks, !hasCardinalPairs {
             throw ReceiverManualAlignmentError.missingLandmarks(
                 "Nasion, LPA, and RPA on both the images and model")
         }
 
         var input = WorldAlignmentInput()
         input.seed = request.seed
-        if hasAllPairs {
-            input.sourceLandmarks = orderedKinds.map { request.sourceLandmarks[$0]! }
-            input.targetLandmarks = orderedKinds.map { request.targetLandmarks[$0]! }
+        if hasCardinalPairs {
+            input.sourceLandmarks = sourceLandmarks
+            input.targetLandmarks = targetLandmarks
         }
 
         var sourceCloud = [SIMD3<Float>]()
@@ -144,10 +150,20 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
             throw ReceiverManualAlignmentError.invalidResult
         }
 
-        let landmarkRMS = hasAllPairs
+        let landmarkRMS = hasCardinalPairs
             ? rms(transform: result.transform, source: input.sourceLandmarks, target: input.targetLandmarks)
             : nil
         var warnings = [String]()
+        // Three cardinal fiducials are coplanar: a mirror-image fit scores an
+        // identical residual and the rotation about that plane is only weakly
+        // constrained, so a small landmark error swings scalp points far off the
+        // surface while the RMS still looks good. Cz (off that plane) removes the
+        // ambiguity. Warn whenever a landmark-based fit ran without it.
+        if hasCardinalPairs, request.strategy != .icp || request.seed == .landmarks,
+           !orderedKinds.contains(.vertex) {
+            warnings.append(
+                "Fit used only the 3 coplanar cardinal landmarks. Place Cz (vertex) on the images and model to constrain the off-plane rotation and prevent a mirror-flipped result.")
+        }
         if let landmarkRMS, landmarkRMS > 0.015 {
             warnings.append(String(format: "Landmark residual is %.1f mm.", landmarkRMS * 1_000))
         }

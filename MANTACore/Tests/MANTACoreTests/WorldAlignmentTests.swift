@@ -62,6 +62,28 @@ struct WorldAlignmentTests {
         #expect(maxError(result.transform, source: source, target: target) < 1e-2)
     }
 
+    @Test func fiducialFitRecoversScaleFromExactlyThreeLandmarks() throws {
+        // Manual Receiver alignment has exactly the Nasion/LPA/RPA triangle.
+        // Lock down the rank-two three-point case under a general 3D rotation.
+        let source: [SIMD3<Float>] = [
+            SIMD3(0, 0.52, 0.11),
+            SIMD3(-0.43, -0.08, -0.02),
+            SIMD3(0.46, -0.06, 0.01)
+        ]
+        let truth = knownTransform(
+            scale: 0.19,
+            axis: SIMD3(0.3, 0.9, -0.2),
+            angle: 1.35,
+            translation: SIMD3(-0.42, 0.16, -1.08))
+        let target = source.map { apply(truth, $0) }
+
+        let result = try #require(
+            AbsoluteOrientation.fit(source: source, target: target, scale: .estimate))
+
+        #expect(result.rmsError < 1e-5)
+        #expect(maxError(result.transform, source: source, target: target) < 1e-4)
+    }
+
     @Test func fiducialFitReturnsNilWhenUnderdetermined() {
         let source: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(1, 0, 0)]
         let target = source

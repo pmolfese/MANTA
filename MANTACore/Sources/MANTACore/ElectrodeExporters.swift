@@ -43,7 +43,7 @@ public struct ElectrodeExporters {
     /// MNE-oriented SFP. SFP cannot declare units, so MANTA always writes meters.
     public static func sfp(_ session: ScanSession) -> String {
         let fiducials = session.fiducials.compactMap { fiducial -> String? in
-            guard let coordinate = fiducial.coordinate else { return nil }
+            guard fiducial.kind.isCardinal, let coordinate = fiducial.coordinate else { return nil }
             return sfpRow(
                 label: sfpFiducialLabel(fiducial.kind), coordinate: coordinate,
                 sourceUnit: session.coordinateSpace.unit)
@@ -100,6 +100,13 @@ public struct ElectrodeExporters {
     /// EGI `coordinates_mff` XML. Cartesian coordinates are always centimeters.
     public static func egiCoordinatesXML(_ session: ScanSession) -> String {
         let electrodeSensors = session.electrodes.enumerated().map { index, electrode in
+            if electrode.label.caseInsensitiveCompare("Cz") == .orderedSame {
+                return egiSensor(
+                    name: session.layout.referenceLabel ?? "VREF",
+                    number: session.layout.referenceSensor ?? session.layout.channelCount + 1,
+                    type: 1, coordinate: electrode.coordinate,
+                    sourceUnit: session.coordinateSpace.unit)
+            }
             let number = Int(electrode.label.drop(while: { !$0.isNumber })) ?? index + 1
             return egiSensor(
                 name: "", number: number, type: 0, coordinate: electrode.coordinate,
@@ -112,6 +119,7 @@ public struct ElectrodeExporters {
             case .nasion: metadata = ("Nasion", 2002)
             case .leftPreauricular: metadata = ("Left periauricular point", 2011)
             case .rightPreauricular: metadata = ("Right periauricular point", 2010)
+            case .vertex: return nil  // Cz is a reference electrode, not an EEG fiducial.
             }
             return egiSensor(
                 name: metadata.0, number: metadata.1, type: 2, coordinate: coordinate,
@@ -148,6 +156,7 @@ public struct ElectrodeExporters {
         case .nasion: "FidNz"
         case .leftPreauricular: "FidT9"
         case .rightPreauricular: "FidT10"
+        case .vertex: "Cz"
         }
     }
 

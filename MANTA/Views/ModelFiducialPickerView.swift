@@ -54,7 +54,7 @@ struct ModelFiducialPickerView: View {
     private var controls: some View {
         VStack(spacing: 8) {
             Picker("Landmark", selection: $currentKind) {
-                ForEach(FiducialKind.allCases) { kind in
+                ForEach(FiducialKind.cardinal) { kind in
                     Text(kind.rawValue).tag(kind)
                 }
             }
@@ -84,7 +84,7 @@ struct ModelFiducialPickerView: View {
     }
 
     private func advance(after kind: FiducialKind) {
-        let kinds = FiducialKind.allCases
+        let kinds = FiducialKind.cardinal
         // Move to the next kind that still needs a coordinate.
         if let next = kinds.first(where: { candidate in
             candidate != kind && viewModel.session.modelFiducials.first(where: { $0.kind == candidate })?.coordinate == nil
@@ -188,6 +188,7 @@ struct ModelSceneView: UIViewRepresentable {
             case .nasion: return .systemOrange
             case .leftPreauricular: return .systemBlue
             case .rightPreauricular: return .systemTeal
+            case .vertex: return .systemPurple
             }
         }
     }

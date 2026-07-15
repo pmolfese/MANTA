@@ -74,7 +74,7 @@ struct ReceiverElectrodeWorkspace: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Button("Run OCR", systemImage: "text.viewfinder") {
+            Button("Detect Sensors", systemImage: "viewfinder.circle") {
                 store.detectElectrodes()
             }
             .buttonStyle(.borderedProminent)
@@ -100,6 +100,10 @@ struct ReceiverElectrodeWorkspace: View {
             } else {
                 Label("\(observedCount) observed", systemImage: "text.viewfinder")
                     .foregroundStyle(.secondary)
+                if unlabeledCandidateCount > 0 {
+                    Label("\(unlabeledCandidateCount) CV proposals", systemImage: "circle.dotted")
+                        .foregroundStyle(.mint)
+                }
                 if guessedCount > 0 {
                     Label("\(visibleGuessCount)/\(guessedCount) guesses", systemImage: "point.3.connected.trianglepath.dotted")
                         .foregroundStyle(.orange)
@@ -194,6 +198,11 @@ struct ReceiverElectrodeWorkspace: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if let diagnostic = selectedReprojectionDiagnostic {
+                        Text(diagnostic.description)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(diagnostic.isLargeError ? .orange : .cyan)
+                    }
                 }
                 Spacer()
                 Toggle("All frames", isOn: $showsAllFrames)
@@ -217,11 +226,21 @@ struct ReceiverElectrodeWorkspace: View {
                 image: orientedImage,
                 observation: currentObservation,
                 evidence: currentFrameEvidence,
+                cupCandidates: currentFrameCupEvidence,
                 selectedLabel: selectedLabel,
+                projectedRawImagePoint: selectedReprojectionDiagnostic?.rawPoint,
                 onPlace: placeFromImage,
                 onRelabel: beginRelabel)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .frame(minHeight: 280)
+
+            if !currentFrameCupEvidence.isEmpty {
+                Label(
+                    "Mint rings are unlabeled visual cup proposals; labels are assigned only after multi-view 3D fusion.",
+                    systemImage: "circle.dotted")
+                    .font(.caption)
+                    .foregroundStyle(.mint)
+            }
 
             if !frameObservations.isEmpty {
                 HStack(spacing: 8) {
@@ -264,9 +283,12 @@ struct ReceiverElectrodeWorkspace: View {
         .padding(12)
     }
 
+    private var electrodeChannelCount: Int {
+        bundle.capture.layoutID.localizedCaseInsensitiveContains("256") ? 256 : 128
+    }
+
     private var labels: [String] {
-        let count = bundle.capture.layoutID.localizedCaseInsensitiveContains("256") ? 256 : 128
-        return (1...count).map { "E\($0)" }
+        (1...electrodeChannelCount).map { "E\($0)" } + ["Cz"]
     }
 
     private var hasAlignedModel: Bool {
@@ -308,6 +330,10 @@ struct ReceiverElectrodeWorkspace: View {
         workingElectrodes.count - guessedCount
     }
 
+    private var unlabeledCandidateCount: Int {
+        evidence?.unlabeledCandidates?.count ?? 0
+    }
+
     private var displayedElectrodes: [MANTAElectrodeSolution] {
         workingElectrodes.filter {
             $0.state != "Guessed" || $0.confidence >= guessThreshold
@@ -339,6 +365,36 @@ struct ReceiverElectrodeWorkspace: View {
     private var currentFrameEvidence: [ReceiverElectrodeObservationEvidence] {
         guard let id = currentObservation?.id else { return [] }
         return (evidence?.observations ?? []).filter { $0.observationID == id }
+    }
+
+    private var currentFrameCupEvidence: [ReceiverUnlabeledCupEvidence] {
+        guard let id = currentObservation?.id else { return [] }
+        return (evidence?.unlabeledCandidates ?? []).filter { $0.observationID == id }
+    }
+
+    private var selectedReprojectionDiagnostic: ReceiverReprojectionDiagnostic? {
+        guard let observation = currentObservation,
+              let solution = solution(for: selectedLabel),
+              solution.coordinate.count == 3,
+              let camera = PinholeCamera(
+                intrinsics: observation.intrinsics.map(Float.init),
+                transform: observation.cameraToWorld.map(Float.init)),
+              let projected = camera.project(SIMD3(
+                Float(solution.coordinate[0]), Float(solution.coordinate[1]),
+                Float(solution.coordinate[2]))) else { return nil }
+        let rawPoint = [Double(projected.pixel.x), Double(projected.pixel.y)]
+        let candidates = currentFrameEvidence.filter { $0.label == solution.label }
+        let error = candidates.compactMap { item -> Double? in
+            guard item.rawImagePoint.count == 2 else { return nil }
+            return hypot(
+                item.rawImagePoint[0] - rawPoint[0],
+                item.rawImagePoint[1] - rawPoint[1])
+        }.min()
+        let depthDelta = candidates.compactMap { item -> Double? in
+            abs(item.depthMeters - Double(projected.depth))
+        }.min()
+        return ReceiverReprojectionDiagnostic(
+            rawPoint: rawPoint, pixelError: error, depthDeltaMeters: depthDelta)
     }
 
     private func solution(for label: String?) -> MANTAElectrodeSolution? {
@@ -426,7 +482,7 @@ struct ReceiverElectrodeWorkspace: View {
         guard let oldLabel = relabelSource,
               let newLabel = normalizedLabel(replacementLabel),
               labels.contains(newLabel) else {
-            placementError = "Use a sensor number between 1 and \(labels.count)."
+            placementError = "Use a sensor number between 1 and \(electrodeChannelCount)."
             return
         }
         guard newLabel != oldLabel else { return }
@@ -504,7 +560,7 @@ struct ReceiverElectrodeWorkspace: View {
 
     private func normalizedLabel(_ value: String) -> String? {
         let compact = value.uppercased().filter(\.isNumber)
-        guard let number = Int(compact), (1...labels.count).contains(number) else { return nil }
+        guard let number = Int(compact), (1...electrodeChannelCount).contains(number) else { return nil }
         return "E\(number)"
     }
 
@@ -602,7 +658,7 @@ struct ReceiverElectrodeWorkspace: View {
         let values = bundle.capture.layoutID.localizedCaseInsensitiveContains("256")
             ? [31, 67, 36, 224, 219, 72, 173, 114, 119, 168, 234, 237, 216, 199, 165, 145, 111, 91, 247, 244]
             : [17, 43, 24, 124, 120, 47, 98, 72, 68, 94]
-        return Set(values.map { "E\($0)" })
+        return Set(values.map { "E\($0)" }).union(["Cz"])
     }
 
     private func electrodeNumber(_ label: String) -> Int {
@@ -670,11 +726,37 @@ private enum ReceiverElectrodeFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private struct ReceiverReprojectionDiagnostic {
+    var rawPoint: [Double]
+    var pixelError: Double?
+    var depthDeltaMeters: Double?
+
+    var isLargeError: Bool {
+        (pixelError ?? 0) > 18 || (depthDeltaMeters ?? 0) > 0.015
+    }
+
+    var description: String {
+        var values = ["3D→image"]
+        if let pixelError {
+            values.append("error \(pixelError.formatted(.number.precision(.fractionLength(1)))) px")
+        } else {
+            values.append("no matching observation")
+        }
+        if let depthDeltaMeters {
+            values.append(
+                "depth Δ \((depthDeltaMeters * 1_000).formatted(.number.precision(.fractionLength(1)))) mm")
+        }
+        return values.joined(separator: " · ")
+    }
+}
+
 private struct ReceiverElectrodeImageCanvas: View {
     let image: ReceiverOrientedFrameImage?
     let observation: MANTACaptureObservation?
     let evidence: [ReceiverElectrodeObservationEvidence]
+    let cupCandidates: [ReceiverUnlabeledCupEvidence]
     let selectedLabel: String?
+    let projectedRawImagePoint: [Double]?
     let onPlace: (SIMD2<Float>) -> Void
     let onRelabel: (String) -> Void
 
@@ -747,6 +829,42 @@ private struct ReceiverElectrodeImageCanvas: View {
                                 in: Capsule())
                             .overlay(Capsule().stroke(.black.opacity(0.65), lineWidth: 1))
                             .position(marker)
+                            .allowsHitTesting(false)
+                    }
+                    ForEach(cupCandidates) { candidate in
+                        let point = displayPoint(
+                            rawImagePoint: candidate.rawImagePoint, rawSize: rawSize,
+                            displaySize: displaySize, orientation: image.orientation,
+                            rect: rect)
+                        Circle()
+                            .stroke(.mint.opacity(0.85), lineWidth: 1.5)
+                            .frame(width: 14, height: 14)
+                            .position(point)
+                            .allowsHitTesting(false)
+                    }
+                    if let projectedRawImagePoint {
+                        let projected = displayPoint(
+                            rawImagePoint: projectedRawImagePoint, rawSize: rawSize,
+                            displaySize: displaySize, orientation: image.orientation,
+                            rect: rect)
+                        if let observed = evidence.first(where: {
+                            $0.label == selectedLabel && $0.rawImagePoint.count == 2
+                        }) {
+                            let observedPoint = markerPoint(
+                                observed, rawSize: rawSize, displaySize: displaySize,
+                                orientation: image.orientation, rect: rect)
+                            Path { path in
+                                path.move(to: observedPoint)
+                                path.addLine(to: projected)
+                            }
+                            .stroke(.cyan.opacity(0.8), style: StrokeStyle(
+                                lineWidth: 1.5, dash: [4, 3]))
+                            .allowsHitTesting(false)
+                        }
+                        Circle()
+                            .stroke(.cyan, lineWidth: 2)
+                            .frame(width: 18, height: 18)
+                            .position(projected)
                             .allowsHitTesting(false)
                     }
                     if let dragPreview {

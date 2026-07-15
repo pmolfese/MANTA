@@ -111,6 +111,8 @@ struct SharedSolverMigrationTests {
         #expect(layout.electrodes.count == 2)
         #expect(layout.electrodes[0].neighbors == [2])
         #expect(layout.fiducialCoordinatePriors[.nasion] == Coordinate3D(x: 0, y: 9, z: 0))
+        #expect(layout.referenceSensor == 3)
+        #expect(layout.referenceCoordinatePrior == Coordinate3D(x: 0.5, y: 0.5, z: 2))
     }
 
     private func syntheticLayout() -> ElectrodeLayout {
@@ -135,7 +137,7 @@ struct SharedSolverMigrationTests {
         """
         {"layouts":[{"id":"test-2","name":"Test","channelCount":2,
         "coordinatesFile":"coordinates","sensorLayoutFile":"layout",
-        "referenceSensor":null,"referenceLabel":null,"cardinalSensors":[1],
+        "referenceSensor":3,"referenceLabel":"VREF","cardinalSensors":[1],
         "fiducialSensorHints":{"nasion":1}}]}
         """
     }
@@ -144,6 +146,7 @@ struct SharedSolverMigrationTests {
         <coordinates><sensorLayout><sensors>
         <sensor><name></name><number>1</number><type>0</type><x>0</x><y>0</y><z>1</z></sensor>
         <sensor><name></name><number>2</number><type>0</type><x>1</x><y>0</y><z>1</z></sensor>
+        <sensor><name>VREF</name><number>3</number><type>1</type><x>0.5</x><y>0.5</y><z>2</z></sensor>
         <sensor><name>Nasion</name><number>2002</number><type>2</type><x>0</x><y>9</y><z>0</z></sensor>
         </sensors></sensorLayout></coordinates>
         """

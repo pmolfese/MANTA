@@ -8,7 +8,7 @@ import simd
 
 nonisolated struct ReceiverElectrodeEvidenceDocument: Codable, Sendable {
     var format = "org.nih.manta.electrode-evidence"
-    var version = 2
+    var version = 3
     var sessionID: UUID
     var sourceBundleID: UUID
     var generatedAt: Date
@@ -17,6 +17,28 @@ nonisolated struct ReceiverElectrodeEvidenceDocument: Codable, Sendable {
     var observations: [ReceiverElectrodeObservationEvidence]
     var summaries: [ReceiverElectrodeSummary]
     var manualEdits: [ReceiverElectrodeManualEdit]?
+    /// Visually detected cup centers that did not require readable text. These
+    /// remain unlabeled evidence; assignments are recorded in summaries.
+    var unlabeledCandidates: [ReceiverUnlabeledCupEvidence]? = nil
+    var detectorMetadata: ReceiverElectrodeDetectorMetadata? = nil
+}
+
+nonisolated struct ReceiverElectrodeDetectorMetadata: Codable, Sendable {
+    var engine: String
+    var engineVersion: Int
+    var cupAppearanceThreshold: Double
+    var cupFusionRadiusMeters: Double
+    var cupMinimumViews: Int
+    var maximumAssignmentDistanceMeters: Double
+}
+
+nonisolated struct ReceiverUnlabeledCupEvidence: Codable, Identifiable, Sendable {
+    var id: UUID
+    var observationID: UUID
+    var rawImagePoint: [Double]
+    var depthPoint: [Double]
+    var appearanceScore: Double
+    var depthConfidence: Int
 }
 
 nonisolated struct ReceiverElectrodeManualEdit: Codable, Identifiable, Sendable {
@@ -74,7 +96,7 @@ nonisolated enum ReceiverElectrodeDetectionError: LocalizedError {
         case .noCalibratedFrames:
             "No saved images have both valid camera calibration and metric depth."
         case .noRecognizedElectrodes:
-            "OCR did not find any valid electrode numbers with reliable metric depth."
+            "Neither OCR nor visual cup detection found reliable electrode evidence."
         }
     }
 }
@@ -100,6 +122,7 @@ nonisolated enum ReceiverElectrodeDetector {
         }
         let surface = modelMesh.map(ReceiverSurfaceVertexIndex.init)
         var evidence = [ReceiverElectrodeObservationEvidence]()
+        var unlabeledEvidence = [ReceiverUnlabeledCupEvidence]()
 
         for (index, observation) in frames.enumerated() {
             try Task.checkCancellation()
@@ -117,6 +140,7 @@ nonisolated enum ReceiverElectrodeDetector {
 
             let recognized = try recognize(
                 image: image, observation: observation, validNumbers: validNumbers)
+            let discLocator = ReceiverElectrodeDiscLocator(image: image)
             let origin = camera.cameraToWorld.columns.3.xyz
             var bestByLabel = [String: ReceiverResolvedOCRHit]()
             for hit in recognized {
@@ -152,14 +176,37 @@ nonisolated enum ReceiverElectrodeDetector {
                     depthPoint: resolved.world.doubles, rayOrigin: resolved.origin.doubles,
                     rayDirection: resolved.direction.doubles))
             }
+            let occupied = bestByLabel.values.map(\.hit.rawPoint)
+            let cvFrameStride = max(1, Int(ceil(Double(frames.count) / 24.0)))
+            let cupCandidates = index.isMultiple(of: cvFrameStride)
+                ? (discLocator?.locateAllDiscs(
+                orientation: ReceiverStoredImageOrientation(observation.imageOrientation),
+                rawSize: CGSize(
+                    width: observation.imageDimensions.width,
+                    height: observation.imageDimensions.height)) ?? [])
+                : []
+            for candidate in cupCandidates {
+                guard !occupied.contains(where: {
+                    simd_distance($0, candidate.rawPoint) < 18
+                }), let sample = depth.sample(rawImagePoint: candidate.rawPoint) else { continue }
+                let world = camera.unproject(pixel: candidate.rawPoint, depth: sample.depth)
+                guard world.allFinite else { continue }
+                unlabeledEvidence.append(ReceiverUnlabeledCupEvidence(
+                    id: UUID(), observationID: observation.id,
+                    rawImagePoint: candidate.rawPoint.doubles,
+                    depthPoint: world.doubles,
+                    appearanceScore: Double(candidate.score),
+                    depthConfidence: Int(sample.confidence)))
+            }
         }
 
-        guard !evidence.isEmpty else {
+        guard !evidence.isEmpty || !unlabeledEvidence.isEmpty else {
             throw ReceiverElectrodeDetectionError.noRecognizedElectrodes
         }
         progress?(0.93, "Fusing repeated sensor sightings")
         let summaries = solve(
-            evidence: evidence, surface: surface, layout: layout, worldGuide: worldGuide)
+            evidence: evidence, unlabeledEvidence: unlabeledEvidence,
+            surface: surface, layout: layout, worldGuide: worldGuide)
         let roles = cardinalLabels(layoutID: bundle.capture.layoutID)
         let electrodes = summaries.map { summary in
             MANTAElectrodeSolution(
@@ -177,7 +224,13 @@ nonisolated enum ReceiverElectrodeDetector {
             modelToWorld: reconstruction?.modelToWorld,
             observations: evidence.sorted(by: evidenceOrder),
             summaries: summaries,
-            manualEdits: nil)
+            manualEdits: nil,
+            unlabeledCandidates: unlabeledEvidence,
+            detectorMetadata: ReceiverElectrodeDetectorMetadata(
+                engine: "vision-ocr+classical-cup-cv+global-layout-assignment",
+                engineVersion: 1, cupAppearanceThreshold: 0.16,
+                cupFusionRadiusMeters: 0.012, cupMinimumViews: 2,
+                maximumAssignmentDistanceMeters: 0.04))
         progress?(0.97, "Estimating unobserved sensors")
         let initial = ReceiverElectrodeDetectionResult(
             electrodes: electrodes, evidence: document)
@@ -190,6 +243,7 @@ nonisolated enum ReceiverElectrodeDetector {
 
     private static func solve(
         evidence: [ReceiverElectrodeObservationEvidence],
+        unlabeledEvidence: [ReceiverUnlabeledCupEvidence],
         surface: ReceiverSurfaceVertexIndex?,
         layout: ElectrodeLayout?,
         worldGuide: ReceiverLayoutWorldGuide?
@@ -274,13 +328,15 @@ nonisolated enum ReceiverElectrodeDetector {
                 }
             }
             summaries = appendLayoutInferences(
-                to: summaries, layout: layout, surface: surface, worldGuide: worldGuide)
+                to: summaries, unlabeledEvidence: unlabeledEvidence,
+                layout: layout, surface: surface, worldGuide: worldGuide)
         }
         return summaries.sorted { electrodeNumber($0.label) < electrodeNumber($1.label) }
     }
 
     private static func appendLayoutInferences(
         to summaries: [ReceiverElectrodeSummary],
+        unlabeledEvidence: [ReceiverUnlabeledCupEvidence],
         layout: ElectrodeLayout,
         surface: ReceiverSurfaceVertexIndex?,
         worldGuide: ReceiverLayoutWorldGuide?
@@ -297,7 +353,7 @@ nonisolated enum ReceiverElectrodeDetector {
             ? fitted?.transform : worldGuide?.transform else { return summaries }
         let usedFiducialSeed = fitted?.isReliable != true
 
-        let existing = Set(summaries.map(\.label))
+        var existing = Set(summaries.map(\.label))
         let priorByLabel = definitions.mapValues {
             SIMD3(Float($0.coordinatePrior.x), Float($0.coordinatePrior.y),
                   Float($0.coordinatePrior.z))
@@ -309,6 +365,52 @@ nonisolated enum ReceiverElectrodeDetector {
         }
 
         var output = summaries
+        let clusters = fuseUnlabeledCups(unlabeledEvidence).filter { cluster in
+            !anchors.values.contains(where: { simd_distance($0, cluster.center) < 0.009 })
+        }
+        let missingDefinitions = layout.electrodes.filter {
+            !existing.contains($0.label)
+        }
+        let predictions = missingDefinitions.compactMap { definition
+            -> ReceiverLayoutPrediction? in
+            guard let prior = priorByLabel[definition.label] else { return nil }
+            var point = (transform * SIMD4(prior, 1)).xyz
+            let localResiduals = definition.neighbors.compactMap { residuals["E\($0)"] }
+            if !localResiduals.isEmpty {
+                point += localResiduals.reduce(.zero, +) / Float(localResiduals.count)
+            }
+            return ReceiverLayoutPrediction(
+                definition: definition, point: point,
+                anchoredNeighborCount: localResiduals.count)
+        }
+        let assignments = assignGlobally(
+            predictions: predictions, clusters: clusters,
+            anchors: anchors, priorByLabel: priorByLabel, transform: transform)
+        for assignment in assignments {
+            let cluster = clusters[assignment.clusterIndex]
+            var coordinate = cluster.center
+            var surfaceDistance: Float?
+            if let nearest = surface?.nearest(to: coordinate, maximumDistance: 0.03) {
+                surfaceDistance = nearest.distance
+                if nearest.distance <= 0.012 { coordinate = nearest.point }
+            }
+            let confidence = min(
+                0.78,
+                Double(cluster.meanScore)
+                    * (0.55 + 0.15 * Double(min(cluster.supportCount, 3)))
+                    * exp(-Double(assignment.distance) / 0.035))
+            output.append(ReceiverElectrodeSummary(
+                label: assignment.label, coordinate: coordinate.doubles,
+                supportCount: cluster.supportCount,
+                spreadMeters: Double(cluster.spread), confidence: confidence,
+                state: "Needs Review", rayResidualMeters: nil,
+                surfaceDistanceMeters: surfaceDistance.map(Double.init),
+                geometryWarning: String(
+                    format: "CV-observed cup · globally assigned from layout · %.1f mm",
+                    assignment.distance * 1_000)))
+            existing.insert(assignment.label)
+        }
+
         for definition in layout.electrodes where !existing.contains(definition.label) {
             guard let prior = priorByLabel[definition.label] else { continue }
             var predicted = (transform * SIMD4(prior, 1)).xyz
@@ -333,6 +435,87 @@ nonisolated enum ReceiverElectrodeDetector {
                 geometryWarning: "Inferred from \(layout.channelCount)-sensor layout (\(neighborText))"))
         }
         return output
+    }
+
+    private static func fuseUnlabeledCups(
+        _ evidence: [ReceiverUnlabeledCupEvidence]
+    ) -> [ReceiverCupCluster] {
+        var clusters = [ReceiverCupClusterAccumulator]()
+        for item in evidence.sorted(by: { $0.appearanceScore > $1.appearanceScore }) {
+            guard item.depthConfidence >= 1,
+                  let point = SIMD3<Float>(doubles: item.depthPoint) else { continue }
+            if let index = clusters.indices.min(by: {
+                simd_distance(clusters[$0].center, point)
+                    < simd_distance(clusters[$1].center, point)
+            }), simd_distance(clusters[index].center, point) <= 0.012,
+               !clusters[index].observationIDs.contains(item.observationID) {
+                clusters[index].append(
+                    point: point, observationID: item.observationID,
+                    score: Float(item.appearanceScore))
+            } else {
+                clusters.append(ReceiverCupClusterAccumulator(
+                    point: point, observationID: item.observationID,
+                    score: Float(item.appearanceScore)))
+            }
+        }
+        return clusters.compactMap { accumulator in
+            guard accumulator.points.count >= 2 else { return nil }
+            let spread = accumulator.points.map {
+                simd_distance($0, accumulator.center)
+            }.max() ?? 0
+            guard spread <= 0.014 else { return nil }
+            return ReceiverCupCluster(
+                center: accumulator.center,
+                supportCount: accumulator.points.count,
+                spread: spread,
+                meanScore: accumulator.scores.reduce(0, +)
+                    / Float(accumulator.scores.count))
+        }
+    }
+
+    private static func assignGlobally(
+        predictions: [ReceiverLayoutPrediction],
+        clusters: [ReceiverCupCluster],
+        anchors: [String: SIMD3<Float>],
+        priorByLabel: [String: SIMD3<Float>],
+        transform: simd_float4x4
+    ) -> [ReceiverCupAssignment] {
+        guard !predictions.isEmpty, !clusters.isEmpty else { return [] }
+        let dummyCost = 1.18
+        let columnCount = clusters.count + predictions.count
+        let costs = predictions.map { prediction in
+            clusters.map { cluster -> Double in
+                let distance = simd_distance(prediction.point, cluster.center)
+                guard distance <= 0.04 else { return 20 }
+                var topologyPenalty = 0.0
+                let anchoredNeighbors = prediction.definition.neighbors.compactMap {
+                    anchors["E\($0)"].map { ("E\($0)", $0) }
+                }
+                for (label, anchor) in anchoredNeighbors {
+                    guard let prior = priorByLabel[label] else { continue }
+                    let expectedAnchor = (transform * SIMD4(prior, 1)).xyz
+                    let expected = simd_distance(prediction.point, expectedAnchor)
+                    let observed = simd_distance(cluster.center, anchor)
+                    topologyPenalty += Double(abs(expected - observed) / 0.025)
+                }
+                if !anchoredNeighbors.isEmpty {
+                    topologyPenalty /= Double(anchoredNeighbors.count)
+                }
+                return Double(distance / 0.035)
+                    + topologyPenalty * 0.35
+                    + Double(max(0, 0.22 - cluster.meanScore))
+            } + Array(repeating: dummyCost, count: predictions.count)
+        }
+        let columns = ReceiverMinimumCostAssignment.solve(costs)
+        return columns.enumerated().compactMap { row, column in
+            guard clusters.indices.contains(column), costs[row][column] < dummyCost else {
+                return nil
+            }
+            return ReceiverCupAssignment(
+                label: predictions[row].definition.label,
+                clusterIndex: column,
+                distance: simd_distance(predictions[row].point, clusters[column].center))
+        }
     }
 
     private static func recognize(
@@ -451,6 +634,18 @@ nonisolated enum ReceiverElectrodeDetector {
         guard let path = bundle.manifest.content.layout,
               let data = try? Data(contentsOf: bundle.rootDirectory.appendingPathComponent(path))
         else { return nil }
+        // Finalized bundles include the coordinate XML, topology XML, and
+        // metadata together. Prefer the shared loader so the Receiver uses the
+        // same fiducials, Cz/reference prior, and real neighbor graph as MANTA.
+        let resourceDirectory = bundle.rootDirectory.appendingPathComponent(path)
+            .deletingLastPathComponent()
+        if let layouts = try? HydroCelLayoutFileLoader(
+            resourceDirectory: resourceDirectory).loadLayouts(),
+           let layout = layouts.first(where: {
+               $0.id == bundle.capture.layoutID || $0.channelCount == validNumbers.count
+           }) {
+            return layout
+        }
         if path.lowercased().hasSuffix(".json"),
            let layout = try? JSONDecoder().decode(ElectrodeLayout.self, from: data) {
             return layout
@@ -478,8 +673,12 @@ nonisolated enum ReceiverElectrodeDetector {
             id: bundle.capture.layoutID, name: bundle.capture.layoutID,
             channelCount: validNumbers.count,
             labels: definitions.map(\.label), cardinalLabels: roles,
-            electrodes: definitions, fiducialCoordinatePriors: [:],
-            fiducialSensorHints: [:], referenceSensor: nil, referenceLabel: nil)
+            electrodes: definitions,
+            fiducialCoordinatePriors: delegate.fiducials,
+            fiducialSensorHints: [:],
+            referenceSensor: delegate.reference?.number,
+            referenceLabel: delegate.reference?.name,
+            referenceCoordinatePrior: delegate.reference?.coordinate)
     }
 
     private static func distanceSquared(_ lhs: Coordinate3D, _ rhs: Coordinate3D) -> Double {
@@ -502,8 +701,110 @@ nonisolated enum ReceiverElectrodeDetector {
     }
 }
 
+nonisolated private struct ReceiverCupClusterAccumulator {
+    var points: [SIMD3<Float>]
+    var observationIDs: Set<UUID>
+    var scores: [Float]
+
+    init(point: SIMD3<Float>, observationID: UUID, score: Float) {
+        points = [point]
+        observationIDs = [observationID]
+        scores = [score]
+    }
+
+    var center: SIMD3<Float> {
+        points.reduce(.zero, +) / Float(points.count)
+    }
+
+    mutating func append(point: SIMD3<Float>, observationID: UUID, score: Float) {
+        points.append(point)
+        observationIDs.insert(observationID)
+        scores.append(score)
+    }
+}
+
+nonisolated private struct ReceiverCupCluster {
+    var center: SIMD3<Float>
+    var supportCount: Int
+    var spread: Float
+    var meanScore: Float
+}
+
+nonisolated private struct ReceiverLayoutPrediction {
+    var definition: ElectrodeDefinition
+    var point: SIMD3<Float>
+    var anchoredNeighborCount: Int
+}
+
+nonisolated private struct ReceiverCupAssignment {
+    var label: String
+    var clusterIndex: Int
+    var distance: Float
+}
+
+/// Hungarian minimum-cost bipartite assignment. Dummy columns let a layout
+/// sensor remain unobserved instead of forcing a poor visual match.
+nonisolated private enum ReceiverMinimumCostAssignment {
+    static func solve(_ costs: [[Double]]) -> [Int] {
+        guard let columnCount = costs.first?.count, !costs.isEmpty,
+              columnCount >= costs.count else { return [] }
+        let rowCount = costs.count
+        var rowPotential = [Double](repeating: 0, count: rowCount + 1)
+        var columnPotential = [Double](repeating: 0, count: columnCount + 1)
+        var matchedRow = [Int](repeating: 0, count: columnCount + 1)
+        var previousColumn = [Int](repeating: 0, count: columnCount + 1)
+
+        for row in 1...rowCount {
+            matchedRow[0] = row
+            var column = 0
+            var minimum = [Double](repeating: .infinity, count: columnCount + 1)
+            var used = [Bool](repeating: false, count: columnCount + 1)
+            repeat {
+                used[column] = true
+                let activeRow = matchedRow[column]
+                var delta = Double.infinity
+                var nextColumn = 0
+                for candidate in 1...columnCount where !used[candidate] {
+                    let reduced = costs[activeRow - 1][candidate - 1]
+                        - rowPotential[activeRow] - columnPotential[candidate]
+                    if reduced < minimum[candidate] {
+                        minimum[candidate] = reduced
+                        previousColumn[candidate] = column
+                    }
+                    if minimum[candidate] < delta {
+                        delta = minimum[candidate]
+                        nextColumn = candidate
+                    }
+                }
+                for candidate in 0...columnCount {
+                    if used[candidate] {
+                        rowPotential[matchedRow[candidate]] += delta
+                        columnPotential[candidate] -= delta
+                    } else if candidate > 0 {
+                        minimum[candidate] -= delta
+                    }
+                }
+                column = nextColumn
+            } while matchedRow[column] != 0
+
+            repeat {
+                let previous = previousColumn[column]
+                matchedRow[column] = matchedRow[previous]
+                column = previous
+            } while column != 0
+        }
+
+        var result = [Int](repeating: -1, count: rowCount)
+        for column in 1...columnCount where matchedRow[column] > 0 {
+            result[matchedRow[column] - 1] = column - 1
+        }
+        return result
+    }
+}
+
 nonisolated private final class ReceiverElectrodeCoordinateParser: NSObject, XMLParserDelegate {
     struct Sensor {
+        var name = ""
         var number = ""
         var type = ""
         var x = ""
@@ -512,6 +813,8 @@ nonisolated private final class ReceiverElectrodeCoordinateParser: NSObject, XML
     }
 
     var coordinates = [Int: Coordinate3D]()
+    var fiducials = [FiducialKind: Coordinate3D]()
+    var reference: (number: Int, name: String, coordinate: Coordinate3D)?
     var failed = false
     private var element = ""
     private var sensor: Sensor?
@@ -530,6 +833,7 @@ nonisolated private final class ReceiverElectrodeCoordinateParser: NSObject, XML
     func parser(_ parser: XMLParser, foundCharacters string: String) {
         guard var sensor else { return }
         switch element {
+        case "name": sensor.name += string
         case "number": sensor.number += string
         case "type": sensor.type += string
         case "x": sensor.x += string
@@ -557,7 +861,23 @@ nonisolated private final class ReceiverElectrodeCoordinateParser: NSObject, XML
             failed = true
             return
         }
-        if type == 0 { coordinates[number] = Coordinate3D(x: x, y: y, z: z) }
+        let coordinate = Coordinate3D(x: x, y: y, z: z)
+        if type == 0 { coordinates[number] = coordinate }
+        if type == 1 {
+            reference = (
+                number, sensor.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                coordinate)
+        }
+        if type == 2 {
+            let name = sensor.name.lowercased()
+            if name.contains("nasion") { fiducials[.nasion] = coordinate }
+            if name.contains("left") && name.contains("periauricular") {
+                fiducials[.leftPreauricular] = coordinate
+            }
+            if name.contains("right") && name.contains("periauricular") {
+                fiducials[.rightPreauricular] = coordinate
+            }
+        }
     }
 
     func parser(_ parser: XMLParser, parseErrorOccurred parseError: Error) {
@@ -595,6 +915,12 @@ nonisolated private struct ReceiverResolvedOCRHit {
 }
 
 nonisolated private struct ReceiverElectrodeDiscLocator {
+    struct Candidate {
+        var rawPoint: SIMD2<Float>
+        var score: Float
+        var radius: Float
+    }
+
     private struct Pixel {
         var luminance: Float
         var saturation: Float
@@ -657,6 +983,61 @@ nonisolated private struct ReceiverElectrodeDiscLocator {
             y += step
         }
         return best?.point
+    }
+
+    /// Classical CV proposal pass for cups whose printed label is unreadable.
+    /// It evaluates low-saturation circular center/ring contrast at several
+    /// scales, then performs non-maximum suppression. This deliberately emits
+    /// unlabeled proposals; geometry assigns labels later.
+    func locateAllDiscs(
+        orientation: ReceiverStoredImageOrientation,
+        rawSize: CGSize
+    ) -> [Candidate] {
+        let displaySize = orientation.displaySize(for: rawSize)
+        let shortSide = min(displaySize.width, displaySize.height)
+        guard shortSide >= 200 else { return [] }
+        let radii = [0.0032, 0.0048, 0.0068].map {
+            max(6, min(30, shortSide * $0))
+        }
+        let step = max(10, shortSide / 180)
+        let margin = radii.max()! * 1.8
+        var proposals = [(point: CGPoint, score: Float, radius: CGFloat)]()
+
+        var y = margin
+        while y < displaySize.height - margin {
+            var x = margin
+            while x < displaySize.width - margin {
+                let point = CGPoint(x: x, y: y)
+                // Cheap rejection before the circular appearance samples.
+                if let center = pixel(
+                    atDisplayPoint: point, orientation: orientation, rawSize: rawSize),
+                   center.saturation <= 0.32, (0.18...0.88).contains(center.luminance) {
+                    for radius in radii {
+                        guard let score = discAppearance(
+                            center: point, radius: radius,
+                            orientation: orientation, rawSize: rawSize),
+                              score >= 0.16 else { continue }
+                        proposals.append((point, score, radius))
+                    }
+                }
+                x += step
+            }
+            y += step
+        }
+
+        var accepted = [Candidate]()
+        for proposal in proposals.sorted(by: { $0.score > $1.score }) {
+            let raw = orientation.rawPoint(proposal.point, rawSize: rawSize)
+            let rawPoint = SIMD2(Float(raw.x), Float(raw.y))
+            let rawRadius = Float(proposal.radius)
+            guard !accepted.contains(where: {
+                simd_distance($0.rawPoint, rawPoint) < max($0.radius, rawRadius) * 1.7
+            }) else { continue }
+            accepted.append(Candidate(
+                rawPoint: rawPoint, score: proposal.score, radius: rawRadius))
+            if accepted.count >= 160 { break }
+        }
+        return accepted
     }
 
     private func discAppearance(
@@ -740,7 +1121,7 @@ nonisolated private struct ReceiverLayoutWorldGuide {
             source.append(SIMD3(Float(prior.x), Float(prior.y), Float(prior.z)))
             target.append(point)
         }
-        guard source.count == 3,
+        guard source.count >= 3,
               let fit = AbsoluteOrientation.fit(
                 source: source, target: target, scale: .estimate) else { return nil }
         var predicted = layout.electrodes.reduce(into: [String: SIMD3<Float>]()) {
@@ -797,7 +1178,7 @@ nonisolated private struct ReceiverLayoutWorldGuide {
             }), let coordinate = item.coordinate, coordinate.count == 3 else { return }
             result[kind] = SIMD3(coordinate.map(Float.init))
         }
-        if output.count == 3 { return output }
+        if output.count >= 3 { return output }
 
         let url = bundle.rootDirectory.appendingPathComponent(
             "acquisition/fiducial-placements.json")

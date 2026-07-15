@@ -115,13 +115,17 @@ residuals and snapping predictions to the reconstructed surface. Moving or revie
 a point refits all remaining guesses. The displayed confidence combines fit error,
 anchor count, local confirmed neighbors, surface distance, and spatial collisions.
 
+The Receiver also runs a classical multi-scale cup-appearance proposal pass. Proposals
+are intentionally unlabeled, lifted through metric depth, fused only when supported by
+multiple frames, and matched one-to-one to the fitted layout with a minimum-cost global
+assignment. These remain review-required and are stored separately from OCR evidence.
+
 Important limitations:
 
 - The displayed percentage is a heuristic confidence score, not a statistically
   calibrated probability. Calibration needs a held-out set of fully reviewed nets.
-- A guess does not yet mean an unlabeled cup was detected in the image. The current
-  solver can place the layout on plausible surface geometry even when a cup is
-  occluded or absent from every frame.
+- A template-only guess still does not mean a cup was detected. The UI and evidence
+  distinguish those guesses from multi-view CV-observed cups.
 - Nearest-surface snapping can select hair, scalp, straps, or another cup. A trained
   cup detector or segmenter should supply visual support before high-confidence
   automatic acceptance.
@@ -130,7 +134,7 @@ Important limitations:
   still desirable.
 - A similarity transform plus local residual interpolation approximates cap stretch;
   it is not a full non-rigid net deformation model.
-- Labels remain attached to template slots. This is not yet a global assignment
-  solver matching all visible unlabeled cups to all layout labels.
+- Global assignment is rigid/topology-guided and one-to-one, but it is not yet a
+  full non-rigid cap model; substantial cap deformation can still shift assignments.
 - Guessed points are persisted with their state and confidence. Coordinate exports
   need an explicit policy for whether to include guesses, and at what threshold.

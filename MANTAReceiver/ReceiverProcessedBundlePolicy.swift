@@ -81,10 +81,12 @@ nonisolated enum ReceiverProcessedPackage {
         bundle source: MANTAValidatedBundle,
         preparation: ReceiverReconstructionPreparation,
         run: ReceiverPhotogrammetryRun,
+        log: (@Sendable (ReceiverReconstructionLogLevel, String) -> Void)? = nil,
         progress: (@Sendable (Double, String) -> Void)? = nil
     ) throws -> ReceiverProcessedUpdate {
         let preview = try ReceiverReconstructionWorkflow.makePreview(
-            bundle: source, preparation: preparation, run: run, progress: progress)
+            bundle: source, preparation: preparation, run: run,
+            progress: progress, log: log)
         var state = try ensurePackage(for: source)
         let modelPath = "reconstruction/macos_\(preparation.detail.rawValue).usdz"
         let diagnosticsPath = "reconstruction/macos_\(preparation.detail.rawValue)_diagnostics.json"
