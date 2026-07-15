@@ -5,6 +5,7 @@ import simd
 
 struct ReceiverElectrodeWorkspace: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
 
     @State private var selectedLabel: String? = "E1"
@@ -12,6 +13,7 @@ struct ReceiverElectrodeWorkspace: View {
     @State private var workingElectrodes = [MANTAElectrodeSolution]()
     @State private var evidence: ReceiverElectrodeEvidenceDocument?
     @State private var frameIndex = 0
+    @State private var imageZoom: CGFloat = 1
     @State private var showsAllFrames = false
     @State private var orientedImage: ReceiverOrientedFrameImage?
     @State private var isMovingIn3D = false
@@ -32,6 +34,7 @@ struct ReceiverElectrodeWorkspace: View {
                     .frame(minWidth: 390, idealWidth: 520)
                 CombinedModelViewer(
                     bundle: bundle,
+                    display: display,
                     electrodesOverride: displayedElectrodes,
                     electrodePlacementLabel: isMovingIn3D ? selectedLabel : nil,
                     onWorldElectrodePointPicked: placeFromModel,
@@ -222,17 +225,19 @@ struct ReceiverElectrodeWorkspace: View {
             }
             .controlSize(.small)
 
-            ReceiverElectrodeImageCanvas(
-                image: orientedImage,
-                observation: currentObservation,
-                evidence: currentFrameEvidence,
-                cupCandidates: currentFrameCupEvidence,
-                selectedLabel: selectedLabel,
-                projectedRawImagePoint: selectedReprojectionDiagnostic?.rawPoint,
-                onPlace: placeFromImage,
-                onRelabel: beginRelabel)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .frame(minHeight: 280)
+            ReceiverZoomableImageArea(zoom: $imageZoom) {
+                ReceiverElectrodeImageCanvas(
+                    image: orientedImage,
+                    observation: currentObservation,
+                    evidence: currentFrameEvidence,
+                    cupCandidates: currentFrameCupEvidence,
+                    selectedLabel: selectedLabel,
+                    projectedRawImagePoint: selectedReprojectionDiagnostic?.rawPoint,
+                    onPlace: placeFromImage,
+                    onRelabel: beginRelabel)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minHeight: 280)
 
             if !currentFrameCupEvidence.isEmpty {
                 Label(

@@ -5,6 +5,7 @@ import simd
 
 struct ReceiverAlignmentWorkspace: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
     let ephemeralReconstruction: ReceiverEphemeralReconstruction?
 
@@ -13,16 +14,26 @@ struct ReceiverAlignmentWorkspace: View {
     @State private var orientedImage: ReceiverOrientedFrameImage?
     @State private var targetEvidence = [FiducialKind: [UUID: ReceiverImageFiducialHit]]()
     @State private var sourceLandmarks = [FiducialKind: SIMD3<Float>]()
-    @State private var strategy = WorldAlignmentStrategy.fiducial
+    // Default to landmark-seeded ICP: the fiducials you place seed the fit, then
+    // it refines against the dense fused-depth surface. A pure fiducial fit on 3
+    // coplanar points is available but degenerate; ICP against the metric depth
+    // constrains the whole surface.
+    @State private var strategy = WorldAlignmentStrategy.icp
     @State private var seed = AlignmentSeed.landmarks
     @State private var outcome: ReceiverManualAlignmentOutcome?
     @State private var isSolving = false
     @State private var placementError: String?
     @State private var solveError: String?
     @State private var allowPlausibilityOverride = false
-    @State private var isViewerExpanded = false
-    @State private var imagePanelFraction: CGFloat = 0.58
-    @State private var imageResizeStartFraction: CGFloat?
+    @State private var debugLogURL: URL?
+    @State private var imageZoom: CGFloat = 1
+    /// When on, Nasion/LPA/RPA use the device-recorded world fiducials from the
+    /// original capture as the alignment target, instead of resolving fresh depth
+    /// clicks. Useful when the per-frame depth data has a systematic bias: the
+    /// archived fiducials and the LiDAR mesh are independently consistent with
+    /// each other, so they sidestep that bias entirely. Cz has no archived value
+    /// and always comes from a fresh click.
+    @State private var useArchivedFiducials = false
 
     private var observations: [MANTACaptureObservation] {
         bundle.capture.observations.filter {
@@ -40,10 +51,34 @@ struct ReceiverAlignmentWorkspace: View {
         }
     }
 
-    private var hasArchivedCaptureFiducials: Bool {
-        (bundle.capture.fiducials ?? []).contains {
-            $0.coordinateSystem == "arkit-world" && $0.coordinate?.count == 3
+    /// The resolved image-click world points (robust center across views), shown
+    /// in the 3D panel as cyan markers alongside the pink model landmarks so a
+    /// mismatch is visible directly instead of only as a residual number.
+    private var worldTargetLandmarks: [ReceiverModelLandmark] {
+        FiducialKind.allCases.compactMap { kind in
+            worldTarget(for: kind).map { ReceiverModelLandmark(kind: kind, point: $0) }
         }
+    }
+
+    /// Device-recorded world fiducials from the original capture, keyed by kind.
+    private var archivedFiducials: [FiducialKind: SIMD3<Float>] {
+        Dictionary(uniqueKeysWithValues: (bundle.capture.fiducials ?? []).compactMap {
+            fiducial -> (FiducialKind, SIMD3<Float>)? in
+            guard fiducial.coordinateSystem == "arkit-world",
+                  let coordinate = fiducial.coordinate, coordinate.count == 3,
+                  let kind = FiducialKind(rawValue: fiducial.kind) else { return nil }
+            return (kind, SIMD3(coordinate.map(Float.init)))
+        })
+    }
+
+    private var hasArchivedCaptureFiducials: Bool { !archivedFiducials.isEmpty }
+
+    /// The world-space point used for `kind`: the archived capture fiducial when
+    /// the override is on and one exists, otherwise the robust center of this
+    /// session's image clicks.
+    private func worldTarget(for kind: FiducialKind) -> SIMD3<Float>? {
+        if useArchivedFiducials, let archived = archivedFiducials[kind] { return archived }
+        return targetSummary(for: kind)?.center
     }
 
     var body: some View {
@@ -59,54 +94,18 @@ struct ReceiverAlignmentWorkspace: View {
                     systemImage: "camera.badge.ellipsis",
                     description: Text("Image fiducial placement needs saved images with metric depth and camera calibration."))
             } else {
-                HSplitView {
-                    if !isViewerExpanded {
-                        alignmentSidebar
-                            .frame(minWidth: 420, idealWidth: 680, maxWidth: 1_200)
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        modelPanel
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        Divider()
+                        imagePanel
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                    VStack(spacing: 0) {
-                        HStack(spacing: 10) {
-                            Text("3D photogrammetry placement · \(selectedKind.rawValue)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            if !isViewerExpanded {
-                                Text("Drag the divider to resize")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Button(
-                                isViewerExpanded ? "Show Controls" : "Expand 3D",
-                                systemImage: isViewerExpanded
-                                    ? "rectangle.split.2x1" : "arrow.up.left.and.arrow.down.right"
-                            ) {
-                                isViewerExpanded.toggle()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .help(isViewerExpanded
-                                  ? "Restore the image-placement and solver panels"
-                                  : "Give the 3D model the full alignment workspace")
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(.bar)
-
-                        CombinedModelViewer(
-                            bundle: bundle,
-                            modelToWorldOverride: outcome?.result.transform
-                                ?? ephemeralReconstruction?.modelToWorld,
-                            photogrammetryURLOverride: ephemeralReconstruction?.modelURL,
-                            photogrammetryPlacementLabel: selectedKind.rawValue,
-                            modelLandmarks: modelLandmarks,
-                            onPhotogrammetryPointPicked: { point in
-                            sourceLandmarks[selectedKind] = point
-                            invalidateSolve()
-                        })
-                    }
-                    .frame(minWidth: 360)
-                    .layoutPriority(1)
+                    Divider()
+                    bottomDeck
                 }
             }
         }
@@ -116,91 +115,119 @@ struct ReceiverAlignmentWorkspace: View {
     /// A bounded sidebar avoids the oversized intrinsic width that VSplitView
     /// can assign to text-heavy children. The explicit divider also makes image
     /// resizing discoverable and leaves every control reachable by scrolling.
-    private var alignmentSidebar: some View {
-        GeometryReader { geometry in
-            let minimumImageHeight: CGFloat = 300
-            let minimumControlsHeight: CGFloat = 220
-            let dividerHeight: CGFloat = 10
-            let usableHeight = max(1, geometry.size.height - dividerHeight)
-            let maximumImageHeight = max(
-                minimumImageHeight,
-                usableHeight - minimumControlsHeight)
-            let imageHeight = min(
-                maximumImageHeight,
-                max(minimumImageHeight, usableHeight * imagePanelFraction))
-
-            VStack(spacing: 0) {
-                imagePlacementPanel
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .frame(height: imageHeight)
-
-                imageResizeDivider(availableHeight: usableHeight)
-                    .frame(height: dividerHeight)
-
-                alignmentControls
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    private func panelHeader(
+        _ title: String, trailing: AnyView? = nil, subrow: AnyView? = nil
+    ) -> some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                trailing
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            subrow
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.bar)
     }
 
-    private func imageResizeDivider(availableHeight: CGFloat) -> some View {
-        ZStack {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor))
-                .frame(height: 1)
-            Capsule()
-                .fill(.secondary.opacity(0.65))
-                .frame(width: 38, height: 4)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    if imageResizeStartFraction == nil {
-                        imageResizeStartFraction = imagePanelFraction
-                    }
-                    let initial = imageResizeStartFraction ?? imagePanelFraction
-                    imagePanelFraction = min(
-                        0.82,
-                        max(0.32, initial + value.translation.height / availableHeight))
-                }
-                .onEnded { _ in imageResizeStartFraction = nil }
-        )
-        .help("Drag to resize the landmark image")
-        .accessibilityLabel("Resize landmark image")
-    }
-
-    private var imagePlacementPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Picker("Landmark", selection: $selectedKind) {
-                    ForEach(FiducialKind.allCases) { kind in
-                        Text(kind.rawValue).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
-                Button("Clear", systemImage: "xmark.circle") {
-                    targetEvidence[selectedKind] = nil
-                    sourceLandmarks[selectedKind] = nil
+    // LEFT: the 3D photogrammetry model you click on. Orbits + scroll-zooms.
+    // The landmark picker lives here, above the model, since it's what governs
+    // which landmark a click on the model places.
+    private var modelPanel: some View {
+        VStack(spacing: 0) {
+            panelHeader(
+                "3D model",
+                trailing: AnyView(landmarkLegend),
+                subrow: AnyView(landmarkPickerBar))
+            CombinedModelViewer(
+                bundle: bundle,
+                display: display,
+                modelToWorldOverride: outcome?.result.transform
+                    ?? ephemeralReconstruction?.modelToWorld,
+                photogrammetryURLOverride: ephemeralReconstruction?.modelURL,
+                photogrammetryPlacementLabel: selectedKind.rawValue,
+                modelLandmarks: modelLandmarks,
+                worldTargetLandmarks: worldTargetLandmarks,
+                onPhotogrammetryPointPicked: { point in
+                    sourceLandmarks[selectedKind] = point
                     invalidateSolve()
+                },
+                // Archived capture fiducials live in ARKit-world meters; drawing
+                // them beside model-space placement picks mixes two frames.
+                includesFiducialAnnotations: false)
+        }
+    }
+
+    private var landmarkLegend: some View {
+        HStack(spacing: 10) {
+            legendDot(.pink, "model click")
+            legendDot(.cyan, "image target")
+            Text("line = mismatch (green ≤15mm, yellow ≤30mm, red >30mm)")
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+    }
+
+    private func legendDot(_ color: Color, _ label: String) -> some View {
+        HStack(spacing: 3) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(label)
+        }
+    }
+
+    // RIGHT: the RGB-D image you click on. Scroll wheel, pinch, or +/- to zoom.
+    // The depth-frame selector lives here, above the photo, since it picks
+    // which photo is showing.
+    private var imagePanel: some View {
+        VStack(spacing: 0) {
+            panelHeader(
+                "RGB-D image · \(selectedKind.rawValue)",
+                trailing: AnyView(ReceiverZoomControls(zoom: $imageZoom, maximumZoom: 6)),
+                subrow: AnyView(frameNavBar))
+
+            ReceiverZoomableImageArea(zoom: $imageZoom, maximumZoom: 6) {
+                ReceiverFiducialImageCanvas(
+                    image: orientedImage,
+                    observation: currentObservation,
+                    hits: currentObservation.flatMap { targetEvidence[selectedKind]?[$0.id] }.map { [$0] } ?? []
+                ) { rawPoint in
+                    placeTarget(at: rawPoint)
                 }
-                .help("Clear this landmark on both images and the model")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
 
-            ReceiverFiducialImageCanvas(
-                image: orientedImage,
-                observation: currentObservation,
-                hits: currentObservation.flatMap { targetEvidence[selectedKind]?[$0.id] }.map { [$0] } ?? []
-            ) { rawPoint in
-                placeTarget(at: rawPoint)
+    // A single control deck spanning the full width beneath both panels. The
+    // landmark picker and depth-frame selector now live above their respective
+    // panels, so this only holds status/help text and the solve controls
+    // (landmark status is shown once, at the top of alignmentControls).
+    private var bottomDeck: some View {
+        alignmentControls
+            .frame(height: 300)
+            .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var landmarkPickerBar: some View {
+        HStack {
+            Picker("Landmark", selection: $selectedKind) {
+                ForEach(FiducialKind.allCases) { kind in
+                    Text(kind.rawValue).tag(kind)
+                }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .frame(minHeight: 170)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Button("Clear", systemImage: "xmark.circle") {
+                targetEvidence[selectedKind] = nil
+                sourceLandmarks[selectedKind] = nil
+                invalidateSolve()
+            }
+            .help("Clear this landmark on both images and the model")
+        }
+    }
 
+    private var frameNavBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Button("Previous", systemImage: "chevron.left") {
                     observationIndex = max(0, observationIndex - 1)
@@ -208,67 +235,51 @@ struct ReceiverAlignmentWorkspace: View {
                 .disabled(observationIndex == 0)
                 Spacer()
                 Text("Depth frame \(observationIndex + 1) of \(observations.count)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
                 Button("Next", systemImage: "chevron.right") {
                     observationIndex = min(observations.count - 1, observationIndex + 1)
                 }
                 .disabled(observationIndex >= observations.count - 1)
             }
-
             HStack(spacing: 8) {
-                Text("1")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 26, alignment: .leading)
+                Text("1").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                 if observations.count > 1 {
                     Slider(
                         value: Binding(
                             get: { Double(observationIndex) },
                             set: { observationIndex = Int($0.rounded()) }),
-                        in: 0...Double(observations.count - 1),
-                        step: 1)
+                        in: 0...Double(observations.count - 1), step: 1)
                     .help("Scrub through depth frames")
                 } else {
-                    Capsule()
-                        .fill(.quaternary)
-                        .frame(height: 4)
-                        .accessibilityHidden(true)
+                    Capsule().fill(.quaternary).frame(height: 4)
                 }
-                Text("\(observations.count)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 34, alignment: .trailing)
-            }
-            .accessibilityLabel("Depth frame scrubber")
-
-            Text("Click \(selectedKind.rawValue) in the image, then click the same landmark on the 3D photogrammetry model. Repeat the image click in another view to check depth consistency.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let placementError {
-                Label(placementError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text("\(observations.count)").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var alignmentControls: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 12) {
+                if let placementError {
+                    Label(placementError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 landmarkStatus
 
                 if hasArchivedCaptureFiducials {
-                    Label(
-                        "Saved capture fiducials are reference data and are not counted as photo review. Place Nasion, LPA, and RPA in the RGB-D images for this alignment.",
-                        systemImage: "info.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Use archived capture fiducials as image targets", isOn: $useArchivedFiducials)
+                            .toggleStyle(.checkbox)
+                            .onChange(of: useArchivedFiducials) { _, _ in invalidateSolve() }
+                        Text(useArchivedFiducials
+                             ? "Nasion/LPA/RPA use the device-recorded world fiducials from the original capture instead of fresh depth clicks. Useful if per-frame depth has a systematic bias - the archived points and the LiDAR mesh are independently consistent with each other. Cz still needs a fresh click."
+                             : "Saved capture fiducials are reference data and are not counted as photo review. Place Nasion, LPA, and RPA in the RGB-D images for this alignment, or check the box above to use the archived points instead.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 GroupBox("Purpose of Align") {
@@ -336,6 +347,22 @@ struct ReceiverAlignmentWorkspace: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
+
+                if let debugLogURL {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                        Text("Debug log: \(debugLogURL.path)")
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                        Button("Reveal") {
+                            NSWorkspace.shared.activateFileViewerSelecting([debugLogURL])
+                        }
+                        .controlSize(.small)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
                 if let outcome { resultPanel(outcome) }
                 if store.isApplyingAlignment {
                     ProgressView(store.alignmentStage)
@@ -365,7 +392,9 @@ struct ReceiverAlignmentWorkspace: View {
         let target = targetSummary(for: kind)
         let imageCount = targetEvidence[kind]?.count ?? 0
         let targetLabel: String
-        if imageCount > 0, let target {
+        if useArchivedFiducials, archivedFiducials[kind] != nil {
+            targetLabel = "Archived (device)"
+        } else if imageCount > 0, let target {
             let views = "\(imageCount) view\(imageCount == 1 ? "" : "s")"
             targetLabel = target.outlierCount > 0
                 ? "\(views) · \(target.outlierCount) ignored"
@@ -374,12 +403,13 @@ struct ReceiverAlignmentWorkspace: View {
             targetLabel = "Missing"
         }
         let optionalTag = kind.isCardinal ? "" : "  (optional, recommended)"
+        let hasTarget = worldTarget(for: kind) != nil
         return GridRow {
             Text(kind.rawValue + optionalTag)
             Label(
                 targetLabel,
-                systemImage: target == nil ? "circle" : "checkmark.circle.fill")
-                .foregroundStyle(target == nil ? Color.secondary : Color.green)
+                systemImage: hasTarget ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(hasTarget ? Color.green : Color.secondary)
             Label(
                 sourceLandmarks[kind] == nil ? "Missing" : "Placed",
                 systemImage: sourceLandmarks[kind] == nil ? "circle" : "checkmark.circle.fill")
@@ -463,14 +493,14 @@ struct ReceiverAlignmentWorkspace: View {
     private var canSolve: Bool {
         if strategy == .icp, seed != .landmarks { return true }
         return FiducialKind.cardinal.allSatisfy {
-            targetSummary(for: $0) != nil && sourceLandmarks[$0] != nil
+            worldTarget(for: $0) != nil && sourceLandmarks[$0] != nil
         }
     }
 
     /// Whether Cz is placed on both the image and the model. When present it is
     /// fed to the solver as an off-plane 4th correspondence.
     private var hasVertexPair: Bool {
-        targetSummary(for: .vertex) != nil && sourceLandmarks[.vertex] != nil
+        worldTarget(for: .vertex) != nil && sourceLandmarks[.vertex] != nil
     }
 
     private var solveReadinessMessage: String {
@@ -478,7 +508,7 @@ struct ReceiverAlignmentWorkspace: View {
             return "Ready for surface alignment without landmark correspondences."
         }
         let imageCount = FiducialKind.cardinal.filter {
-            targetSummary(for: $0) != nil
+            worldTarget(for: $0) != nil
         }.count
         let modelCount = FiducialKind.cardinal.filter {
             sourceLandmarks[$0] != nil
@@ -519,6 +549,15 @@ struct ReceiverAlignmentWorkspace: View {
         var rawSpreads = [FiducialKind: Float]()
         var centerMethods = [FiducialKind: String]()
         for kind in FiducialKind.allCases {
+            if useArchivedFiducials, let archived = archivedFiducials[kind] {
+                targets[kind] = archived
+                counts[kind] = 1
+                usedCounts[kind] = 1
+                spreads[kind] = 0
+                rawSpreads[kind] = 0
+                centerMethods[kind] = "archived device fiducial"
+                continue
+            }
             guard let summary = targetSummary(for: kind) else { continue }
             targets[kind] = summary.center
             counts[kind] = summary.totalCount
@@ -547,19 +586,27 @@ struct ReceiverAlignmentWorkspace: View {
         isSolving = true
         solveError = nil
         allowPlausibilityOverride = false
+        let modelURLForLog = ephemeralReconstruction?.modelURL
         Task {
+            var solvedOutcome: ReceiverManualAlignmentOutcome?
+            var failure: String?
             do {
-                outcome = try await Task.detached(priority: .userInitiated) {
+                solvedOutcome = try await Task.detached(priority: .userInitiated) {
                     try ReceiverManualAlignmentWorkflow.solve(
                         bundle: sourceBundle,
                         request: request,
-                        modelURLOverride: ephemeralReconstruction?.modelURL)
+                        modelURLOverride: modelURLForLog)
                 }.value
             } catch {
-                solveError = error.localizedDescription
-                outcome = nil
+                failure = error.localizedDescription
             }
+            outcome = solvedOutcome
+            solveError = failure
             isSolving = false
+            let logURL = ReceiverAlignmentDebugLog.record(
+                packageRoot: sourceBundle.rootDirectory,
+                request: request, outcome: solvedOutcome, errorMessage: failure)
+            if let logURL { debugLogURL = logURL }
         }
     }
 

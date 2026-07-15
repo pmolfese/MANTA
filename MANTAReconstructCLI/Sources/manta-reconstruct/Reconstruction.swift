@@ -3,27 +3,19 @@ import MANTACore
 import RealityKit
 import simd
 
-enum ReceiverReconstructionOutputMode: String, CaseIterable, Identifiable, Sendable {
-    case preview = "Preview in App"
-    case derivedBundle = "Save / Update PROCESSED"
-    var id: String { rawValue }
-}
+// Photogrammetry reconstruction driver, ported from the MANTA receiver's
+// ReceiverPhotogrammetryReconstruction so it can run from the command line.
+// It depends only on Foundation / RealityKit / simd / MANTACore — no SwiftUI —
+// so the same Object Capture pipeline the app uses is reproduced here.
 
-enum ReceiverReconstructionLogLevel: String, Codable, Sendable {
+enum ReconstructionLogLevel: String, Codable, Sendable {
     case info
     case warning
     case error
     case success
 }
 
-struct ReceiverReconstructionLogEntry: Identifiable, Sendable {
-    var id = UUID()
-    var timestamp = Date()
-    var level: ReceiverReconstructionLogLevel
-    var message: String
-}
-
-enum ReceiverPhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
+enum PhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
     case medium
     case full
     case raw
@@ -31,15 +23,7 @@ enum ReceiverPhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable 
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
 
-    var explanation: String {
-        switch self {
-        case .medium: "Moderate geometry and memory use; useful for a quick Mac reconstruction."
-        case .full: "High-detail reconstruction suitable for analysis and interactive inspection."
-        case .raw: "Maximum recovered geometry; very large and intended for offline processing."
-        }
-    }
-
-    fileprivate var requestDetail: PhotogrammetrySession.Request.Detail {
+    var requestDetail: PhotogrammetrySession.Request.Detail {
         switch self {
         case .medium: .medium
         case .full: .full
@@ -47,7 +31,7 @@ enum ReceiverPhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable 
         }
     }
 
-    fileprivate func conservativeWorkingBytes(sourceImageBytes: Int64) -> Int64 {
+    func conservativeWorkingBytes(sourceImageBytes: Int64) -> Int64 {
         switch self {
         case .medium: max(2_000_000_000, sourceImageBytes * 2)
         case .full: max(5_000_000_000, sourceImageBytes * 4)
@@ -56,7 +40,7 @@ enum ReceiverPhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable 
     }
 }
 
-struct ReceiverReconstructionEstimate: Sendable {
+struct ReconstructionEstimate: Sendable {
     var imageCount: Int
     var sourceImageBytes: Int64
     var requiredWorkingBytes: Int64
@@ -68,44 +52,35 @@ struct ReceiverReconstructionEstimate: Sendable {
     }
 }
 
-struct ReceiverReconstructionPreparation: Sendable {
+struct ReconstructionPreparation: Sendable {
     var workspace: URL
     var inputDirectory: URL
     var modelURL: URL
     var posesURL: URL
     var diagnosticsURL: URL
-    var detail: ReceiverPhotogrammetryDetail
+    var detail: PhotogrammetryDetail
     var imageCount: Int
     var sourceImageBytes: Int64
 }
 
-struct ReceiverPhotogrammetryRun: Sendable {
+struct PhotogrammetryRun: Sendable {
     var startedAt: Date
     var completedAt: Date
     var skippedSampleIDs: [String]
     var automaticDownsampling: Bool
 }
 
-struct ReceiverDerivedReconstruction: Sendable {
-    var archiveURL: URL
-    var alignmentRMSMeters: Float?
-    var alignmentAccepted: Bool
-}
-
-/// Session-scoped Object Capture output. Object Capture requires a destination
-/// URL, so this lives in a temporary workspace rather than literally in RAM.
-/// The Receiver owns and deletes that workspace when the preview is replaced.
-struct ReceiverEphemeralReconstruction: Sendable {
+struct EphemeralReconstruction: Sendable {
     var modelURL: URL
     var posesURL: URL
     var diagnosticsURL: URL
-    var detail: ReceiverPhotogrammetryDetail
+    var detail: PhotogrammetryDetail
     var modelToWorld: simd_float4x4?
     var alignmentRMSMeters: Float?
     var alignmentAccepted: Bool
 }
 
-struct ReceiverMacReconstructionDiagnostics: Codable, Sendable {
+struct MacReconstructionDiagnostics: Codable, Sendable {
     var detail: String
     var inputImageCount: Int
     var sourceImageBytes: Int64
@@ -124,14 +99,13 @@ struct ReceiverMacReconstructionDiagnostics: Codable, Sendable {
     var alignmentMethod: String
 }
 
-enum ReceiverReconstructionError: LocalizedError {
+enum ReconstructionError: LocalizedError {
     case unsupported
     case noImages
     case insufficientStorage(required: Int64, available: Int64)
     case processing(String)
     case cancelled
     case missingOutput
-    case archiveTooLarge(Int64)
 
     var errorDescription: String? {
         switch self {
@@ -147,8 +121,6 @@ enum ReceiverReconstructionError: LocalizedError {
             "Reconstruction was cancelled."
         case .missingOutput:
             "Object Capture completed without producing the requested model."
-        case .archiveTooLarge(let bytes):
-            "The derived bundle would be \(Self.bytes(bytes)), above the current .manta archive limit. Try Full detail; ZIP64 bundle support is still needed for a model this large."
         }
     }
 
@@ -157,8 +129,7 @@ enum ReceiverReconstructionError: LocalizedError {
     }
 }
 
-@MainActor
-final class ReceiverPhotogrammetryRunner {
+final class PhotogrammetryRunner {
     private var session: PhotogrammetrySession?
 
     var isSupported: Bool { PhotogrammetrySession.isSupported }
@@ -168,12 +139,12 @@ final class ReceiverPhotogrammetryRunner {
     }
 
     func reconstruct(
-        preparation: ReceiverReconstructionPreparation,
-        progress: @escaping @MainActor (Double, String) -> Void,
-        log: @escaping @MainActor (ReceiverReconstructionLogLevel, String) -> Void
-    ) async throws -> ReceiverPhotogrammetryRun {
+        preparation: ReconstructionPreparation,
+        progress: @escaping (Double, String) -> Void,
+        log: @escaping (ReconstructionLogLevel, String) -> Void
+    ) async throws -> PhotogrammetryRun {
         guard PhotogrammetrySession.isSupported else {
-            throw ReceiverReconstructionError.unsupported
+            throw ReconstructionError.unsupported
         }
         var configuration = PhotogrammetrySession.Configuration()
         configuration.sampleOrdering = .sequential
@@ -198,7 +169,7 @@ final class ReceiverPhotogrammetryRunner {
             for try await output in active.outputs {
                 if Task.isCancelled {
                     active.cancel()
-                    throw ReceiverReconstructionError.cancelled
+                    throw ReconstructionError.cancelled
                 }
                 switch output {
                 case .requestProgress(_, let fraction):
@@ -213,17 +184,17 @@ final class ReceiverPhotogrammetryRunner {
                     log(.warning, "Object Capture enabled automatic image downsampling.")
                 case .requestError(_, let error):
                     log(.error, "Object Capture request failed: \(error.localizedDescription)")
-                    throw ReceiverReconstructionError.processing(error.localizedDescription)
+                    throw ReconstructionError.processing(error.localizedDescription)
                 case .processingCancelled:
                     log(.warning, "Object Capture reported cancellation at \(Int(currentProgress * 100))%.")
-                    throw ReceiverReconstructionError.cancelled
+                    throw ReconstructionError.cancelled
                 case .processingComplete:
                     guard FileManager.default.fileExists(atPath: preparation.modelURL.path) else {
                         log(.error, "Object Capture completed but did not produce a model file.")
-                        throw ReceiverReconstructionError.missingOutput
+                        throw ReconstructionError.missingOutput
                     }
                     log(.success, "Object Capture model generation completed.")
-                    return ReceiverPhotogrammetryRun(
+                    return PhotogrammetryRun(
                         startedAt: startedAt,
                         completedAt: Date(),
                         skippedSampleIDs: skipped,
@@ -233,13 +204,13 @@ final class ReceiverPhotogrammetryRunner {
                 }
             }
         } catch is CancellationError {
-            throw ReceiverReconstructionError.cancelled
+            throw ReconstructionError.cancelled
         }
-        throw ReceiverReconstructionError.missingOutput
+        throw ReconstructionError.missingOutput
     }
 }
 
-nonisolated enum ReceiverReconstructionWorkflow {
+enum ReconstructionWorkflow {
     private struct PoseRecord: Codable {
         var imageFilename: String
         var observationID: UUID
@@ -250,8 +221,8 @@ nonisolated enum ReceiverReconstructionWorkflow {
 
     static func estimate(
         bundle: MANTAValidatedBundle,
-        detail: ReceiverPhotogrammetryDetail
-    ) -> ReceiverReconstructionEstimate {
+        detail: PhotogrammetryDetail
+    ) -> ReconstructionEstimate {
         let sources = imageSources(bundle: bundle)
         let bytes = sources.reduce(Int64(0)) { partial, item in
             partial + Int64((try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
@@ -259,7 +230,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
         let available = try? bundle.rootDirectory.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
-        return ReceiverReconstructionEstimate(
+        return ReconstructionEstimate(
             imageCount: sources.count,
             sourceImageBytes: bytes,
             requiredWorkingBytes: detail.conservativeWorkingBytes(sourceImageBytes: bytes),
@@ -268,12 +239,12 @@ nonisolated enum ReceiverReconstructionWorkflow {
 
     static func prepare(
         bundle: MANTAValidatedBundle,
-        detail: ReceiverPhotogrammetryDetail
-    ) throws -> ReceiverReconstructionPreparation {
+        detail: PhotogrammetryDetail
+    ) throws -> ReconstructionPreparation {
         let estimate = estimate(bundle: bundle, detail: detail)
-        guard estimate.imageCount > 0 else { throw ReceiverReconstructionError.noImages }
+        guard estimate.imageCount > 0 else { throw ReconstructionError.noImages }
         if let available = estimate.availableBytes, !estimate.hasEnoughSpace {
-            throw ReceiverReconstructionError.insufficientStorage(
+            throw ReconstructionError.insufficientStorage(
                 required: estimate.requiredWorkingBytes, available: available)
         }
 
@@ -282,7 +253,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true)
         let workspace = support
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
+            .appendingPathComponent("MANTA Reconstruct CLI", isDirectory: true)
             .appendingPathComponent("Reconstruction Workspaces", isDirectory: true)
             .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
         let input = workspace.appendingPathComponent("Input", isDirectory: true)
@@ -310,7 +281,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
             let encoder = MANTAJSON.makeEncoder()
             try encoder.encode(poses).write(to: posesURL, options: .atomic)
             let stem = "macos_\(detail.rawValue)"
-            return ReceiverReconstructionPreparation(
+            return ReconstructionPreparation(
                 workspace: workspace,
                 inputDirectory: input,
                 modelURL: workspace.appendingPathComponent("\(stem).usdz"),
@@ -325,14 +296,13 @@ nonisolated enum ReceiverReconstructionWorkflow {
         }
     }
 
-
     static func makePreview(
         bundle: MANTAValidatedBundle,
-        preparation: ReceiverReconstructionPreparation,
-        run: ReceiverPhotogrammetryRun,
-        progress: (@Sendable (Double, String) -> Void)? = nil,
-        log: (@Sendable (ReceiverReconstructionLogLevel, String) -> Void)? = nil
-    ) throws -> ReceiverEphemeralReconstruction {
+        preparation: ReconstructionPreparation,
+        run: PhotogrammetryRun,
+        progress: ((Double, String) -> Void)? = nil,
+        log: ((ReconstructionLogLevel, String) -> Void)? = nil
+    ) throws -> EphemeralReconstruction {
         progress?(0.01, "Loading reconstruction geometry")
         let source = ModelPointCloudLoader.load(url: preparation.modelURL, maxPoints: 8_000)
         let target = alignmentTarget(bundle: bundle, maxPoints: 8_000)
@@ -379,7 +349,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
 
         let modelBytes = Int64((try? preparation.modelURL.resourceValues(
             forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        let diagnostics = ReceiverMacReconstructionDiagnostics(
+        let diagnostics = MacReconstructionDiagnostics(
             detail: preparation.detail.rawValue,
             inputImageCount: preparation.imageCount,
             sourceImageBytes: preparation.sourceImageBytes,
@@ -399,7 +369,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
         try MANTAJSON.makeEncoder().encode(diagnostics).write(
             to: preparation.diagnosticsURL, options: .atomic)
         log?(.info, "Wrote reconstruction diagnostics.")
-        return ReceiverEphemeralReconstruction(
+        return EphemeralReconstruction(
             modelURL: preparation.modelURL,
             posesURL: preparation.posesURL,
             diagnosticsURL: preparation.diagnosticsURL,
@@ -409,7 +379,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
             alignmentAccepted: alignmentAccepted)
     }
 
-    static func removeWorkspace(_ preparation: ReceiverReconstructionPreparation) {
+    static func removeWorkspace(_ preparation: ReconstructionPreparation) {
         try? FileManager.default.removeItem(at: preparation.workspace)
     }
 
@@ -448,11 +418,6 @@ nonisolated enum ReceiverReconstructionWorkflow {
             }
         }
         return points
-    }
-
-    private static func flattened(_ matrix: simd_float4x4) -> [Double] {
-        [matrix.columns.0, matrix.columns.1, matrix.columns.2, matrix.columns.3]
-            .flatMap { [Double($0.x), Double($0.y), Double($0.z), Double($0.w)] }
     }
 
     private static func uniformScale(_ transform: simd_float4x4) -> Float {
@@ -498,5 +463,4 @@ nonisolated enum ReceiverReconstructionWorkflow {
         }
         return (sum / Float(source.count)).squareRoot()
     }
-
 }

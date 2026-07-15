@@ -4,9 +4,11 @@ import SwiftUI
 
 struct CaptureVisualizationView: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
     @State private var mode = CaptureViewMode.model
     @State private var observationIndex = 0
+    @State private var cameraZoom: CGFloat = 1
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,6 +38,7 @@ struct CaptureVisualizationView: View {
     private var modelViewer: some View {
         CombinedModelViewer(
             bundle: bundle,
+            display: display,
             modelToWorldOverride: store.ephemeralReconstruction?.modelToWorld,
             photogrammetryURLOverride: store.ephemeralReconstruction?.modelURL,
             fiducialSaveInProgress: store.isApplyingAlignment
@@ -49,11 +52,13 @@ struct CaptureVisualizationView: View {
             ContentUnavailableView("No saved camera frames", systemImage: "camera")
         } else {
             VStack(spacing: 0) {
-                StoredCameraFrameView(
-                    root: bundle.rootDirectory,
-                    observation: bundle.capture.observations[observationIndex],
-                    electrodes: bundle.capture.electrodes ?? [],
-                    fiducials: bundle.capture.fiducials ?? [])
+                ReceiverZoomableImageArea(zoom: $cameraZoom) {
+                    StoredCameraFrameView(
+                        root: bundle.rootDirectory,
+                        observation: bundle.capture.observations[observationIndex],
+                        electrodes: bundle.capture.electrodes ?? [],
+                        fiducials: bundle.capture.fiducials ?? [])
+                }
                 Divider()
                 HStack {
                     Button("Previous", systemImage: "chevron.left") {

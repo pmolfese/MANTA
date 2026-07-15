@@ -90,6 +90,43 @@ struct WorldAlignmentTests {
         #expect(AbsoluteOrientation.fit(source: source, target: target, scale: .rigid) == nil)
     }
 
+    @Test func robustFitExcludesASingleBadLandmarkWhenAFourthIsPresent() throws {
+        // A well-conditioned tetrahedron (no 3-point subset near-degenerate),
+        // so the fit isn't confounded by the coplanar ambiguity itself.
+        let source: [SIMD3<Float>] = [
+            SIMD3(0, 0, 0), SIMD3(0.1, 0, 0), SIMD3(0, 0.1, 0), SIMD3(0.03, 0.03, 0.1)
+        ]
+        let truth = knownTransform(
+            scale: 0.44, axis: SIMD3(0.2, 1, -0.1), angle: 0.7, translation: SIMD3(0.05, -0.28, -0.6))
+        var target = source.map { apply(truth, $0) }
+        // Corrupt one landmark (index 2) the way a bad depth click does: a
+        // large, isolated offset on just that one point.
+        target[2] += SIMD3(0.15, -0.08, 0.06)
+
+        let plain = try #require(AbsoluteOrientation.fit(source: source, target: target, scale: .estimate))
+        let robust = try #require(AbsoluteOrientation.fitRobust(source: source, target: target, scale: .estimate))
+
+        // The plain least-squares fit is dragged off by the bad point across the
+        // whole transform, including at the good landmarks.
+        #expect(maxError(plain.transform, source: source, target: target) > 0.01)
+        // The robust fit identifies and drops the corrupted landmark...
+        #expect(robust.excludedIndex == 2)
+        // ...and recovers a transform that exactly matches truth at the good
+        // points (3 clean points determine a similarity transform exactly).
+        let goodSource = [source[0], source[1], source[3]]
+        let goodTruthTarget = goodSource.map { apply(truth, $0) }
+        #expect(maxError(robust.result.transform, source: goodSource, target: goodTruthTarget) < 0.001)
+    }
+
+    @Test func robustFitLeavesAConsistentThreePointSetUnchanged() throws {
+        // With exactly 3 points there's no redundancy to detect an outlier, so
+        // fitRobust must behave exactly like plain fit - never drop a point.
+        let source: [SIMD3<Float>] = [SIMD3(0.05, -0.19, -0.55), SIMD3(0.14, -0.22, -0.60), SIMD3(0, -0.21, -0.64)]
+        let target = source
+        let robust = try #require(AbsoluteOrientation.fitRobust(source: source, target: target, scale: .rigid))
+        #expect(robust.excludedIndex == nil)
+    }
+
     @Test func icpConvergesFromIdentitySeed() throws {
         // A small point cloud on a sphere-ish shell.
         var cloud: [SIMD3<Float>] = []
@@ -104,6 +141,7 @@ struct WorldAlignmentTests {
             source: cloud,
             target: target,
             seed: matrix_identity_float4x4,
+            scaleMode: .rigid,
             maxIterations: 60,
             tolerance: 1e-6
         )

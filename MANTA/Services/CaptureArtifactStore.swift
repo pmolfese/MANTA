@@ -269,8 +269,11 @@ struct CaptureArtifactStore: @unchecked Sendable {
         let outputDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("MANTA Exports", isDirectory: true)
             .appendingPathComponent(bundleID.uuidString, isDirectory: true)
+        // Share a plain package folder, not a zip: the folder shares directly via
+        // the same Share Sheet/AirDrop/Files mechanism, and unlike a zip it can be
+        // opened and edited in place on the receiving Mac with no extraction step.
         let finalized = try MANTABundleFinalizer(fileManager: fileManager).finalize(
-            request, in: outputDirectory
+            request, in: outputDirectory, preferDirectoryPackage: true
         ) { fraction, stage in
             progress?(0.10 + fraction * 0.70, stage)
         }

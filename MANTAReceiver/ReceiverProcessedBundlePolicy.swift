@@ -190,6 +190,103 @@ nonisolated enum ReceiverProcessedPackage {
             alignmentRMSMeters: nil, alignmentAccepted: false)
     }
 
+    /// Saves an edited head bounding box. This only changes what future Fused
+    /// Depth builds and LiDAR-crop alignment fallbacks treat as "the head" - it
+    /// never touches electrode search, which depends solely on camera poses and
+    /// the photogrammetry mesh.
+    static func updateHeadBoundingBox(
+        bundle source: MANTAValidatedBundle,
+        boundingBox: HeadBoundingBox
+    ) throws -> ReceiverProcessedUpdate {
+        var state = try ensurePackage(for: source)
+        var capture = state.bundle.capture
+        var reconstruction = capture.reconstruction ?? MANTAReconstructionReference()
+        reconstruction.headBoundingBox = boundingBox
+
+        // Regenerate the head-cropped LiDAR mesh from the full-environment mesh
+        // using the new box. The crop was previously a fixed file baked once at
+        // capture time; widening the box here had no effect on it, only on
+        // Fused Depth. Best-effort: if the full mesh is missing or unreadable,
+        // leave the existing crop (if any) untouched rather than failing the
+        // whole save.
+        var changedFiles = [FileDescription]()
+        var targets = ["capture.json"]
+        if let fullPath = reconstruction.lidarMeshPath {
+            let fullURL = state.root.appendingPathComponent(fullPath)
+            if let cropped = try? croppedLiDARMesh(fullMeshURL: fullURL, boundingBox: boundingBox),
+               !cropped.vertices.isEmpty {
+                let croppedPath = "reconstruction/lidar_mesh_head.ply"
+                let temporary = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("manta-lidar-crop-\(UUID().uuidString).ply")
+                do {
+                    try ReceiverSurfaceExporter.writeMeshPLY(cropped, to: temporary)
+                    try replaceFile(temporary, at: croppedPath, in: state.root)
+                    reconstruction.headCroppedLidarMeshPath = croppedPath
+                    changedFiles.append(FileDescription(
+                        path: croppedPath, mediaType: "application/octet-stream",
+                        role: "lidar-head-crop"))
+                    targets.append(croppedPath)
+                } catch {
+                    // Leave the prior crop (if any) in place.
+                }
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
+
+        capture.reconstruction = reconstruction
+        let change = MANTAChangeRecord(
+            changedAt: Date(),
+            category: "head-bounding-box-edit",
+            summary: changedFiles.isEmpty
+                ? "Adjusted the head bounding box used for Fused Depth and LiDAR-crop alignment on macOS."
+                : "Adjusted the head bounding box and regenerated the LiDAR head crop on macOS.",
+            targets: targets)
+        state.bundle = try commit(state: state, capture: capture, change: change, changedFiles: changedFiles)
+        return ReceiverProcessedUpdate(
+            bundle: state.bundle, packageURL: state.root,
+            alignmentRMSMeters: nil, alignmentAccepted: false)
+    }
+
+    /// Filters the full LiDAR mesh's triangles down to the ones entirely inside
+    /// `boundingBox`, remapping vertex indices to stay contiguous. A triangle
+    /// with any vertex outside the box is dropped rather than clipped, which
+    /// can leave a slightly jagged boundary edge - acceptable for a
+    /// visualization/ICP target, not a precision surface.
+    private static func croppedLiDARMesh(
+        fullMeshURL: URL, boundingBox: HeadBoundingBox
+    ) throws -> ReceiverTriangleMesh {
+        guard let mesh = try ReceiverPLYMesh(contentsOf: fullMeshURL) else {
+            throw ReceiverProcessedPackageError.inconsistentMetadata
+        }
+        let center = SIMD3<Float>(
+            Float(boundingBox.center.x), Float(boundingBox.center.y), Float(boundingBox.center.z))
+        let half = SIMD3<Float>(
+            Float(boundingBox.widthMeters / 2), Float(boundingBox.heightMeters / 2),
+            Float(boundingBox.depthMeters / 2))
+        func isInside(_ p: SIMD3<Float>) -> Bool {
+            let delta = abs(p - center)
+            return delta.x <= half.x && delta.y <= half.y && delta.z <= half.z
+        }
+        var remap = [Int: UInt32]()
+        var vertices = [SIMD3<Float>]()
+        var indices = [UInt32]()
+        func remappedIndex(_ index: Int) -> UInt32? {
+            guard isInside(mesh.points[index]) else { return nil }
+            if let existing = remap[index] { return existing }
+            let newIndex = UInt32(vertices.count)
+            vertices.append(mesh.points[index])
+            remap[index] = newIndex
+            return newIndex
+        }
+        for face in stride(from: 0, to: mesh.indices.count, by: 3) {
+            guard let a = remappedIndex(Int(mesh.indices[face])),
+                  let b = remappedIndex(Int(mesh.indices[face + 1])),
+                  let c = remappedIndex(Int(mesh.indices[face + 2])) else { continue }
+            indices.append(contentsOf: [a, b, c])
+        }
+        return ReceiverTriangleMesh(vertices: vertices, indices: indices)
+    }
+
     static func updateElectrodes(
         bundle source: MANTAValidatedBundle,
         electrodes: [MANTAElectrodeSolution],
@@ -230,69 +327,36 @@ nonisolated enum ReceiverProcessedPackage {
         var role: String
     }
 
+    /// Everything about a capture lives in the one folder the user gave us -
+    /// wherever that is on disk. There is no promotion into an app-managed
+    /// location and no RAW/PROCESSED fork: the first edit stamps the folder with
+    /// local metadata in place, and every later edit reuses the same root and
+    /// the same bundle identity. Re-running a step (reconstruction, alignment,
+    /// electrode detection) simply overwrites its own output files in place.
     private static func ensurePackage(for source: MANTAValidatedBundle) throws -> State {
-        if isPackage(source.rootDirectory) {
-            let loaded = try load(at: source.rootDirectory)
+        let root = source.rootDirectory
+        if isPackage(root) {
+            let loaded = try load(at: root)
             let metadata = try MANTAJSON.makeDecoder().decode(
                 ReceiverProcessedPackageMetadata.self,
-                from: Data(contentsOf: source.rootDirectory.appendingPathComponent(metadataFilename)))
-            return State(root: source.rootDirectory, bundle: loaded, metadata: metadata)
-        }
-
-        let fileManager = FileManager.default
-        let rawBundleID = source.manifest.parentBundleID ?? source.manifest.bundleID
-        let applicationSupport = try fileManager.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true)
-        let sessionDirectory = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Processed", isDirectory: true)
-            .appendingPathComponent(source.manifest.sessionID.uuidString.lowercased(), isDirectory: true)
-        try fileManager.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
-        let destination = sessionDirectory.appendingPathComponent(
-            MANTABundleFilename.timestamped(for: source.manifest.createdAt, tag: "processed"),
-            isDirectory: true)
-
-        if fileManager.fileExists(atPath: destination.path) {
-            guard isPackage(destination) else {
-                throw ReceiverProcessedPackageError.destinationExists(destination.path)
-            }
-            let loaded = try load(at: destination)
-            let metadata = try MANTAJSON.makeDecoder().decode(
-                ReceiverProcessedPackageMetadata.self,
-                from: Data(contentsOf: destination.appendingPathComponent(metadataFilename)))
-            return State(root: destination, bundle: loaded, metadata: metadata)
-        }
-
-        let importsDirectory = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Imports", isDirectory: true)
-            .standardizedFileURL
-        let sourceRoot = source.rootDirectory.standardizedFileURL
-        let receipt = sourceRoot.deletingLastPathComponent()
-        if receipt.deletingLastPathComponent() == importsDirectory {
-            try fileManager.moveItem(at: sourceRoot, to: destination)
-            // The receipt now contains only the private copy of the imported ZIP.
-            try? fileManager.removeItem(at: receipt)
-        } else {
-            try fileManager.copyItem(at: sourceRoot, to: destination)
+                from: Data(contentsOf: root.appendingPathComponent(metadataFilename)))
+            return State(root: root, bundle: loaded, metadata: metadata)
         }
 
         let now = Date()
         let metadata = ReceiverProcessedPackageMetadata(
-            processedBundleID: UUID(), rawBundleID: rawBundleID,
+            processedBundleID: source.manifest.bundleID,
+            rawBundleID: source.manifest.parentBundleID ?? source.manifest.bundleID,
             sessionID: source.manifest.sessionID, createdAt: now, updatedAt: now)
-        try writeJSON(metadata, to: destination.appendingPathComponent(metadataFilename))
+        try writeJSON(metadata, to: root.appendingPathComponent(metadataFilename))
         var manifest = source.manifest
-        manifest.bundleID = metadata.processedBundleID
-        manifest.parentBundleID = rawBundleID
         manifest.finalizedAt = now
         manifest.producer = producer()
         manifest.content.changeLog = logFilename
         let initial = MANTAValidatedBundle(
-            rootDirectory: destination, manifest: manifest,
+            rootDirectory: root, manifest: manifest,
             capture: source.capture, changeLog: source.changeLog)
-        return State(root: destination, bundle: initial, metadata: metadata)
+        return State(root: root, bundle: initial, metadata: metadata)
     }
 
     private static func invalidateElectrodes(
@@ -429,25 +493,3 @@ private enum ReceiverProcessedPackageError: LocalizedError {
     }
 }
 
-/// Compatibility for the older portable snapshot writers. The Receiver's save
-/// path no longer calls those writers; they remain available only until the
-/// optional explicit "export portable copy" feature is separated out.
-nonisolated enum ReceiverProcessedBundlePolicy {
-    struct Revision: Sendable {
-        var bundleID: UUID
-        var rawParentBundleID: UUID
-        var changes: [MANTAChangeRecord]
-    }
-
-    static func revision(
-        of bundle: MANTAValidatedBundle,
-        appending change: MANTAChangeRecord
-    ) -> Revision {
-        Revision(
-            bundleID: bundle.manifest.parentBundleID == nil
-                ? UUID() : bundle.manifest.bundleID,
-            rawParentBundleID: bundle.manifest.parentBundleID
-                ?? bundle.manifest.bundleID,
-            changes: (bundle.changeLog?.changes ?? []) + [change])
-    }
-}

@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 struct ReceiverContentView: View {
     @StateObject private var store = ReceiverStore()
+    @StateObject private var display = ReceiverDisplaySettings()
     @State private var showsImporter = false
     @State private var isDropTargeted = false
 
@@ -53,6 +54,27 @@ struct ReceiverContentView: View {
                     }
                 }
 
+                if let bundle = store.bundle {
+                    Section {
+                        ReceiverDisplayControls(display: display)
+                    } header: {
+                        Text("Display")
+                    }
+
+                    Section {
+                        ReceiverHeadBoundingBoxControls(store: store, display: display)
+                    } header: {
+                        HStack(spacing: 4) {
+                            Text("Head Bounding Box")
+                            ReceiverInfoButton(text: ReceiverGlossary.headBoundingBox)
+                        }
+                    }
+
+                    ReconstructionSidebarSection(store: store, bundle: bundle)
+
+                    MetadataSidebarSection(bundle: bundle, archiveURL: store.importedArchiveURL)
+                }
+
                 if store.isReconstructing {
                     Section("Mac Reconstruction") {
                         ProgressView(value: store.reconstructionProgress)
@@ -75,7 +97,7 @@ struct ReceiverContentView: View {
             if store.isImporting {
                 ProgressView("Copying and validating capture…")
             } else if let bundle = store.bundle {
-                BundleInspector(store: store, bundle: bundle, archiveURL: store.importedArchiveURL)
+                BundleInspector(store: store, display: display, bundle: bundle)
             } else {
                 ContentUnavailableView(
                     "Import a Capture",
@@ -152,29 +174,26 @@ struct ReceiverContentView: View {
 
 private struct BundleInspector: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
-    let archiveURL: URL?
 
     var body: some View {
         TabView {
-            CaptureVisualizationView(store: store, bundle: bundle)
+            CaptureVisualizationView(store: store, display: display, bundle: bundle)
                 .tabItem { Label("Viewer", systemImage: "viewfinder") }
-            ReceiverReconstructionView(store: store, bundle: bundle)
-                .tabItem { Label("Reconstruct", systemImage: "camera.metering.matrix") }
             ReceiverAlignmentWorkspace(
                 store: store,
+                display: display,
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .id(alignmentWorkspaceID)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
-            ReceiverElectrodeWorkspace(store: store, bundle: bundle)
+            ReceiverElectrodeWorkspace(store: store, display: display, bundle: bundle)
                 .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
             ReceiverExportView(
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .tabItem { Label("Export", systemImage: "square.and.arrow.up") }
-            metadata
-                .tabItem { Label("Metadata", systemImage: "list.bullet.rectangle") }
         }
         .navigationTitle("Capture Inspector")
     }
@@ -190,61 +209,6 @@ private struct BundleInspector: View {
         return "\(bundle.manifest.bundleID.uuidString)|\(modelIdentity)"
     }
 
-    private var metadata: some View {
-        Form {
-            Section("Identity") {
-                LabeledContent(
-                    "Package",
-                    value: bundle.manifest.parentBundleID == nil ? "RAW" : "PROCESSED")
-                LabeledContent("Bundle ID", value: bundle.manifest.bundleID.uuidString.lowercased())
-                LabeledContent("Session ID", value: bundle.manifest.sessionID.uuidString.lowercased())
-                LabeledContent("Schema", value: bundle.manifest.schemaVersion)
-                LabeledContent("Finalized", value: bundle.manifest.finalizedAt.formatted())
-                if let parent = bundle.manifest.parentBundleID {
-                    LabeledContent("Parent bundle", value: parent.uuidString.lowercased())
-                }
-            }
-
-            Section("Capture") {
-                LabeledContent("Mode", value: bundle.capture.captureMode)
-                LabeledContent("Layout", value: bundle.capture.layoutID)
-                LabeledContent("Observations", value: "\(bundle.capture.observations.count)")
-                LabeledContent("Electrodes", value: "\(bundle.capture.electrodes?.count ?? 0)")
-                LabeledContent("Fiducials", value: "\(bundle.capture.fiducials?.count ?? 0)")
-            }
-
-            Section("Producer") {
-                LabeledContent("Application", value: bundle.manifest.producer.application)
-                LabeledContent("Version", value: "\(bundle.manifest.producer.version) (\(bundle.manifest.producer.build))")
-                LabeledContent("Platform", value: bundle.manifest.producer.platform)
-                LabeledContent("Device", value: bundle.manifest.producer.deviceModel)
-                LabeledContent("Operating system", value: bundle.manifest.producer.operatingSystemVersion)
-            }
-
-            Section("Files") {
-                ForEach(bundle.manifest.files, id: \.path) { file in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(file.path).font(.system(.body, design: .monospaced))
-                            Text(file.role).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            if let archiveURL {
-                Section("Stored Copy") {
-                    Text(archiveURL.path)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
-        }
-        .formStyle(.grouped)
-    }
 }
 
 private struct ReceiverReconstructionView: View {
@@ -498,6 +462,134 @@ private struct ReceiverReconstructionView: View {
     private func elapsed(from start: Date, to end: Date) -> String {
         let seconds = max(0, Int(end.timeIntervalSince(start)))
         return String(format: "%02d:%02d:%02d", seconds / 3_600, (seconds / 60) % 60, seconds % 60)
+    }
+}
+
+/// Reconstruction controls, folded into the sidebar. Collapsed by default once a
+/// reconstruction already exists in the package (or a session preview is loaded).
+private struct ReconstructionSidebarSection: View {
+    @ObservedObject var store: ReceiverStore
+    let bundle: MANTAValidatedBundle
+    @State private var isExpanded: Bool?
+
+    private var hasReconstruction: Bool {
+        bundle.capture.reconstruction?.objectCaptureModelPath != nil
+            || store.ephemeralReconstruction != nil
+    }
+
+    var body: some View {
+        Section {
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { isExpanded ?? !hasReconstruction },
+                    set: { isExpanded = $0 })
+            ) {
+                ReceiverReconstructionView(store: store, bundle: bundle)
+                    .padding(.top, 4)
+            } label: {
+                HStack(spacing: 4) {
+                    Label("Reconstruct", systemImage: "camera.metering.matrix")
+                    ReceiverInfoButton(text: ReceiverGlossary.reconstruct)
+                }
+            }
+        }
+    }
+}
+
+/// Bundle metadata, folded into the sidebar as collapsible groups. Any group with
+/// more than six rows (e.g. the file manifest) starts collapsed.
+private struct MetadataSidebarSection: View {
+    let bundle: MANTAValidatedBundle
+    let archiveURL: URL?
+
+    var body: some View {
+        Section {
+            metadataContent
+        } header: {
+            HStack(spacing: 4) {
+                Text("Metadata")
+                ReceiverInfoButton(text: ReceiverGlossary.metadata)
+            }
+        }
+    }
+
+    @ViewBuilder private var metadataContent: some View {
+            group("Identity", count: bundle.manifest.parentBundleID == nil ? 5 : 6) {
+                row("Package", bundle.manifest.parentBundleID == nil ? "RAW" : "PROCESSED")
+                row("Bundle ID", bundle.manifest.bundleID.uuidString.lowercased())
+                row("Session ID", bundle.manifest.sessionID.uuidString.lowercased())
+                row("Schema", bundle.manifest.schemaVersion)
+                row("Finalized", bundle.manifest.finalizedAt.formatted())
+                if let parent = bundle.manifest.parentBundleID {
+                    row("Parent", parent.uuidString.lowercased())
+                }
+            }
+            group("Capture", count: 5) {
+                row("Mode", bundle.capture.captureMode)
+                row("Layout", bundle.capture.layoutID)
+                row("Observations", "\(bundle.capture.observations.count)")
+                row("Electrodes", "\(bundle.capture.electrodes?.count ?? 0)")
+                row("Fiducials", "\(bundle.capture.fiducials?.count ?? 0)")
+            }
+            group("Producer", count: 5) {
+                row("Application", bundle.manifest.producer.application)
+                row("Version", "\(bundle.manifest.producer.version) (\(bundle.manifest.producer.build))")
+                row("Platform", bundle.manifest.producer.platform)
+                row("Device", bundle.manifest.producer.deviceModel)
+                row("OS", bundle.manifest.producer.operatingSystemVersion)
+            }
+            group("Files", count: bundle.manifest.files.count) {
+                ForEach(bundle.manifest.files, id: \.path) { file in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(file.path).font(.system(.caption, design: .monospaced))
+                        HStack {
+                            Text(file.role).font(.caption2).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            if let archiveURL {
+                group("Stored Copy", count: 1) {
+                    Text(archiveURL.path)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+    }
+
+    /// A collapsible metadata group; collapsed initially when it has >6 rows.
+    private func group(
+        _ title: String, count: Int, @ViewBuilder content: @escaping () -> some View
+    ) -> some View {
+        CollapsibleGroup(title: title, initiallyExpanded: count <= 6, content: content)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        LabeledContent(label) {
+            Text(value).font(.caption).foregroundStyle(.secondary)
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+        }
+        .font(.caption)
+    }
+}
+
+/// DisclosureGroup with its own remembered expand state, seeded once.
+private struct CollapsibleGroup<Content: View>: View {
+    let title: String
+    @State private var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    init(title: String, initiallyExpanded: Bool, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        _isExpanded = State(initialValue: initiallyExpanded)
+        self.content = content
+    }
+
+    var body: some View {
+        DisclosureGroup(title, isExpanded: $isExpanded) { content() }
     }
 }
 

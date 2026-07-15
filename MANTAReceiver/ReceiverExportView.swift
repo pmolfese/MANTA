@@ -495,11 +495,16 @@ nonisolated enum ReceiverSurfaceExporter {
         try writer.finish()
     }
 
-    private nonisolated static func writeMeshPLY(
+    nonisolated static func writeMeshPLY(
         _ mesh: ReceiverTriangleMesh, to url: URL
     ) throws {
         let writer = try ReceiverBinaryFileWriter(destination: url)
-        try writer.write(Data("""
+        // Swift's multi-line string literal has no trailing newline after its
+        // last line, but PLY readers (including this app's own ReceiverPLYMesh)
+        // find the end of the header by searching for the exact bytes
+        // "end_header\n" - append it explicitly, or the binary data that
+        // follows is misread as part of that search and never found.
+        try writer.write(Data(("""
             ply
             format binary_little_endian 1.0
             comment MANTA surface; coordinates in meters
@@ -510,7 +515,7 @@ nonisolated enum ReceiverSurfaceExporter {
             element face \(mesh.indices.count / 3)
             property list uchar uint vertex_indices
             end_header
-            """.utf8))
+            """ + "\n").utf8))
         for point in mesh.vertices {
             try writer.float(point.x); try writer.float(point.y); try writer.float(point.z)
         }

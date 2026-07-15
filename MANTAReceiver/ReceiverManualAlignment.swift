@@ -2,6 +2,131 @@ import Foundation
 import MANTACore
 import simd
 
+/// Appends a rich per-solve record to a single growing JSON file so alignment
+/// attempts can be reviewed together. This is a debugging aid: it captures the
+/// exact landmark geometry (model vs world edge lengths and their per-edge scale
+/// ratios), the solved scale/RMS, and any warnings, which together reveal whether
+/// the correspondences are geometrically consistent.
+nonisolated enum ReceiverAlignmentDebugLog {
+    struct Entry: Codable {
+        var timestamp: String
+        var strategy: String
+        var seed: String
+        var pairedLandmarks: [String]
+        var landmarkRMSmm: Double?
+        var solverRMSmm: Double?
+        var solvedScale: Double?
+        var iterations: Int?
+        var accepted: Bool?
+        var sourceCloudPoints: Int?
+        var targetCloudPoints: Int?
+        var modelPoints: [String: [Double]]
+        var worldPoints: [String: [Double]]
+        var modelEdgeMM: [String: Double]
+        var worldEdgeMM: [String: Double]
+        var edgeScaleRatio: [String: Double]
+        var perLandmarkResidualMM: [String: Double]
+        var imageViewsPerLandmark: [String: Int]
+        var maxImageSpreadMM: [String: Double]
+        var warnings: [String]
+        var error: String?
+    }
+
+    static let fileName = "alignment_debug_log.json"
+
+    @discardableResult
+    static func record(
+        packageRoot: URL,
+        request: ReceiverManualAlignmentRequest,
+        outcome: ReceiverManualAlignmentOutcome?,
+        errorMessage: String?
+    ) -> URL? {
+        let paired = FiducialKind.allCases.filter {
+            request.sourceLandmarks[$0] != nil && request.targetLandmarks[$0] != nil
+        }
+        func encode(_ dict: [FiducialKind: SIMD3<Float>]) -> [String: [Double]] {
+            Dictionary(uniqueKeysWithValues: paired.compactMap { kind in
+                dict[kind].map { (kind.rawValue, [Double($0.x), Double($0.y), Double($0.z)]) }
+            })
+        }
+        var modelEdge = [String: Double](), worldEdge = [String: Double]()
+        var ratio = [String: Double]()
+        for i in paired.indices {
+            for j in (i + 1)..<paired.count {
+                let a = paired[i], b = paired[j]
+                guard let ma = request.sourceLandmarks[a], let mb = request.sourceLandmarks[b],
+                      let wa = request.targetLandmarks[a], let wb = request.targetLandmarks[b]
+                else { continue }
+                let key = "\(a.rawValue)-\(b.rawValue)"
+                let md = Double(simd_distance(ma, mb)), wd = Double(simd_distance(wa, wb))
+                modelEdge[key] = md * 1_000
+                worldEdge[key] = wd * 1_000
+                if md > 1e-6 { ratio[key] = wd / md }
+            }
+        }
+        var residual = [String: Double]()
+        if let outcome {
+            let t = outcome.result.transform
+            for kind in paired {
+                guard let m = request.sourceLandmarks[kind],
+                      let w = request.targetLandmarks[kind] else { continue }
+                let mapped = t * SIMD4<Float>(m, 1)
+                residual[kind.rawValue] = Double(
+                    simd_distance(SIMD3(mapped.x, mapped.y, mapped.z), w)) * 1_000
+            }
+        }
+        let diagnostics = outcome?.diagnostics
+        let entry = Entry(
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            strategy: request.strategy.rawValue,
+            seed: request.seed.rawValue,
+            pairedLandmarks: paired.map(\.rawValue),
+            landmarkRMSmm: diagnostics?.landmarkRMSMeters.map { $0 * 1_000 },
+            solverRMSmm: diagnostics?.solverRMSMeters.map { $0 * 1_000 },
+            solvedScale: diagnostics.map(\.scale),
+            iterations: diagnostics?.iterations,
+            accepted: diagnostics?.accepted,
+            sourceCloudPoints: diagnostics?.sourceCloudPoints,
+            targetCloudPoints: diagnostics?.targetCloudPoints,
+            modelPoints: encode(request.sourceLandmarks),
+            worldPoints: encode(request.targetLandmarks),
+            modelEdgeMM: modelEdge,
+            worldEdgeMM: worldEdge,
+            edgeScaleRatio: ratio,
+            perLandmarkResidualMM: residual,
+            imageViewsPerLandmark: Dictionary(uniqueKeysWithValues: paired.map {
+                ($0.rawValue, request.targetEvidenceCounts[$0] ?? 0)
+            }),
+            maxImageSpreadMM: Dictionary(uniqueKeysWithValues: paired.map {
+                ($0.rawValue, Double(request.targetMaximumSpreads[$0] ?? 0) * 1_000)
+            }),
+            warnings: diagnostics?.warnings ?? [],
+            error: errorMessage)
+
+        guard let url = logURL(packageRoot: packageRoot) else { return nil }
+        var entries = (try? Data(contentsOf: url)).flatMap {
+            try? JSONDecoder().decode([Entry].self, from: $0)
+        } ?? []
+        entries.append(entry)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(entries) {
+            try? data.write(to: url, options: .atomic)
+        }
+        print("[MANTA alignment debug] appended solve #\(entries.count) to \(url.path)")
+        return url
+    }
+
+    /// Logs live inside the package folder itself, under `logs/`, not in
+    /// Application Support - the package is the single place everything about a
+    /// capture lives.
+    private static func logURL(packageRoot: URL) -> URL? {
+        let dir = packageRoot.appendingPathComponent("logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(fileName)
+    }
+}
+
 nonisolated struct ReceiverManualImageEvidence: Codable, Sendable {
     var kind: String
     var observationID: UUID
@@ -122,7 +247,16 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
         if request.strategy == .icp {
             sourceCloud = ModelPointCloudLoader.load(
                 url: modelURL, maxPoints: 2_500)
-            targetCloud = alignmentTarget(bundle: bundle, maxPoints: 2_500)
+            // Prefer the dense, metric fused-depth cloud as the ICP target. It
+            // is thousands of points in the correct ARKit-world frame, so it
+            // constrains the whole photogrammetry surface and averages the
+            // reconstruction warp. The sparse LiDAR head mesh (often only a few
+            // hundred vertices) is a poor fallback used only when fusion yields
+            // too little to register against.
+            targetCloud = fusedDepthTarget(bundle: bundle, maxPoints: 4_000)
+            if targetCloud.count < 300 {
+                targetCloud = alignmentTarget(bundle: bundle, maxPoints: 2_500)
+            }
             guard sourceCloud.count >= 100 else { throw ReceiverManualAlignmentError.noSourceCloud }
             guard targetCloud.count >= 100 else { throw ReceiverManualAlignmentError.noTargetCloud }
             input.sourceCloud = sourceCloud
@@ -163,6 +297,18 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
            !orderedKinds.contains(.vertex) {
             warnings.append(
                 "Fit used only the 3 coplanar cardinal landmarks. Place Cz (vertex) on the images and model to constrain the off-plane rotation and prevent a mirror-flipped result.")
+        }
+        // With Cz placed there's enough redundancy (4 points) to tell whether
+        // one landmark disagrees with the other three; the solver already
+        // excludes it internally when fitting/seeding, but flag it here too so
+        // it's clear which landmark is likely mis-clicked rather than just that
+        // the residual is high.
+        if orderedKinds.count >= 4,
+           let robust = AbsoluteOrientation.fitRobust(
+             source: sourceLandmarks, target: targetLandmarks, scale: .estimate),
+           let excludedIndex = robust.excludedIndex {
+            warnings.append(
+                "\(orderedKinds[excludedIndex].rawValue) disagrees with the other placed landmarks and was excluded from the fit as a likely mis-click. Re-check its position in the image and on the model.")
         }
         if let landmarkRMS, landmarkRMS > 0.015 {
             warnings.append(String(format: "Landmark residual is %.1f mm.", landmarkRMS * 1_000))
@@ -239,116 +385,6 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
         return ReceiverManualAlignmentOutcome(result: result, diagnostics: diagnostics)
     }
 
-    static func finalize(
-        bundle: MANTAValidatedBundle,
-        outcome: ReceiverManualAlignmentOutcome,
-        ephemeralReconstruction: ReceiverEphemeralReconstruction? = nil
-    ) throws -> URL {
-        let fileManager = FileManager.default
-        let workspace = fileManager.temporaryDirectory
-            .appendingPathComponent("manta-alignment-\(UUID().uuidString.lowercased())", isDirectory: true)
-        try fileManager.createDirectory(at: workspace, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: workspace) }
-        let diagnosticsURL = workspace.appendingPathComponent("manual_alignment_diagnostics.json")
-        try MANTAJSON.makeEncoder().encode(outcome.diagnostics).write(to: diagnosticsURL, options: .atomic)
-
-        var capture = bundle.capture
-        var reconstruction = capture.reconstruction ?? MANTAReconstructionReference()
-        reconstruction.modelToWorld = flattened(outcome.result.transform)
-        reconstruction.worldCoordinateSystem = "arkit-world"
-        let ephemeralModelPath = ephemeralReconstruction.map {
-            "reconstruction/macos_\($0.detail.rawValue).usdz"
-        }
-        let ephemeralDiagnosticsPath = ephemeralReconstruction.map {
-            "reconstruction/macos_\($0.detail.rawValue)_diagnostics.json"
-        }
-        let ephemeralPosesPath = ephemeralReconstruction.map { _ in
-            "reconstruction/macos_poses.json"
-        }
-        if let ephemeralModelPath {
-            reconstruction.objectCaptureModelPath = ephemeralModelPath
-        }
-        capture.reconstruction = reconstruction
-
-        let replacementPaths = Set(
-            [diagnosticsPath, ephemeralModelPath, ephemeralDiagnosticsPath, ephemeralPosesPath]
-                .compactMap { $0 })
-        var files = bundle.manifest.files.compactMap { entry -> MANTABundleFileSource? in
-            guard entry.path != bundle.manifest.content.capture,
-                  entry.path != bundle.manifest.content.changeLog,
-                  !replacementPaths.contains(entry.path) else { return nil }
-            return MANTABundleFileSource(
-                path: entry.path,
-                sourceURL: bundle.rootDirectory.appendingPathComponent(entry.path),
-                mediaType: entry.mediaType,
-                role: entry.role)
-        }
-        files.append(MANTABundleFileSource(
-            path: diagnosticsPath,
-            sourceURL: diagnosticsURL,
-            mediaType: "application/json",
-            role: "manual-alignment-diagnostics"))
-        if let ephemeralReconstruction,
-           let ephemeralModelPath,
-           let ephemeralDiagnosticsPath,
-           let ephemeralPosesPath {
-            files.append(MANTABundleFileSource(
-                path: ephemeralModelPath,
-                sourceURL: ephemeralReconstruction.modelURL,
-                mediaType: "model/vnd.usdz+zip",
-                role: "photogrammetry-model-macos"))
-            files.append(MANTABundleFileSource(
-                path: ephemeralDiagnosticsPath,
-                sourceURL: ephemeralReconstruction.diagnosticsURL,
-                mediaType: "application/json",
-                role: "reconstruction-diagnostics"))
-            files.append(MANTABundleFileSource(
-                path: ephemeralPosesPath,
-                sourceURL: ephemeralReconstruction.posesURL,
-                mediaType: "application/json",
-                role: "reconstruction-camera-poses"))
-        }
-
-        let payloadBytes = files.reduce(Int64(0)) { partial, file in
-            partial + Int64((try? file.sourceURL.resourceValues(
-                forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        }
-        let classicZIPPayloadLimit: Int64 = 3_950_000_000
-        guard payloadBytes <= classicZIPPayloadLimit else {
-            throw ReceiverReconstructionError.archiveTooLarge(payloadBytes)
-        }
-
-        let now = Date()
-        var changeTargets = ["capture.json", diagnosticsPath]
-        changeTargets.append(contentsOf: [
-            ephemeralModelPath, ephemeralDiagnosticsPath, ephemeralPosesPath
-        ].compactMap { $0 })
-        let change = MANTAChangeRecord(
-            changedAt: now,
-            category: "manual-world-alignment",
-            summary: outcome.diagnostics.userOverrideAccepted
-                ? "Accepted a macOS landmark-guided \(outcome.diagnostics.strategy) model-to-world alignment with an explicit plausibility-warning override."
-                : ephemeralReconstruction == nil
-                    ? "Accepted a macOS landmark-guided \(outcome.diagnostics.strategy) model-to-world alignment."
-                    : "Force-saved the session preview model with an accepted macOS landmark-guided \(outcome.diagnostics.strategy) model-to-world alignment.",
-            targets: changeTargets)
-        let revision = ReceiverProcessedBundlePolicy.revision(
-            of: bundle, appending: change)
-        let request = MANTABundleFinalizationRequest(
-            capture: capture,
-            producer: producer(),
-            createdAt: bundle.manifest.createdAt,
-            finalizedAt: now,
-            bundleID: revision.bundleID,
-            parentBundleID: revision.rawParentBundleID,
-            changes: revision.changes,
-            files: files,
-            layoutPath: bundle.manifest.content.layout,
-            filenameTag: "processed-staging")
-        return try MANTABundleFinalizer().finalize(
-            request, in: try derivedOutputDirectory()).archiveURL
-    }
-
     private static func alignmentTarget(
         bundle: MANTAValidatedBundle, maxPoints: Int
     ) -> [SIMD3<Float>] {
@@ -371,6 +407,40 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
             }
         }
         return points
+    }
+
+    /// Dense metric ICP target built by fusing the confidence-filtered RGB-D
+    /// frames into a single ARKit-world point cloud. Returns an empty array when
+    /// no depth is available or fusion fails, so the caller can fall back to the
+    /// sparse LiDAR mesh.
+    private static func fusedDepthTarget(
+        bundle: MANTAValidatedBundle, maxPoints: Int
+    ) -> [SIMD3<Float>] {
+        let observations = bundle.capture.observations.filter { $0.depth != nil }
+        guard !observations.isEmpty else { return [] }
+        let reconstruction = bundle.capture.reconstruction
+        let headMeshURL = (reconstruction?.headCroppedLidarMeshPath).map {
+            bundle.rootDirectory.appendingPathComponent($0)
+        }
+        let fiducialCoordinates = (bundle.capture.fiducials ?? []).compactMap {
+            fiducial -> SIMD3<Float>? in
+            guard let point = fiducial.coordinate, point.count == 3 else { return nil }
+            return SIMD3(Float(point[0]), Float(point[1]), Float(point[2]))
+        }
+        let input = ReceiverDepthFusionInput(
+            rootDirectory: bundle.rootDirectory,
+            observations: observations,
+            declaredBounds: reconstruction?.headBoundingBox,
+            headMeshURL: headMeshURL,
+            fiducialCoordinates: fiducialCoordinates)
+        guard let cloud = try? ReceiverDepthFusion.fuse(input), !cloud.points.isEmpty else {
+            return []
+        }
+        guard cloud.points.count > maxPoints else { return cloud.points }
+        let stride = cloud.points.count / maxPoints
+        return cloud.points.enumerated().compactMap {
+            $0.offset % stride == 0 ? $0.element : nil
+        }
     }
 
     private static func scaleHint(
@@ -413,89 +483,5 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
             .flatMap { [Double($0.x), Double($0.y), Double($0.z), Double($0.w)] }
     }
 
-    private static func derivedOutputDirectory() throws -> URL {
-        let directory = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true)
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Derived", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
-    }
-
-    private static func producer() -> MANTAProducer {
-        let info = Bundle.main.infoDictionary ?? [:]
-        return MANTAProducer(
-            application: info["CFBundleDisplayName"] as? String ?? "MANTA Receiver",
-            version: info["CFBundleShortVersionString"] as? String ?? "0",
-            build: info["CFBundleVersion"] as? String ?? "0",
-            platform: "macOS",
-            operatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-            deviceModel: "Mac")
-    }
 }
 
-/// Writes reviewed world-space fiducials as a lineage-linked solved child. The
-/// imported/raw bundle remains immutable and its original placement evidence is
-/// retained alongside these reviewed coordinates.
-nonisolated enum ReceiverFiducialCorrectionWorkflow {
-    static func finalize(
-        bundle: MANTAValidatedBundle,
-        fiducials: [MANTAFiducialSolution]
-    ) throws -> URL {
-        var capture = bundle.capture
-        capture.fiducials = fiducials
-
-        let files = bundle.manifest.files.compactMap { entry -> MANTABundleFileSource? in
-            guard entry.path != bundle.manifest.content.capture,
-                  entry.path != bundle.manifest.content.changeLog else { return nil }
-            return MANTABundleFileSource(
-                path: entry.path,
-                sourceURL: bundle.rootDirectory.appendingPathComponent(entry.path),
-                mediaType: entry.mediaType,
-                role: entry.role)
-        }
-        let now = Date()
-        let change = MANTAChangeRecord(
-            changedAt: now,
-            category: "manual-fiducial-correction",
-            summary: "Reviewed and repositioned fiducials on macOS against metric 3D evidence.",
-            targets: ["capture.json"])
-        let revision = ReceiverProcessedBundlePolicy.revision(
-            of: bundle, appending: change)
-        let request = MANTABundleFinalizationRequest(
-            capture: capture,
-            producer: producer(),
-            createdAt: bundle.manifest.createdAt,
-            finalizedAt: now,
-            bundleID: revision.bundleID,
-            parentBundleID: revision.rawParentBundleID,
-            changes: revision.changes,
-            files: files,
-            layoutPath: bundle.manifest.content.layout,
-            filenameTag: "processed-staging")
-        return try MANTABundleFinalizer().finalize(
-            request, in: try derivedOutputDirectory()).archiveURL
-    }
-
-    private static func derivedOutputDirectory() throws -> URL {
-        let directory = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true)
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Derived", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
-    }
-
-    private static func producer() -> MANTAProducer {
-        let info = Bundle.main.infoDictionary ?? [:]
-        return MANTAProducer(
-            application: info["CFBundleDisplayName"] as? String ?? "MANTA Receiver",
-            version: info["CFBundleShortVersionString"] as? String ?? "0",
-            build: info["CFBundleVersion"] as? String ?? "0",
-            platform: "macOS",
-            operatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-            deviceModel: "Mac")
-    }
-}

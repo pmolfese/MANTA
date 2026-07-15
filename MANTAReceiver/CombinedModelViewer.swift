@@ -20,18 +20,40 @@ struct CombinedModelViewer: View {
     private let onFiducialsSaved: (([MANTAFiducialSolution]) -> Void)?
     private let fiducialSaveInProgress: Bool
     private let modelLandmarks: [ReceiverModelLandmark]
+    private let worldTargetLandmarks: [ReceiverModelLandmark]
     private let electrodesOverride: [MANTAElectrodeSolution]?
     private let electrodePlacementLabel: String?
     private let onWorldElectrodePointPicked: ((SIMD3<Double>) -> Void)?
     private let includesFiducialAnnotations: Bool
     private let autoShowsFusedDepth: Bool
 
-    @State private var showLiDAR: Bool
-    @State private var showPhotogrammetry: Bool
-    @State private var showFusedDepth = false
-    @State private var showAnnotations = true
-    @State private var lidarChoice: ReceiverLiDARChoice
-    @State private var lidarStyle = ReceiverLiDARStyle.wireframe
+    @ObservedObject private var display: ReceiverDisplaySettings
+
+    // Forwarders so the body keeps reading/writing plain names while the shared
+    // sidebar-driven settings object is the single source of truth.
+    private var showLiDAR: Bool {
+        get { display.showLiDAR } nonmutating set { display.showLiDAR = newValue }
+    }
+    private var showPhotogrammetry: Bool {
+        get { display.showPhotogrammetry } nonmutating set { display.showPhotogrammetry = newValue }
+    }
+    private var showFusedDepth: Bool {
+        get { display.showFusedDepth } nonmutating set { display.showFusedDepth = newValue }
+    }
+    private var showAnnotations: Bool {
+        get { display.showAnnotations } nonmutating set { display.showAnnotations = newValue }
+    }
+    private var lidarChoice: ReceiverLiDARChoice {
+        get { display.lidarChoice } nonmutating set { display.lidarChoice = newValue }
+    }
+    private var lidarStyle: ReceiverLiDARStyle {
+        get { display.lidarStyle } nonmutating set { display.lidarStyle = newValue }
+    }
+
+    // Stored so defaults can be applied to the shared settings on appear.
+    private let displayContextKey: String
+    private let annotationOnlyDefault: Bool
+
     @State private var selection: ReceiverSceneSelection?
     @State private var loadError: String?
     @State private var frameRequest = 0
@@ -42,10 +64,12 @@ struct CombinedModelViewer: View {
 
     init(
         bundle: MANTAValidatedBundle,
+        display: ReceiverDisplaySettings,
         modelToWorldOverride: simd_float4x4? = nil,
         photogrammetryURLOverride: URL? = nil,
         photogrammetryPlacementLabel: String? = nil,
         modelLandmarks: [ReceiverModelLandmark] = [],
+        worldTargetLandmarks: [ReceiverModelLandmark] = [],
         onPhotogrammetryPointPicked: ((SIMD3<Float>) -> Void)? = nil,
         electrodesOverride: [MANTAElectrodeSolution]? = nil,
         electrodePlacementLabel: String? = nil,
@@ -56,6 +80,7 @@ struct CombinedModelViewer: View {
         onFiducialsSaved: (([MANTAFiducialSolution]) -> Void)? = nil
     ) {
         self.bundle = bundle
+        self.display = display
         var assets = ReceiverSceneAssets(
             bundle: bundle, photogrammetryURLOverride: photogrammetryURLOverride)
         if photogrammetryURLOverride != nil {
@@ -66,6 +91,7 @@ struct CombinedModelViewer: View {
         self.assets = assets
         self.photogrammetryPlacementLabel = photogrammetryPlacementLabel
         self.modelLandmarks = modelLandmarks
+        self.worldTargetLandmarks = worldTargetLandmarks
         self.onPhotogrammetryPointPicked = onPhotogrammetryPointPicked
         self.electrodesOverride = electrodesOverride
         self.electrodePlacementLabel = electrodePlacementLabel
@@ -74,22 +100,37 @@ struct CombinedModelViewer: View {
         self.autoShowsFusedDepth = !annotationOnlyDefault
         self.onFiducialsSaved = onFiducialsSaved
         self.fiducialSaveInProgress = fiducialSaveInProgress
-        let initialLiDAR = assets.defaultLiDARChoice
-        _lidarChoice = State(initialValue: initialLiDAR ?? .fullEnvironment)
-        _showLiDAR = State(
-            initialValue: !annotationOnlyDefault
-                && photogrammetryPlacementLabel == nil && initialLiDAR != nil)
-        _showPhotogrammetry = State(
-            initialValue: !annotationOnlyDefault && assets.photogrammetryURL != nil
-                && (photogrammetryPlacementLabel != nil
-                    || initialLiDAR == nil || assets.modelToWorld != nil))
+        self.annotationOnlyDefault = annotationOnlyDefault
+        // One default configuration per scene context so switching bundle/model
+        // resets the toggles, but capability refreshes never clobber user choices.
+        let modelIdentity = photogrammetryURLOverride?.standardizedFileURL.path
+            ?? assets.photogrammetryURL?.standardizedFileURL.path ?? "none"
+        self.displayContextKey = "\(bundle.manifest.bundleID.uuidString)|\(modelIdentity)"
+            + "|\(photogrammetryPlacementLabel ?? "")|\(annotationOnlyDefault)"
+    }
+
+    /// Pushes current defaults and capabilities into the shared settings.
+    private func syncDisplay() {
+        display.configureDefaults(
+            key: displayContextKey,
+            defaultLiDARChoice: assets.defaultLiDARChoice,
+            photogrammetryAvailable: assets.photogrammetryURL != nil,
+            hasModelToWorld: assets.modelToWorld != nil,
+            isPlacement: photogrammetryPlacementLabel != nil,
+            annotationOnly: annotationOnlyDefault)
+        display.updateCapabilities(
+            defaultLiDARChoice: assets.defaultLiDARChoice,
+            lidarChoices: assets.lidarChoices,
+            photogrammetryAvailable: assets.photogrammetryURL != nil,
+            fusedDepthAvailable: fusedDepth != nil,
+            hasAnnotations: hasAnnotations,
+            annotationsSpatiallyValid: annotationsAreSpatiallyValid,
+            canOverlay: assets.canOverlay)
+        display.configureBoundsDefaults(
+            key: displayContextKey, declared: bundle.capture.reconstruction?.headBoundingBox)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            controls
-            Divider()
-
             ZStack {
                 if assets.hasAnySurface || hasAnnotations || fusedDepth != nil
                     || fusionState == .loading {
@@ -102,10 +143,14 @@ struct CombinedModelViewer: View {
                             showFusedDepth: showFusedDepth,
                             showAnnotations: showAnnotations && annotationsAreSpatiallyValid,
                             lidarChoice: lidarChoice,
-                            lidarStyle: lidarStyle),
+                            lidarStyle: lidarStyle,
+                            showHeadBoundingBox: display.showHeadBoundingBox,
+                            headBoundingBoxCenter: display.headBoundingBoxCenter,
+                            headBoundingBoxHalfExtent: display.headBoundingBoxHalfExtent),
                         electrodes: displayedElectrodes,
                         fiducials: displayedFiducials,
                         modelLandmarks: modelLandmarks,
+                        worldTargetLandmarks: worldTargetLandmarks,
                         selection: $selection,
                         loadError: $loadError,
                         frameRequest: frameRequest,
@@ -138,9 +183,25 @@ struct CombinedModelViewer: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                     .padding(12)
                 }
+
+                if onFiducialsSaved != nil {
+                    fiducialPlacementBar
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .padding(12)
+                }
             }
-        }
+        .onAppear { syncDisplay() }
+        .onChange(of: fusionState) { _, _ in syncDisplay() }
+        .onChange(of: display.frameRequestToken) { _, _ in frameRequest &+= 1 }
         .task(id: bundle.manifest.bundleID) {
+            syncDisplay()
+        }
+        // Keyed on the actual fusion inputs, not the bundle ID: the bundle ID no
+        // longer changes on in-place edits (reconstruction/alignment/bounding-box
+        // saves all mutate the same package), so keying on it here meant Fused
+        // Depth was computed once and never refreshed after an edit that changed
+        // what it should include - e.g. widening the head bounding box.
+        .task(id: fusionInputSignature) {
             if photogrammetryPlacementLabel == nil {
                 await loadDepthFusion()
             }
@@ -151,13 +212,11 @@ struct CombinedModelViewer: View {
         }
         .onChange(of: photogrammetryTransformSignature) { _, _ in
             selection = nil
-            if photogrammetryPlacementLabel != nil {
-                // Placement begins in isolated model space. Once a candidate
-                // model-to-world transform exists, show the metric reference
-                // surface so the user can actually judge the overlay.
-                showLiDAR = assets.modelToWorld != nil
-                    && assets.defaultLiDARChoice != nil
-            }
+            syncDisplay()
+            // The LiDAR toggle is left to the user. Forcing it on with every
+            // solve fought the control and re-showed the metric surface each
+            // time a candidate transform appeared.
+            //
             // The previous camera target is in the coordinate frame that was
             // just replaced. Keeping it makes a correctly transformed model
             // appear tiny and far away, with the old pick marker left behind.
@@ -165,126 +224,46 @@ struct CombinedModelViewer: View {
         }
     }
 
-    private var controls: some View {
-        HStack(spacing: 16) {
-            Toggle("LiDAR", isOn: lidarVisibility)
-                .disabled(assets.defaultLiDARChoice == nil)
-
-            if assets.lidarChoices.count > 1 {
-                Picker("LiDAR mesh", selection: $lidarChoice) {
-                    ForEach(assets.lidarChoices) { choice in
-                        Text(choice.rawValue).tag(choice)
+    /// Fiducial-placement menu for the Viewer's manual fiducial correction. It is
+    /// context-specific (needs `onFiducialsSaved`) so it stays on the scene rather
+    /// than in the global sidebar Display section.
+    @ViewBuilder private var fiducialPlacementBar: some View {
+        HStack(spacing: 10) {
+            Menu {
+                ForEach(FiducialKind.allCases) { kind in
+                    Button(kind.rawValue) {
+                        showAnnotations = true
+                        fiducialPlacementKind = kind
+                        selection = nil
                     }
                 }
-                .labelsHidden()
-                .frame(width: 150)
+            } label: {
+                Label(
+                    fiducialPlacementKind.map { "Place \($0.rawValue)" } ?? "Move Fiducial",
+                    systemImage: "mappin.and.ellipse")
             }
+            .fixedSize()
+            .disabled(!hasWorldPlacementSurface)
 
-            Picker("LiDAR style", selection: $lidarStyle) {
-                ForEach(ReceiverLiDARStyle.allCases) { style in
-                    Text(style.rawValue).tag(style)
+            if !fiducialOverrides.isEmpty {
+                Button("Save Fiducials", systemImage: "checkmark.circle") {
+                    onFiducialsSaved?(displayedFiducials)
+                    fiducialPlacementKind = nil
                 }
-            }
-            .labelsHidden()
-            .frame(width: 125)
-            .disabled(!showLiDAR)
-
-            Toggle("Photogrammetry", isOn: photogrammetryVisibility)
-                .disabled(assets.photogrammetryURL == nil)
-
-            Toggle("Fused Depth", isOn: $showFusedDepth)
-                .disabled(fusedDepth == nil)
-
-            if fusionState == .loading {
-                ProgressView()
-                    .controlSize(.small)
-                    .help("Fusing confidence-filtered RGB-D observations")
-            }
-
-            Toggle("Annotations", isOn: $showAnnotations)
-                .disabled(!hasAnnotations || !annotationsAreSpatiallyValid)
-
-            if hasAnnotations {
-                Button("Sensors Only", systemImage: "dot.circle.and.hand.point.up.left.fill") {
-                    showLiDAR = false
-                    showPhotogrammetry = false
-                    showFusedDepth = false
-                    showAnnotations = true
-                    selection = nil
-                    frameRequest &+= 1
+                .disabled(fiducialSaveInProgress)
+                Button("Discard", role: .cancel) {
+                    fiducialPlacementKind = nil
+                    fiducialOverrides.removeAll()
                 }
-                .help("Hide reconstructed surfaces and frame only sensor annotations")
+                .disabled(fiducialSaveInProgress)
+                if fiducialSaveInProgress { ProgressView().controlSize(.small) }
             }
-
-            if onFiducialsSaved != nil {
-                Menu {
-                    ForEach(FiducialKind.allCases) { kind in
-                        Button(kind.rawValue) {
-                            showAnnotations = true
-                            fiducialPlacementKind = kind
-                            selection = nil
-                        }
-                    }
-                } label: {
-                    Label(
-                        fiducialPlacementKind.map { "Place \($0.rawValue)" } ?? "Move Fiducial",
-                        systemImage: "mappin.and.ellipse")
-                }
-                .disabled(!hasWorldPlacementSurface)
-
-                if !fiducialOverrides.isEmpty {
-                    Button("Save Fiducials", systemImage: "checkmark.circle") {
-                        onFiducialsSaved?(displayedFiducials)
-                        fiducialPlacementKind = nil
-                    }
-                    .disabled(fiducialSaveInProgress)
-                    Button("Discard", role: .cancel) {
-                        fiducialPlacementKind = nil
-                        fiducialOverrides.removeAll()
-                    }
-                    .disabled(fiducialSaveInProgress)
-                    if fiducialSaveInProgress {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-            }
-
-            Spacer()
-
-            Button("Frame All", systemImage: "viewfinder") {
-                frameRequest &+= 1
-            }
-            .keyboardShortcut("f", modifiers: [])
         }
-        .toggleStyle(.switch)
         .controlSize(.small)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private var lidarVisibility: Binding<Bool> {
-        Binding(
-            get: { showLiDAR },
-            set: { enabled in
-                showLiDAR = enabled
-                if enabled, showPhotogrammetry, !assets.canOverlay {
-                    showPhotogrammetry = false
-                }
-                selection = nil
-            })
-    }
-
-    private var photogrammetryVisibility: Binding<Bool> {
-        Binding(
-            get: { showPhotogrammetry },
-            set: { enabled in
-                showPhotogrammetry = enabled
-                if enabled, showLiDAR, !assets.canOverlay {
-                    showLiDAR = false
-                }
-                selection = nil
-            })
-    }
 
     @ViewBuilder private var statusOverlay: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -407,10 +386,33 @@ struct CombinedModelViewer: View {
         return !(showPhotogrammetry && assets.modelToWorld == nil)
     }
 
+    /// Everything that actually determines the fused cloud's contents: which
+    /// frames feed it, the LiDAR head-mesh centroid fallback, and the declared
+    /// head bounding box. Recomputing when this changes (rather than once per
+    /// bundle identity) is what lets a saved bounding-box edit actually widen or
+    /// shrink what Fused Depth includes.
+    private var fusionInputSignature: Int {
+        guard let input = assets.fusionInput else { return 0 }
+        var hasher = Hasher()
+        hasher.combine(input.rootDirectory)
+        hasher.combine(input.observations.count)
+        for observation in input.observations { hasher.combine(observation.id) }
+        hasher.combine(input.headMeshURL)
+        if let bounds = input.declaredBounds {
+            hasher.combine(bounds.center.x)
+            hasher.combine(bounds.center.y)
+            hasher.combine(bounds.center.z)
+            hasher.combine(bounds.widthMeters)
+            hasher.combine(bounds.heightMeters)
+            hasher.combine(bounds.depthMeters)
+        }
+        return hasher.finalize()
+    }
+
     @MainActor
     private func loadDepthFusion() async {
-        guard fusedDepth == nil, let input = assets.fusionInput else {
-            if assets.fusionInput == nil { fusionState = .unavailable }
+        guard let input = assets.fusionInput else {
+            fusionState = .unavailable
             return
         }
         fusionState = .loading
@@ -486,13 +488,13 @@ private struct SelectionInspector: View {
     }
 }
 
-private enum ReceiverLiDARChoice: String, CaseIterable, Identifiable, Hashable {
+enum ReceiverLiDARChoice: String, CaseIterable, Identifiable, Hashable {
     case headRegion = "Head Region"
     case fullEnvironment = "Full Environment"
     var id: String { rawValue }
 }
 
-private enum ReceiverLiDARStyle: String, CaseIterable, Identifiable, Hashable {
+enum ReceiverLiDARStyle: String, CaseIterable, Identifiable, Hashable {
     case solid = "Solid"
     case wireframe = "Wireframe"
     case pointCloud = "Point Cloud"
@@ -506,6 +508,13 @@ private struct ReceiverSceneAssets {
     var modelToWorld: simd_float4x4?
     var fiducials: [MANTAFiducialSolution]
     var fusionInput: ReceiverDepthFusionInput?
+    /// The scene is only rebuilt when `sceneSignature` changes, which is
+    /// otherwise based on file *paths* - unchanged when an edit (e.g.
+    /// regenerating the LiDAR head crop after a bounding-box save) overwrites
+    /// the same path with new bytes. Folding each surface file's modification
+    /// date into the signature (via this) makes such in-place rewrites cause a
+    /// reload instead of silently showing stale, already-loaded geometry.
+    var contentRevision: Date?
 
     init(bundle: MANTAValidatedBundle, photogrammetryURLOverride: URL? = nil) {
         let reconstruction = bundle.capture.reconstruction
@@ -515,6 +524,9 @@ private struct ReceiverSceneAssets {
             root: bundle.rootDirectory, path: reconstruction?.headCroppedLidarMeshPath)
         photogrammetryURL = photogrammetryURLOverride ?? Self.existingURL(
             root: bundle.rootDirectory, path: reconstruction?.objectCaptureModelPath)
+        contentRevision = [fullLiDARURL, headLiDARURL, photogrammetryURL]
+            .compactMap { $0.flatMap(Self.modificationDate) }
+            .max()
         let captureFiducials = bundle.capture.fiducials ?? []
         fiducials = captureFiducials.isEmpty
             ? Self.rawFiducials(root: bundle.rootDirectory)
@@ -570,6 +582,10 @@ private struct ReceiverSceneAssets {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    private static func modificationDate(_ url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
     private static func rawFiducials(root: URL) -> [MANTAFiducialSolution] {
         let url = root.appendingPathComponent("acquisition/fiducial-placements.json")
         guard let data = try? Data(contentsOf: url),
@@ -597,6 +613,9 @@ private struct ReceiverSceneSettings: Hashable {
     var showAnnotations: Bool
     var lidarChoice: ReceiverLiDARChoice
     var lidarStyle: ReceiverLiDARStyle
+    var showHeadBoundingBox: Bool
+    var headBoundingBoxCenter: SIMD3<Float>
+    var headBoundingBoxHalfExtent: SIMD3<Float>
 }
 
 private struct ReceiverSceneSelection: Equatable {
@@ -772,6 +791,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
     let electrodes: [MANTAElectrodeSolution]
     let fiducials: [MANTAFiducialSolution]
     let modelLandmarks: [ReceiverModelLandmark]
+    let worldTargetLandmarks: [ReceiverModelLandmark]
     @Binding var selection: ReceiverSceneSelection?
     @Binding var loadError: String?
     let frameRequest: Int
@@ -815,14 +835,16 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
                     settings: settings,
                     electrodes: electrodes,
                     fiducials: fiducials,
-                    modelLandmarks: modelLandmarks)
+                    modelLandmarks: modelLandmarks,
+                    worldTargetLandmarks: worldTargetLandmarks)
                 view.scene = built.scene
                 context.coordinator.surfaceRoot = built.surfaceRoot
                 context.coordinator.photogrammetryRoot = built.photogrammetryRoot
                 context.coordinator.metricPlacementPoints = built.metricPlacementPoints
                 context.coordinator.sceneSignature = signature
                 context.coordinator.installSelectionMarker(selection)
-                setLoadError(nil)
+                setLoadError(built.partialLoadWarnings.isEmpty
+                    ? nil : built.partialLoadWarnings.joined(separator: " "))
 
                 if let previousCamera, context.coordinator.hasFramedOnce {
                     let camera = ReceiverSceneBuilder.cameraNode()
@@ -870,6 +892,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
         hasher.combine(assets.fullLiDARURL)
         hasher.combine(assets.headLiDARURL)
         hasher.combine(assets.photogrammetryURL)
+        hasher.combine(assets.contentRevision)
         hasher.combine(fusedDepth?.points.count)
         hasher.combine(fusedDepth?.acceptedDepthSamples)
         if let transform = assets.modelToWorld {
@@ -889,6 +912,7 @@ private struct ReceiverCombinedSceneView: NSViewRepresentable {
             hasher.combine(fiducial.coordinate)
         }
         for landmark in modelLandmarks { hasher.combine(landmark) }
+        for landmark in worldTargetLandmarks { hasher.combine(landmark) }
         return hasher.finalize()
     }
 
@@ -1126,6 +1150,12 @@ private enum ReceiverSceneCategory {
     static let photogrammetry = 1 << 2
     static let annotation = 1 << 3
     static let selection = 1 << 4
+    /// Diagnostic-only overlays (head bounding box cube, world-target-landmark
+    /// mismatch lines/spheres): useful to look at, but must never influence
+    /// where the camera thinks "the head" is - unlike real annotations
+    /// (electrodes/fiducials), which "Sensors Only" framing deliberately does
+    /// fit to.
+    static let diagnosticOverlay = 1 << 5
     static let selectable = lidar | fusedDepth | photogrammetry | annotation
 }
 
@@ -1154,6 +1184,11 @@ private enum ReceiverSceneBuilder {
         var surfaceRoot: SCNNode
         var photogrammetryRoot: SCNNode?
         var metricPlacementPoints: [ReceiverMetricPlacementPoint]
+        /// Non-fatal problems loading individual surfaces (e.g. a corrupted
+        /// LiDAR or photogrammetry file). One broken surface must not blank the
+        /// rest of the scene - fused depth, the other surface, annotations, and
+        /// the bounding box cube all still build regardless.
+        var partialLoadWarnings: [String] = []
     }
 
     static func build(
@@ -1162,7 +1197,8 @@ private enum ReceiverSceneBuilder {
         settings: ReceiverSceneSettings,
         electrodes: [MANTAElectrodeSolution],
         fiducials: [MANTAFiducialSolution],
-        modelLandmarks: [ReceiverModelLandmark]
+        modelLandmarks: [ReceiverModelLandmark],
+        worldTargetLandmarks: [ReceiverModelLandmark] = []
     ) throws -> Result {
         let scene = SCNScene()
         let surfaceRoot = SCNNode()
@@ -1170,18 +1206,25 @@ private enum ReceiverSceneBuilder {
         scene.rootNode.addChildNode(surfaceRoot)
         var photogrammetryRoot: SCNNode?
         var metricPlacementPoints = [ReceiverMetricPlacementPoint]()
+        var partialLoadWarnings = [String]()
 
         if settings.showLiDAR, let url = assets.url(for: settings.lidarChoice) {
-            guard let mesh = try ReceiverPLYMesh(contentsOf: url) else {
-                throw ReceiverSceneBuildError.invalidLiDAR(url.lastPathComponent)
+            do {
+                guard let mesh = try ReceiverPLYMesh(contentsOf: url) else {
+                    throw ReceiverSceneBuildError.invalidLiDAR(url.lastPathComponent)
+                }
+                let node = mesh.makeNode(style: settings.lidarStyle)
+                node.name = settings.lidarChoice.rawValue
+                surfaceRoot.addChildNode(node)
+                metricPlacementPoints.append(contentsOf: mesh.points.enumerated().map {
+                    ReceiverMetricPlacementPoint(
+                        point: $0.element, surface: .lidar, pointIndex: $0.offset)
+                })
+            } catch {
+                partialLoadWarnings.append(
+                    ReceiverSceneBuildError.invalidLiDAR(url.lastPathComponent).errorDescription
+                        ?? "Could not load LiDAR mesh.")
             }
-            let node = mesh.makeNode(style: settings.lidarStyle)
-            node.name = settings.lidarChoice.rawValue
-            surfaceRoot.addChildNode(node)
-            metricPlacementPoints.append(contentsOf: mesh.points.enumerated().map {
-                ReceiverMetricPlacementPoint(
-                    point: $0.element, surface: .lidar, pointIndex: $0.offset)
-            })
         }
 
         if settings.showFusedDepth, let fusedDepth {
@@ -1196,21 +1239,36 @@ private enum ReceiverSceneBuilder {
         }
 
         if settings.showPhotogrammetry, let url = assets.photogrammetryURL {
-            guard let loaded = try? SCNScene(url: url, options: nil) else {
-                throw ReceiverSceneBuildError.invalidPhotogrammetry(url.lastPathComponent)
+            if let loaded = try? SCNScene(url: url, options: nil) {
+                let holder = SCNNode()
+                holder.name = "Photogrammetry"
+                loaded.rootNode.childNodes.forEach { holder.addChildNode($0.clone()) }
+                if let transform = assets.modelToWorld { holder.simdTransform = transform }
+                markPhotogrammetryNodes(holder)
+                addModelLandmarks(modelLandmarks, to: holder)
+                surfaceRoot.addChildNode(holder)
+                photogrammetryRoot = holder
+            } else {
+                partialLoadWarnings.append(
+                    ReceiverSceneBuildError.invalidPhotogrammetry(url.lastPathComponent).errorDescription
+                        ?? "Could not load photogrammetry model.")
             }
-            let holder = SCNNode()
-            holder.name = "Photogrammetry"
-            loaded.rootNode.childNodes.forEach { holder.addChildNode($0.clone()) }
-            if let transform = assets.modelToWorld { holder.simdTransform = transform }
-            markPhotogrammetryNodes(holder)
-            addModelLandmarks(modelLandmarks, to: holder)
-            surfaceRoot.addChildNode(holder)
-            photogrammetryRoot = holder
         }
 
         if settings.showAnnotations {
             addAnnotations(electrodes: electrodes, fiducials: fiducials, to: surfaceRoot)
+        }
+        if !worldTargetLandmarks.isEmpty {
+            addWorldTargetLandmarks(
+                worldTargetLandmarks,
+                modelLandmarks: modelLandmarks,
+                modelToWorld: assets.modelToWorld,
+                to: surfaceRoot)
+        }
+        if settings.showHeadBoundingBox {
+            surfaceRoot.addChildNode(headBoundingBoxNode(
+                center: settings.headBoundingBoxCenter,
+                halfExtent: settings.headBoundingBoxHalfExtent))
         }
 
         let ambient = SCNLight()
@@ -1234,7 +1292,8 @@ private enum ReceiverSceneBuilder {
             scene: scene,
             surfaceRoot: surfaceRoot,
             photogrammetryRoot: photogrammetryRoot,
-            metricPlacementPoints: metricPlacementPoints)
+            metricPlacementPoints: metricPlacementPoints,
+            partialLoadWarnings: partialLoadWarnings)
     }
 
     static func cameraNode() -> SCNNode {
@@ -1253,9 +1312,21 @@ private enum ReceiverSceneBuilder {
         guard let bounds = worldBounds(of: surfaceRoot) else { return false }
         let center = (bounds.min + bounds.max) / 2
         let diagonal = simd_length(bounds.max - bounds.min)
-        let distance = max(0.30, diagonal * 1.55)
+        let radius = max(0.05, diagonal / 2)
         let camera = cameraNode()
-        camera.simdPosition = center + SIMD3(0, diagonal * 0.12, distance)
+
+        // Fit the bounding sphere within BOTH the vertical and horizontal fields
+        // of view for the actual viewport aspect. The previous fixed-multiplier
+        // distance ignored aspect, so a tall/narrow panel (like the new equal-
+        // width Align panels) cropped the model and made orbit pivot off-screen.
+        let verticalFOV = Float(camera.camera?.fieldOfView ?? 42) * .pi / 180
+        let aspect = Float(max(view.bounds.width, 1) / max(view.bounds.height, 1))
+        let horizontalFOV = 2 * atan(tan(verticalFOV / 2) * aspect)
+        let fitVertical = radius / max(sin(verticalFOV / 2), 0.05)
+        let fitHorizontal = radius / max(sin(horizontalFOV / 2), 0.05)
+        let distance = max(0.30, max(fitVertical, fitHorizontal) * 1.15)
+
+        camera.simdPosition = center + SIMD3(0, radius * 0.12, distance)
         camera.look(at: SCNVector3(center))
         camera.camera?.zFar = Double(max(10, distance * 20))
         view.scene?.rootNode.addChildNode(camera)
@@ -1268,8 +1339,17 @@ private enum ReceiverSceneBuilder {
         var minimum = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var maximum = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         var found = false
+        // Real content (surfaces, electrode/fiducial annotations - "Sensors
+        // Only" framing depends on the latter) sets where the camera fits.
+        // Diagnostic-only overlays and the transient selection marker must not:
+        // the head bounding box cube (before its declared value is seeded, or
+        // while being edited) and the world-target mismatch lines (which, by
+        // definition, stretch away from the head exactly when alignment is
+        // bad) previously dragged the orbit's pivot off the head entirely.
+        let excludedCategories = ReceiverSceneCategory.diagnosticOverlay
+            | ReceiverSceneCategory.selection
         root.enumerateChildNodes { node, _ in
-            guard node.geometry != nil else { return }
+            guard node.geometry != nil, node.categoryBitMask & excludedCategories == 0 else { return }
             let box = node.boundingBox
             let corners = [
                 SIMD3(Float(box.min.x), Float(box.min.y), Float(box.min.z)),
@@ -1315,6 +1395,93 @@ private enum ReceiverSceneBuilder {
             node.simdPosition = landmark.point
             root.addChildNode(node)
         }
+    }
+
+    /// Renders the resolved image-click world points (cyan) attached directly to
+    /// `root` in world space - unlike the pink model landmarks, these do not move
+    /// when the photogrammetry model reposes. When a candidate `modelToWorld`
+    /// transform exists, also draws a line from each model landmark's transformed
+    /// world position to its matching world-target point, color-coded by residual,
+    /// so an alignment problem is visible instead of only reported as an RMS
+    /// number.
+    private static func addWorldTargetLandmarks(
+        _ landmarks: [ReceiverModelLandmark],
+        modelLandmarks: [ReceiverModelLandmark],
+        modelToWorld: simd_float4x4?,
+        to root: SCNNode
+    ) {
+        for landmark in landmarks {
+            let sphere = SCNSphere(radius: 0.0055)
+            sphere.segmentCount = 18
+            let material = SCNMaterial()
+            material.diffuse.contents = NSColor.systemCyan
+            material.emission.contents = NSColor.systemCyan.withAlphaComponent(0.6)
+            sphere.materials = [material]
+            let node = SCNNode(geometry: sphere)
+            node.name = "\(landmark.kind.rawValue) (image target)"
+            node.categoryBitMask = ReceiverSceneCategory.diagnosticOverlay
+            node.simdPosition = landmark.point
+            root.addChildNode(node)
+
+            guard let modelToWorld,
+                  let paired = modelLandmarks.first(where: { $0.kind == landmark.kind })
+            else { continue }
+            let mapped = modelToWorld * SIMD4<Float>(paired.point, 1)
+            let modelWorldPoint = SIMD3<Float>(mapped.x, mapped.y, mapped.z)
+            let residual = simd_distance(modelWorldPoint, landmark.point)
+            root.addChildNode(residualLine(
+                from: modelWorldPoint, to: landmark.point, residual: residual))
+        }
+    }
+
+    /// A thin line between a model landmark's world position and its matching
+    /// image-click target, colored green/yellow/red by how far apart they are.
+    private static func residualLine(
+        from: SIMD3<Float>, to: SIMD3<Float>, residual: Float
+    ) -> SCNNode {
+        let color: NSColor = residual <= 0.015 ? .systemGreen
+            : residual <= 0.030 ? .systemYellow : .systemRed
+        let vertices = [SCNVector3(from), SCNVector3(to)]
+        let source = SCNGeometrySource(vertices: vertices)
+        let indices: [Int32] = [0, 1]
+        let element = SCNGeometryElement(
+            data: Data(bytes: indices, count: indices.count * MemoryLayout<Int32>.size),
+            primitiveType: .line,
+            primitiveCount: 1,
+            bytesPerIndex: MemoryLayout<Int32>.size)
+        let geometry = SCNGeometry(sources: [source], elements: [element])
+        let material = SCNMaterial()
+        material.diffuse.contents = color
+        material.emission.contents = color
+        material.lightingModel = .constant
+        geometry.materials = [material]
+        let node = SCNNode(geometry: geometry)
+        node.categoryBitMask = ReceiverSceneCategory.diagnosticOverlay
+        return node
+    }
+
+    /// A wireframe cube showing the head bounding box that gates what counts as
+    /// "the head" when building Fused Depth and the LiDAR-crop alignment
+    /// fallback - editable from the sidebar so a box that clips real surface
+    /// (an ear, the crown) can be caught by eye and widened.
+    private static func headBoundingBoxNode(
+        center: SIMD3<Float>, halfExtent: SIMD3<Float>
+    ) -> SCNNode {
+        let box = SCNBox(
+            width: CGFloat(halfExtent.x * 2), height: CGFloat(halfExtent.y * 2),
+            length: CGFloat(halfExtent.z * 2), chamferRadius: 0)
+        let material = SCNMaterial()
+        material.diffuse.contents = NSColor.systemOrange
+        material.emission.contents = NSColor.systemOrange
+        material.lightingModel = .constant
+        material.fillMode = .lines
+        material.isDoubleSided = true
+        box.materials = [material]
+        let node = SCNNode(geometry: box)
+        node.name = "Head bounding box"
+        node.categoryBitMask = ReceiverSceneCategory.diagnosticOverlay
+        node.simdPosition = center
+        return node
     }
 
     private static func addAnnotations(
@@ -1363,13 +1530,17 @@ private enum ReceiverSceneBuilder {
 }
 
 @MainActor
-private struct ReceiverPLYMesh {
+struct ReceiverPLYMesh {
     let points: [SIMD3<Float>]
     let vertices: [SCNVector3]
     let normals: [SCNVector3]
     let indices: [UInt32]
 
-    init?(contentsOf url: URL) throws {
+    // Parsing raw PLY bytes touches no AppKit/SceneKit state, so this needs no
+    // main-actor isolation - callers off the main thread (e.g. background
+    // bounding-box recrop) can construct one directly. Only `makeNode` builds
+    // actual SceneKit UI objects and stays main-actor.
+    nonisolated init?(contentsOf url: URL) throws {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard let marker = data.range(of: Data("end_header\n".utf8)) else { return nil }
         let header = String(decoding: data[..<marker.lowerBound], as: UTF8.self)

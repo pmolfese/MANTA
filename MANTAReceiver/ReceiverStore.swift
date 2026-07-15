@@ -49,7 +49,6 @@ final class ReceiverStore: ObservableObject {
     func importArchive(from sourceURL: URL) async {
         guard !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
               !isSavingElectrodes else { return }
-        let previousRoot = bundle?.rootDirectory
         isImporting = true
         errorMessage = nil
 
@@ -74,9 +73,6 @@ final class ReceiverStore: ObservableObject {
             electrodeModelMesh = nil
             electrodeDetectionProgress = 0
             electrodeDetectionStage = ""
-            if let previousRoot {
-                Self.removeImportedWorkspace(containing: previousRoot)
-            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -175,6 +171,27 @@ final class ReceiverStore: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
             alignmentStage = "Alignment export failed"
+        }
+    }
+
+    /// Saves an edited head bounding box in place. Returns whether it succeeded
+    /// so the sidebar can clear its "modified" state only on success.
+    @discardableResult
+    func updateHeadBoundingBox(_ boundingBox: HeadBoundingBox) async -> Bool {
+        guard !isApplyingAlignment, !isReconstructing, !isDetectingElectrodes,
+              !isSavingElectrodes, let sourceBundle = bundle else { return false }
+        do {
+            let updated = try await Task.detached(priority: .userInitiated) {
+                try ReceiverProcessedPackage.updateHeadBoundingBox(
+                    bundle: sourceBundle, boundingBox: boundingBox)
+            }.value
+            bundle = updated.bundle
+            importedArchiveURL = updated.packageURL
+            processedPackageURL = updated.packageURL
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -487,9 +504,15 @@ final class ReceiverStore: ObservableObject {
             modelToWorld: transform)
     }
 
+    /// Everything about a capture lives in the one folder the user gave us.
+    /// A folder is opened and edited directly, in place - nothing is copied into
+    /// Application Support. Only a legacy `.manta`/`.manta.zip` archive or a
+    /// pre-share iPad working-session folder needs a one-time conversion, and
+    /// that conversion writes a sibling folder next to the source (not into any
+    /// app-managed location) which then becomes the live package for every
+    /// future edit.
     private nonisolated static func persistAndValidate(
-        _ sourceURL: URL,
-        copyArchive: Bool = true
+        _ sourceURL: URL
     ) throws -> (bundle: MANTAValidatedBundle, archiveURL: URL) {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
@@ -497,83 +520,51 @@ final class ReceiverStore: ObservableObject {
             throw ReceiverImportError.unsupportedExtension
         }
 
-        let isRawSessionDirectory = isDirectory.boolValue
-            && fileManager.fileExists(atPath: sourceURL.appendingPathComponent("session.json").path)
-            && !fileManager.fileExists(
-                atPath: sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename).path)
         if isDirectory.boolValue {
             if ReceiverProcessedPackage.isPackage(sourceURL) {
                 return (try ReceiverProcessedPackage.load(at: sourceURL), sourceURL)
             }
             let manifestURL = sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename)
-            if !fileManager.fileExists(atPath: manifestURL.path) && !isRawSessionDirectory {
+            let isRawSessionDirectory = fileManager.fileExists(
+                atPath: sourceURL.appendingPathComponent("session.json").path)
+                && !fileManager.fileExists(atPath: manifestURL.path)
+            if isRawSessionDirectory {
+                let destination = siblingDestination(for: sourceURL, tag: "recovered")
+                let recovered = try MANTARawSessionRecovery().recoverDirectoryPackage(
+                    from: sourceURL, to: destination, producer: recoveryProducer())
+                return (recovered.bundle, recovered.packageURL)
+            }
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
                 throw ReceiverImportError.notALogicalBundle
             }
-        } else {
-            guard sourceURL.pathExtension.lowercased() == "manta" ||
-                    sourceURL.lastPathComponent.lowercased().hasSuffix(".manta.zip") else {
-                throw ReceiverImportError.unsupportedExtension
-            }
+            let bundle = try MANTABundleValidator().validate(directory: sourceURL)
+            return (bundle, sourceURL)
         }
 
-        let applicationSupport = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let imports = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Imports", isDirectory: true)
-        try fileManager.createDirectory(at: imports, withIntermediateDirectories: true)
-
-        let receipt = imports.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
-        try fileManager.createDirectory(at: receipt, withIntermediateDirectories: false)
-        do {
-            let contents = receipt.appendingPathComponent("Contents", isDirectory: true)
-            if isDirectory.boolValue {
-                if isRawSessionDirectory {
-                    let recovered = try MANTARawSessionRecovery().recoverDirectoryPackage(
-                        from: sourceURL,
-                        to: contents,
-                        producer: recoveryProducer())
-                    return (recovered.bundle, recovered.packageURL)
-                }
-                // Copy the extracted bundle in, then validate the copy in place so
-                // the imported record survives if the source folder is later moved.
-                try fileManager.copyItem(at: sourceURL, to: contents)
-                let bundle = try MANTABundleValidator().validate(directory: contents)
-                return (bundle, contents)
-            }
-            let archive: URL
-            if copyArchive {
-                archive = receipt.appendingPathComponent("capture.manta")
-                try fileManager.copyItem(at: sourceURL, to: archive)
-            } else {
-                archive = sourceURL
-            }
-            let bundle = try MANTAArchiveImporter().importBundle(at: archive, to: contents)
-            return (bundle, archive)
-        } catch {
-            try? fileManager.removeItem(at: receipt)
-            throw error
+        guard sourceURL.pathExtension.lowercased() == "manta" ||
+                sourceURL.lastPathComponent.lowercased().hasSuffix(".manta.zip") else {
+            throw ReceiverImportError.unsupportedExtension
         }
+        let destination = siblingDestination(for: sourceURL, tag: nil)
+        let bundle = try MANTAArchiveImporter().importBundle(at: sourceURL, to: destination)
+        return (bundle, destination)
     }
 
-    private nonisolated static func removeImportedWorkspace(containing root: URL) {
+    /// A not-yet-existing folder next to `source`, named after it. Used only for
+    /// the one-time conversion of a legacy zip or a raw session folder into a
+    /// live package; the source item itself is left untouched.
+    private nonisolated static func siblingDestination(for source: URL, tag: String?) -> URL {
         let fileManager = FileManager.default
-        guard let applicationSupport = try? fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false) else { return }
-        let imports = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Imports", isDirectory: true)
-            .standardizedFileURL
-        let receipt = root.standardizedFileURL.deletingLastPathComponent()
-        guard receipt.deletingLastPathComponent() == imports else { return }
-        try? fileManager.removeItem(at: receipt)
+        let parent = source.deletingLastPathComponent()
+        let base = source.deletingPathExtension().lastPathComponent
+        let name = tag.map { "\(base)-\($0)" } ?? base
+        var candidate = parent.appendingPathComponent("\(name).manta", isDirectory: true)
+        var suffix = 2
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = parent.appendingPathComponent("\(name)-\(suffix).manta", isDirectory: true)
+            suffix += 1
+        }
+        return candidate
     }
 
     private nonisolated static func recoveryProducer() -> MANTAProducer {
