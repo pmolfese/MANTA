@@ -216,9 +216,16 @@ private struct ReceiverReconstructionView: View {
     let bundle: MANTAValidatedBundle
     @State private var detail: ReceiverPhotogrammetryDetail = .full
     @State private var outputMode = ReceiverReconstructionOutputMode.derivedBundle
+    @State private var inputMode = ReceiverPhotogrammetryInputMode.imagesOnly
 
     private var estimate: ReceiverReconstructionEstimate? {
         store.reconstructionEstimate(for: detail)
+    }
+
+    /// Depth-guided reconstruction is only offered when at least one frame has a
+    /// saved depth map to hand Object Capture.
+    private var hasDepthObservations: Bool {
+        bundle.capture.observations.contains { $0.depth != nil }
     }
 
     var body: some View {
@@ -255,6 +262,23 @@ private struct ReceiverReconstructionView: View {
                      : "Creates a mutable PROCESSED package from RAW, then writes only files changed by later edits.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Picker("Inputs", selection: $inputMode) {
+                    ForEach(ReceiverPhotogrammetryInputMode.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(store.isReconstructing || !hasDepthObservations)
+
+                Text(hasDepthObservations
+                     ? inputMode.explanation
+                     : "This capture has no saved depth frames, so only images-only reconstruction is available.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onChange(of: hasDepthObservations) { _, hasDepth in
+                if !hasDepth { inputMode = .imagesOnly }
             }
 
             Section("Preflight") {
@@ -316,7 +340,8 @@ private struct ReceiverReconstructionView: View {
                             : "Reconstruct \(detail.title) Model",
                         systemImage: "cube.transparent"
                     ) {
-                        store.startReconstruction(detail: detail, outputMode: outputMode)
+                        store.startReconstruction(
+                            detail: detail, outputMode: outputMode, inputMode: inputMode)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canStart)

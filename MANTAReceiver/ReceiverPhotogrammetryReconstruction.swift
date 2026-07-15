@@ -9,6 +9,43 @@ enum ReceiverReconstructionOutputMode: String, CaseIterable, Identifiable, Senda
     var id: String { rawValue }
 }
 
+/// How the images are handed to Object Capture. `imagesOnly` feeds a folder of
+/// RGB images and lets `PhotogrammetrySession` solve its own arbitrary-scale
+/// structure-from-motion. `depthGuided` instead feeds `PhotogrammetrySample`s
+/// carrying each frame's LiDAR depth (which gives the reconstruction real metric
+/// scale) and a per-frame gravity vector derived from the stored camera pose.
+enum ReceiverPhotogrammetryInputMode: String, CaseIterable, Identifiable, Sendable {
+    case imagesOnly = "Images only"
+    case depthGuided = "Depth-guided"
+
+    var id: String { rawValue }
+    var title: String { rawValue }
+    var usesDepth: Bool { self == .depthGuided }
+
+    var explanation: String {
+        switch self {
+        case .imagesOnly:
+            return "Object Capture solves geometry from the RGB images alone. The model comes out in an arbitrary scale and pose that the Align step must recover."
+        case .depthGuided:
+            return "Feeds each frame's LiDAR depth and a gravity vector to Object Capture, so the model comes out metric and gravity-oriented. Needs frames with saved depth."
+        }
+    }
+}
+
+/// One frame's inputs for a depth-guided `PhotogrammetrySample`, resolved to
+/// workspace-local file URLs so the runner never has to reach back into the
+/// bundle. `depthURL` is nil when a frame has no usable depth; that frame still
+/// contributes its RGB image and gravity.
+struct ReceiverReconstructionSampleDescriptor: Sendable {
+    var sampleID: Int
+    var imageURL: URL
+    var depthURL: URL?
+    var depthWidth: Int
+    var depthHeight: Int
+    var depthCompression: String
+    var cameraToWorld: [Double]
+}
+
 enum ReceiverReconstructionLogLevel: String, Codable, Sendable {
     case info
     case warning
@@ -77,6 +114,9 @@ struct ReceiverReconstructionPreparation: Sendable {
     var detail: ReceiverPhotogrammetryDetail
     var imageCount: Int
     var sourceImageBytes: Int64
+    var inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
+    /// Populated only for `depthGuided`; empty otherwise.
+    var sampleDescriptors: [ReceiverReconstructionSampleDescriptor] = []
 }
 
 struct ReceiverPhotogrammetryRun: Sendable {
@@ -107,6 +147,8 @@ struct ReceiverEphemeralReconstruction: Sendable {
 
 struct ReceiverMacReconstructionDiagnostics: Codable, Sendable {
     var detail: String
+    var inputMode: String = ReceiverPhotogrammetryInputMode.imagesOnly.rawValue
+    var depthGuidedSampleCount: Int = 0
     var inputImageCount: Int
     var sourceImageBytes: Int64
     var startedAt: Date
@@ -178,8 +220,19 @@ final class ReceiverPhotogrammetryRunner {
         var configuration = PhotogrammetrySession.Configuration()
         configuration.sampleOrdering = .sequential
         configuration.featureSensitivity = .high
-        let active = try PhotogrammetrySession(
-            input: preparation.inputDirectory, configuration: configuration)
+        let active: PhotogrammetrySession
+        if preparation.inputMode.usesDepth, !preparation.sampleDescriptors.isEmpty {
+            let withDepth = preparation.sampleDescriptors.count(where: { $0.depthURL != nil })
+            active = try PhotogrammetrySession(
+                input: ReceiverPhotogrammetrySampleSequence(
+                    descriptors: preparation.sampleDescriptors),
+                configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.sampleDescriptors.count) depth-guided samples (\(withDepth) carrying LiDAR depth) at \(preparation.detail.title) detail.")
+        } else {
+            active = try PhotogrammetrySession(
+                input: preparation.inputDirectory, configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
+        }
         session = active
         defer { session = nil }
 
@@ -191,7 +244,6 @@ final class ReceiverPhotogrammetryRunner {
         var automaticDownsampling = false
         var currentProgress = 0.0
         progress(0, "Starting Object Capture")
-        log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
         try active.process(requests: [request])
 
         do {
@@ -268,7 +320,8 @@ nonisolated enum ReceiverReconstructionWorkflow {
 
     static func prepare(
         bundle: MANTAValidatedBundle,
-        detail: ReceiverPhotogrammetryDetail
+        detail: ReceiverPhotogrammetryDetail,
+        inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) throws -> ReceiverReconstructionPreparation {
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReceiverReconstructionError.noImages }
@@ -289,8 +342,9 @@ nonisolated enum ReceiverReconstructionWorkflow {
         try fileManager.createDirectory(at: input, withIntermediateDirectories: true)
 
         var poses = [PoseRecord]()
+        var sampleDescriptors = [ReceiverReconstructionSampleDescriptor]()
         do {
-            for item in imageSources(bundle: bundle) {
+            for (index, item) in imageSources(bundle: bundle).enumerated() {
                 let extensionName = item.url.pathExtension.lowercased()
                 let filename = "\(item.observation.id.uuidString.lowercased()).\(extensionName)"
                 let destination = input.appendingPathComponent(filename)
@@ -305,11 +359,58 @@ nonisolated enum ReceiverReconstructionWorkflow {
                     cameraToWorld: item.observation.cameraToWorld,
                     intrinsics: item.observation.intrinsics,
                     imageOrientation: item.observation.imageOrientation))
+
+                guard inputMode.usesDepth else { continue }
+                // Link the frame's depth alongside its image so the runner is
+                // self-contained. A frame missing usable depth still yields an
+                // RGB+gravity sample, so record it with a nil depth URL.
+                var depthURL: URL?
+                var depthWidth = 0
+                var depthHeight = 0
+                var depthCompression = "none"
+                if let depth = item.observation.depth,
+                   depth.scalarType.lowercased() == "float32",
+                   depth.units == .meters,
+                   depth.byteOrder.lowercased() == "little-endian",
+                   depth.layout.lowercased().replacingOccurrences(of: "-", with: "")
+                       .hasPrefix("rowmajor"),
+                   depth.imageMapping.lowercased() == "resolution-scale" {
+                    let source = bundle.rootDirectory.appendingPathComponent(depth.path)
+                    if fileManager.fileExists(atPath: source.path) {
+                        let depthFilename = "\(item.observation.id.uuidString.lowercased()).depth"
+                        let depthDestination = input.appendingPathComponent(depthFilename)
+                        do {
+                            try fileManager.linkItem(at: source, to: depthDestination)
+                        } catch {
+                            try? fileManager.copyItem(at: source, to: depthDestination)
+                        }
+                        if fileManager.fileExists(atPath: depthDestination.path) {
+                            depthURL = depthDestination
+                            depthWidth = depth.dimensions.width
+                            depthHeight = depth.dimensions.height
+                            depthCompression = depth.compression
+                        }
+                    }
+                }
+                sampleDescriptors.append(ReceiverReconstructionSampleDescriptor(
+                    sampleID: index,
+                    imageURL: destination,
+                    depthURL: depthURL,
+                    depthWidth: depthWidth,
+                    depthHeight: depthHeight,
+                    depthCompression: depthCompression,
+                    cameraToWorld: item.observation.cameraToWorld))
             }
             let posesURL = workspace.appendingPathComponent("macos-poses.json")
             let encoder = MANTAJSON.makeEncoder()
             try encoder.encode(poses).write(to: posesURL, options: .atomic)
+            // A depth-guided run with no frame carrying usable depth would be
+            // identical to images-only but mislabeled; fall back explicitly.
+            let resolvedMode: ReceiverPhotogrammetryInputMode =
+                inputMode.usesDepth && sampleDescriptors.contains { $0.depthURL != nil }
+                    ? .depthGuided : .imagesOnly
             let stem = "macos_\(detail.rawValue)"
+                + (resolvedMode.usesDepth ? "_depthguided" : "")
             return ReceiverReconstructionPreparation(
                 workspace: workspace,
                 inputDirectory: input,
@@ -318,7 +419,9 @@ nonisolated enum ReceiverReconstructionWorkflow {
                 diagnosticsURL: workspace.appendingPathComponent("\(stem)_diagnostics.json"),
                 detail: detail,
                 imageCount: poses.count,
-                sourceImageBytes: estimate.sourceImageBytes)
+                sourceImageBytes: estimate.sourceImageBytes,
+                inputMode: resolvedMode,
+                sampleDescriptors: resolvedMode.usesDepth ? sampleDescriptors : [])
         } catch {
             try? fileManager.removeItem(at: workspace)
             throw error
@@ -381,6 +484,8 @@ nonisolated enum ReceiverReconstructionWorkflow {
             forKeys: [.fileSizeKey]).fileSize) ?? 0)
         let diagnostics = ReceiverMacReconstructionDiagnostics(
             detail: preparation.detail.rawValue,
+            inputMode: preparation.inputMode.rawValue,
+            depthGuidedSampleCount: preparation.sampleDescriptors.count(where: { $0.depthURL != nil }),
             inputImageCount: preparation.imageCount,
             sourceImageBytes: preparation.sourceImageBytes,
             startedAt: run.startedAt,

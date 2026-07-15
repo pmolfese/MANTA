@@ -87,7 +87,8 @@ final class ReceiverStore: ObservableObject {
 
     func startReconstruction(
         detail: ReceiverPhotogrammetryDetail,
-        outputMode: ReceiverReconstructionOutputMode
+        outputMode: ReceiverReconstructionOutputMode,
+        inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) {
         guard !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
               let sourceBundle = bundle else { return }
@@ -95,10 +96,11 @@ final class ReceiverStore: ObservableObject {
         reconstructionLog.removeAll(keepingCapacity: true)
         appendReconstructionLog(
             .info,
-            "Requested \(detail.title) reconstruction · \(outputMode.rawValue).")
+            "Requested \(detail.title) reconstruction · \(outputMode.rawValue) · \(inputMode.title).")
         reconstructionTask = Task { [weak self] in
             await self?.performReconstruction(
-                bundle: sourceBundle, detail: detail, outputMode: outputMode)
+                bundle: sourceBundle, detail: detail,
+                outputMode: outputMode, inputMode: inputMode)
         }
     }
 
@@ -346,7 +348,8 @@ final class ReceiverStore: ObservableObject {
     private func performReconstruction(
         bundle sourceBundle: MANTAValidatedBundle,
         detail: ReceiverPhotogrammetryDetail,
-        outputMode: ReceiverReconstructionOutputMode
+        outputMode: ReceiverReconstructionOutputMode,
+        inputMode: ReceiverPhotogrammetryInputMode
     ) async {
         isReconstructing = true
         reconstructionCanCancel = true
@@ -373,8 +376,13 @@ final class ReceiverStore: ObservableObject {
         do {
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try ReceiverReconstructionWorkflow.prepare(
-                    bundle: sourceBundle, detail: detail)
+                    bundle: sourceBundle, detail: detail, inputMode: inputMode)
             }.value
+            if inputMode.usesDepth, prepared.inputMode != .depthGuided {
+                appendReconstructionLog(
+                    .warning,
+                    "Depth-guided reconstruction was requested, but no frames carried usable depth. Falling back to images-only.")
+            }
             preparation = prepared
             try Task.checkCancellation()
             updateReconstructionProgress(0.03, stage: "Prepared reconstruction inputs")
