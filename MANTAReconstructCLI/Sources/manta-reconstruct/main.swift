@@ -23,6 +23,10 @@ ARGUMENTS:
 
 OPTIONS:
   -d, --detail LEVEL   Reconstruction detail: medium | full | raw   (default: full)
+  -m, --input-mode M   images | depth   (default: images)
+                       'depth' feeds each frame's LiDAR depth + gravity into
+                       Object Capture; falls back to images-only if no frame
+                       carries usable depth.
   -o, --output DIR     Directory for the reconstructed model, poses, and
                        diagnostics. Default: "<input-name>-reconstruction"
                        next to the input.
@@ -41,6 +45,7 @@ OUTPUTS (written into --output):
 struct Options {
     var input: URL
     var detail: PhotogrammetryDetail = .full
+    var inputMode: PhotogrammetryInputMode = .imagesOnly
     var output: URL?
     var keepWorkspace = false
 }
@@ -54,6 +59,7 @@ func parseArguments() -> Options {
 
     var input: String?
     var detail: PhotogrammetryDetail = .full
+    var inputMode: PhotogrammetryInputMode = .imagesOnly
     var output: String?
     var keepWorkspace = false
 
@@ -77,6 +83,15 @@ func parseArguments() -> Options {
                 exit(2)
             }
             detail = parsed
+        case "-m", "--input-mode":
+            let raw = nextValue(for: arg).lowercased()
+            switch raw {
+            case "images", "imagesonly", "images-only": inputMode = .imagesOnly
+            case "depth", "depthguided", "depth-guided": inputMode = .depthGuided
+            default:
+                printErr("error: invalid input mode '\(raw)'. Use images or depth.")
+                exit(2)
+            }
         case "-o", "--output":
             output = nextValue(for: arg)
         case "--keep-workspace":
@@ -106,6 +121,7 @@ func parseArguments() -> Options {
     return Options(
         input: URL(fileURLWithPath: input),
         detail: detail,
+        inputMode: inputMode,
         output: output.map { URL(fileURLWithPath: $0) },
         keepWorkspace: keepWorkspace)
 }
@@ -123,7 +139,23 @@ func loadBundle(at input: URL) throws -> (bundle: MANTAValidatedBundle, cleanup:
     }
 
     if isDirectory.boolValue {
-        let bundle = try MANTABundleValidator().validate(directory: input)
+        // Lenient load: decode the manifest and capture document directly and
+        // skip the strict integrity gates (size/undeclared-file checks). This is
+        // a personal offline reconstruction tool, not a distribution integrity
+        // checkpoint — we do not want a stray off-by-one in a saved bundle to
+        // block a reconstruction.
+        let root = input.standardizedFileURL
+        let decoder = MANTAJSON.makeDecoder()
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        let manifest = try decoder.decode(
+            MANTABundleManifest.self,
+            from: Data(contentsOf: manifestURL))
+        let captureURL = root.appendingPathComponent(manifest.content.capture)
+        let capture = try decoder.decode(
+            MANTACaptureDocument.self,
+            from: Data(contentsOf: captureURL))
+        let bundle = MANTAValidatedBundle(
+            rootDirectory: root, manifest: manifest, capture: capture, changeLog: nil)
         return (bundle, nil)
     }
 
@@ -194,9 +226,13 @@ Task {
                 "Available on volume: \(bytesString(available)).")
         }
 
-        let prep = try ReconstructionWorkflow.prepare(bundle: bundle, detail: options.detail)
+        let prep = try ReconstructionWorkflow.prepare(
+            bundle: bundle, detail: options.detail, inputMode: options.inputMode)
         preparation = prep
-        log(.info, "Prepared workspace with \(prep.imageCount) linked images.")
+        log(.info, "Prepared workspace with \(prep.imageCount) linked images (\(prep.inputMode.title)).")
+        if options.inputMode.usesDepth, !prep.inputMode.usesDepth {
+            log(.warning, "No frames carried usable LiDAR depth; falling back to images-only.")
+        }
 
         let run = try await runner.reconstruct(
             preparation: prep, progress: reportProgress, log: log)

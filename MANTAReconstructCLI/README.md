@@ -30,14 +30,24 @@ ln -sf "$(pwd)/.build/release/manta-reconstruct" /usr/local/bin/manta-reconstruc
 # From a .manta archive, Full detail (default):
 manta-reconstruct /path/to/capture.manta
 
-# From an already-extracted bundle directory, Raw detail, custom output:
-manta-reconstruct /path/to/bundleDir --detail raw --output ~/Desktop/recon
+# Depth-guided reconstruction from a .manta directory package, Raw detail:
+manta-reconstruct /path/to/bundle.manta --input-mode depth --detail raw -o ~/Desktop/recon
 ```
 
-Options: `-d/--detail medium|full|raw`, `-o/--output DIR`,
-`--keep-workspace`, `-h/--help`. Progress and logs go to stderr; the final
-`model.usdz` path is printed to stdout (handy for scripting). Ctrl-C cancels
-cleanly and releases the GPU.
+Options: `-d/--detail medium|full|raw`, `-m/--input-mode images|depth`,
+`-o/--output DIR`, `--keep-workspace`, `-h/--help`. Progress and logs go to
+stderr; the final `model.usdz` path is printed to stdout (handy for scripting).
+Ctrl-C cancels cleanly and releases the GPU.
+
+`--input-mode depth` feeds each frame's LiDAR depth map + gravity into Object
+Capture; it falls back to images-only automatically if no frame carries usable
+depth.
+
+The input may be a `.manta` **directory package** or a `.manta` **zip
+archive**. Directory packages are loaded leniently — the manifest and capture
+document are read directly and per-file integrity gates (SHA / size) are not
+enforced — so a stray byte-count drift in a saved bundle never blocks a
+reconstruction.
 
 ### Outputs (written into `--output`)
 

@@ -12,9 +12,16 @@ nonisolated enum ReceiverAlignmentDebugLog {
         var timestamp: String
         var strategy: String
         var seed: String
+        var fitModel: String?
+        var targetResolution: String?
         var pairedLandmarks: [String]
         var landmarkRMSmm: Double?
         var solverRMSmm: Double?
+        var symmetricSurfaceRMSmm: Double?
+        var edgeRatioSpread: Double?
+        var perLandmarkGeometryErrorMM: [String: Double]?
+        var perLandmarkSnapMM: [String: Double]?
+        var perLandmarkTriangulationRMSmm: [String: Double]?
         var solvedScale: Double?
         var iterations: Int?
         var accepted: Bool?
@@ -76,13 +83,37 @@ nonisolated enum ReceiverAlignmentDebugLog {
             }
         }
         let diagnostics = outcome?.diagnostics
+        func toMM(_ map: [String: Double]?) -> [String: Double]? {
+            map?.mapValues { $0 * 1_000 }
+        }
+        // Precompute every field: a single initializer with ~30 inline optional
+        // expressions overwhelms the Swift type-checker.
+        let geometryErrorMM = toMM(diagnostics?.perLandmarkGeometryErrorMeters)
+        let snapMM = toMM(diagnostics?.perLandmarkSnapDistanceMeters)
+        let triangulationRMSmm = toMM(diagnostics?.perLandmarkTriangulationRMSMeters)
+        let landmarkRMSmm: Double? = diagnostics?.landmarkRMSMeters.map { $0 * 1_000 }
+        let solverRMSmm: Double? = diagnostics?.solverRMSMeters.map { $0 * 1_000 }
+        let symmetricRMSmm: Double? = diagnostics?.symmetricSurfaceRMSMeters.map { $0 * 1_000 }
+        let viewsPerLandmark: [String: Int] = Dictionary(uniqueKeysWithValues: paired.map {
+            ($0.rawValue, request.targetEvidenceCounts[$0] ?? 0)
+        })
+        let spreadPerLandmark: [String: Double] = Dictionary(uniqueKeysWithValues: paired.map {
+            ($0.rawValue, Double(request.targetMaximumSpreads[$0] ?? 0) * 1_000)
+        })
         let entry = Entry(
             timestamp: ISO8601DateFormatter().string(from: Date()),
             strategy: request.strategy.rawValue,
             seed: request.seed.rawValue,
+            fitModel: request.fitModel.rawValue,
+            targetResolution: request.targetResolution,
             pairedLandmarks: paired.map(\.rawValue),
-            landmarkRMSmm: diagnostics?.landmarkRMSMeters.map { $0 * 1_000 },
-            solverRMSmm: diagnostics?.solverRMSMeters.map { $0 * 1_000 },
+            landmarkRMSmm: landmarkRMSmm,
+            solverRMSmm: solverRMSmm,
+            symmetricSurfaceRMSmm: symmetricRMSmm,
+            edgeRatioSpread: diagnostics?.edgeRatioSpread,
+            perLandmarkGeometryErrorMM: geometryErrorMM,
+            perLandmarkSnapMM: snapMM,
+            perLandmarkTriangulationRMSmm: triangulationRMSmm,
             solvedScale: diagnostics.map(\.scale),
             iterations: diagnostics?.iterations,
             accepted: diagnostics?.accepted,
@@ -94,12 +125,8 @@ nonisolated enum ReceiverAlignmentDebugLog {
             worldEdgeMM: worldEdge,
             edgeScaleRatio: ratio,
             perLandmarkResidualMM: residual,
-            imageViewsPerLandmark: Dictionary(uniqueKeysWithValues: paired.map {
-                ($0.rawValue, request.targetEvidenceCounts[$0] ?? 0)
-            }),
-            maxImageSpreadMM: Dictionary(uniqueKeysWithValues: paired.map {
-                ($0.rawValue, Double(request.targetMaximumSpreads[$0] ?? 0) * 1_000)
-            }),
+            imageViewsPerLandmark: viewsPerLandmark,
+            maxImageSpreadMM: spreadPerLandmark,
             warnings: diagnostics?.warnings ?? [],
             error: errorMessage)
 
@@ -140,6 +167,17 @@ nonisolated struct ReceiverManualImageEvidence: Codable, Sendable {
 nonisolated struct ReceiverManualAlignmentRequest: Sendable {
     var strategy: WorldAlignmentStrategy
     var seed: AlignmentSeed
+    /// Degrees of freedom for landmark fits (rigid / similarity / affine).
+    var fitModel: LandmarkFitModel = .similarity
+    /// Gate ICP on a symmetric surface RMS instead of the one-way residual.
+    var useSymmetricAcceptance: Bool = true
+    /// How image clicks were turned into world targets ("Depth" / "Snap to
+    /// LiDAR" / "Triangulate (multi-view)"), recorded for provenance.
+    var targetResolution: String = TargetResolutionMode.depth.rawValue
+    /// Per-landmark distance a click moved when snapped to the mesh (meters).
+    var snapDistances: [FiducialKind: Float] = [:]
+    /// Per-landmark ray-agreement RMS from multi-view triangulation (meters).
+    var triangulationRMS: [FiducialKind: Float] = [:]
     var sourceLandmarks: [FiducialKind: SIMD3<Float>]
     var targetLandmarks: [FiducialKind: SIMD3<Float>]
     var targetEvidenceCounts: [FiducialKind: Int]
@@ -166,7 +204,20 @@ nonisolated struct ReceiverManualAlignmentDiagnostics: Codable, Sendable {
     var targetCloudPoints: Int
     var transform: [Double]
     var solverRMSMeters: Double?
+    var symmetricSurfaceRMSMeters: Double?
     var landmarkRMSMeters: Double?
+    var fitModel: String
+    var targetResolution: String
+    /// Per-landmark leave-one-out geometry error (meters): how far each landmark
+    /// disagrees with a single consistent scale. The outlier's is largest.
+    var perLandmarkGeometryErrorMeters: [String: Double]
+    /// Per-landmark snap-to-mesh displacement (meters), when snapping was used.
+    var perLandmarkSnapDistanceMeters: [String: Double]
+    /// Per-landmark multi-view triangulation ray-agreement RMS (meters).
+    var perLandmarkTriangulationRMSMeters: [String: Double]
+    /// Largest / smallest world-model edge-ratio across all landmark pairs. 1.0
+    /// is perfectly consistent; a similarity fit cannot beat this spread.
+    var edgeRatioSpread: Double?
     var scale: Double
     var iterations: Int
     var accepted: Bool
@@ -234,9 +285,16 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
             throw ReceiverManualAlignmentError.missingLandmarks(
                 "Nasion, LPA, and RPA on both the images and model")
         }
+        // Affine has 12 DOF and needs 4+ non-coplanar correspondences; the three
+        // cardinals alone are coplanar and under-determine it.
+        if request.fitModel == .affine, request.strategy != .icp, orderedKinds.count < 4 {
+            throw ReceiverManualAlignmentError.missingLandmarks(
+                "Cz as a 4th point (affine needs 4+ non-coplanar landmarks)")
+        }
 
         var input = WorldAlignmentInput()
         input.seed = request.seed
+        input.landmarkFitModel = request.fitModel
         if hasCardinalPairs {
             input.sourceLandmarks = sourceLandmarks
             input.targetLandmarks = targetLandmarks
@@ -338,17 +396,70 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
         if request.strategy == .icp, request.seed != .landmarks {
             warnings.append("Unseeded surface alignment can converge to the wrong side of a roughly symmetric head.")
         }
-        if request.strategy == .icp, result.rmsError.isFinite, result.rmsError > 0.04 {
-            warnings.append(String(format: "Surface residual is %.1f mm.", result.rmsError * 1_000))
+        // For ICP, prefer a symmetric (bidirectional) surface RMS: a scale-
+        // collapsed fit nestled inside a subset of the target scores a low one-way
+        // residual but a large reverse one, so max(forward, reverse) refuses to be
+        // fooled. The one-way number stays as `solverRMSMeters`; this is the gate.
+        var symmetricSurfaceRMS: Float?
+        if request.strategy == .icp, request.useSymmetricAcceptance,
+           sourceCloud.count >= 3, targetCloud.count >= 3 {
+            symmetricSurfaceRMS = SurfaceAlignmentMetrics.symmetricRMS(
+                transform: result.transform, source: sourceCloud, target: targetCloud)
+        }
+        // The residual used to judge the surface fit: symmetric when available,
+        // otherwise the solver's own one-way value.
+        let surfaceResidual: Float? = symmetricSurfaceRMS
+            ?? (result.rmsError.isFinite ? result.rmsError : nil)
+        if request.strategy == .icp, let surfaceResidual, surfaceResidual > 0.04 {
+            warnings.append(String(
+                format: "%@ surface residual is %.1f mm.",
+                symmetricSurfaceRMS != nil ? "Symmetric" : "One-way",
+                surfaceResidual * 1_000))
+        }
+
+        // Affine has 12 DOF: with only 4 correspondences it fits exactly, so a
+        // ~0 landmark RMS is a property of the math, not evidence of a good fit.
+        // Require redundancy (>=5 points) before an affine landmark RMS can be
+        // trusted to accept.
+        let affineUnderDetermined = request.fitModel == .affine
+            && request.strategy != .icp && orderedKinds.count < 5
+        if affineUnderDetermined {
+            warnings.append(
+                "Affine fit is exactly determined by \(orderedKinds.count) points - its near-zero residual is not validation. Add correspondences or use a similarity fit.")
+        }
+
+        // Per-landmark geometry plausibility and the global edge-ratio spread,
+        // persisted so a bad landmark stays visible in the saved diagnostics.
+        var perLandmarkGeometryError = [String: Double]()
+        var edgeRatioSpread: Double?
+        if hasCardinalPairs {
+            let scores = LandmarkPlausibilityAnalyzer.evaluate(
+                source: sourceLandmarks, target: targetLandmarks)
+            for (kind, score) in zip(orderedKinds, scores) {
+                if let score { perLandmarkGeometryError[kind.rawValue] = Double(score.geometryErrorMeters) }
+            }
+            var ratios = [Float]()
+            for i in orderedKinds.indices {
+                for j in (i + 1)..<orderedKinds.count {
+                    let md = simd_distance(sourceLandmarks[i], sourceLandmarks[j])
+                    let wd = simd_distance(targetLandmarks[i], targetLandmarks[j])
+                    if md > 1e-6, wd.isFinite { ratios.append(wd / md) }
+                }
+            }
+            if let lo = ratios.min(), let hi = ratios.max(), lo > 1e-9 {
+                edgeRatioSpread = Double(hi / lo)
+            }
         }
 
         let accepted: Bool
-        if let landmarkRMS {
+        if let landmarkRMS, !affineUnderDetermined {
             accepted = landmarkRMS <= 0.025 && largestSpread <= 0.025
                 && !hasUnresolvedRepeatDisagreement
-                && (!result.rmsError.isFinite || request.strategy != .icp || result.rmsError <= 0.06)
+                && (request.strategy != .icp || surfaceResidual == nil || surfaceResidual! <= 0.06)
+        } else if affineUnderDetermined {
+            accepted = false
         } else {
-            accepted = result.rmsError.isFinite && result.rmsError <= 0.04
+            accepted = surfaceResidual != nil && surfaceResidual! <= 0.04
         }
         let diagnostics = ReceiverManualAlignmentDiagnostics(
             strategy: request.strategy.rawValue,
@@ -376,7 +487,18 @@ nonisolated enum ReceiverManualAlignmentWorkflow {
             targetCloudPoints: targetCloud.count,
             transform: matrixValues,
             solverRMSMeters: result.rmsError.isFinite ? Double(result.rmsError) : nil,
+            symmetricSurfaceRMSMeters: symmetricSurfaceRMS.map(Double.init),
             landmarkRMSMeters: landmarkRMS.map(Double.init),
+            fitModel: request.fitModel.rawValue,
+            targetResolution: request.targetResolution,
+            perLandmarkGeometryErrorMeters: perLandmarkGeometryError,
+            perLandmarkSnapDistanceMeters: Dictionary(uniqueKeysWithValues: request.snapDistances.map {
+                ($0.key.rawValue, Double($0.value))
+            }),
+            perLandmarkTriangulationRMSMeters: Dictionary(uniqueKeysWithValues: request.triangulationRMS.map {
+                ($0.key.rawValue, Double($0.value))
+            }),
+            edgeRatioSpread: edgeRatioSpread,
             scale: Double(scale),
             iterations: result.iterations,
             accepted: accepted,

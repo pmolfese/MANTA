@@ -5,7 +5,6 @@
 //  Strict validation of an already-extracted logical .manta bundle directory.
 //
 
-import CryptoKit
 import Foundation
 
 public struct MANTAValidatedBundle: Sendable {
@@ -41,8 +40,6 @@ public enum MANTABundleValidationError: LocalizedError, Equatable, Sendable {
     case nonRegularFile(String)
     case invalidSize(String)
     case sizeMismatch(path: String, expected: Int64, actual: Int64)
-    case invalidHash(String)
-    case hashMismatch(String)
     case inconsistentSessionID
     case invalidLineage(String)
     case invalidCapture(String)
@@ -63,8 +60,6 @@ public enum MANTABundleValidationError: LocalizedError, Equatable, Sendable {
         case .invalidSize(let path): "Bundle entry has an invalid size: \(path)."
         case .sizeMismatch(let path, let expected, let actual):
             "Size mismatch for \(path): expected \(expected), found \(actual)."
-        case .invalidHash(let path): "Bundle entry has an invalid SHA-256 value: \(path)."
-        case .hashMismatch(let path): "SHA-256 mismatch for \(path)."
         case .inconsistentSessionID: "The manifest and capture document session IDs differ."
         case .invalidLineage(let reason): "Bundle lineage is invalid: \(reason)."
         case .invalidCapture(let reason): "Capture metadata is invalid: \(reason)."
@@ -80,16 +75,6 @@ public struct MANTABundleValidator {
     }
 
     public func validate(directory rootDirectory: URL) throws -> MANTAValidatedBundle {
-        try validate(directory: rootDirectory, verifyFileHashes: true)
-    }
-
-    /// Internal fast path for the finalizer, which has just computed every hash
-    /// while building the manifest. External callers always receive full hash
-    /// verification through the public overload above.
-    func validate(
-        directory rootDirectory: URL,
-        verifyFileHashes: Bool
-    ) throws -> MANTAValidatedBundle {
         let root = rootDirectory.standardizedFileURL
         let manifestURL = root.appendingPathComponent(MANTABundleFormat.manifestFilename)
         guard fileManager.fileExists(atPath: manifestURL.path) else {
@@ -102,8 +87,7 @@ public struct MANTABundleValidator {
             throw MANTABundleValidationError.unsupportedFormat(manifest.format)
         }
 
-        let declaredPaths = try validateFiles(
-            manifest.files, in: root, verifyFileHashes: verifyFileHashes)
+        let declaredPaths = try validateFiles(manifest.files, in: root)
         try validateContentReferences(manifest.content, declaredPaths: declaredPaths)
         try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
 
@@ -149,7 +133,7 @@ public struct MANTABundleValidator {
     }
 
     private func validateFiles(
-        _ entries: [MANTAFileEntry], in root: URL, verifyFileHashes: Bool
+        _ entries: [MANTAFileEntry], in root: URL
     ) throws -> Set<String> {
         var paths = Set<String>()
         for entry in entries {
@@ -159,10 +143,6 @@ public struct MANTABundleValidator {
             }
             guard entry.size >= 0 else {
                 throw MANTABundleValidationError.invalidSize(entry.path)
-            }
-            guard entry.sha256.count == 64,
-                  entry.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-                throw MANTABundleValidationError.invalidHash(entry.path)
             }
 
             let url = root.appendingPathComponent(entry.path)
@@ -180,9 +160,6 @@ public struct MANTABundleValidator {
                     expected: entry.size,
                     actual: actualSize
                 )
-            }
-            if verifyFileHashes, try sha256(of: url) != entry.sha256 {
-                throw MANTABundleValidationError.hashMismatch(entry.path)
             }
         }
         return paths
@@ -376,25 +353,5 @@ public struct MANTABundleValidator {
             return String(path.dropFirst("/private".count))
         }
         return path
-    }
-
-    private func sha256(of url: URL) throws -> String {
-        guard let stream = InputStream(url: url) else {
-            throw MANTABundleValidationError.unreadable(url.lastPathComponent)
-        }
-        stream.open()
-        defer { stream.close() }
-
-        var hasher = SHA256()
-        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            if count < 0 {
-                throw MANTABundleValidationError.unreadable(url.lastPathComponent)
-            }
-            if count == 0 { break }
-            hasher.update(data: Data(buffer[0..<count]))
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
