@@ -5,6 +5,7 @@ import CoreVideo
 import Foundation
 import ImageIO
 import MANTACore
+import MANTAProcessing
 import RealityKit
 import simd
 
@@ -58,35 +59,7 @@ struct ReceiverPhotogrammetrySampleSequence: Sequence {
 
     /// Loads an image file into a 32BGRA pixel buffer in its native pixel
     /// orientation (no EXIF rotation applied).
-    static func loadImageBuffer(_ url: URL) -> CVPixelBuffer? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        let width = image.width
-        let height = image.height
-        guard width > 0, height > 0 else { return nil }
-
-        let attributes: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true]
-        var buffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(
-            kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
-            attributes as CFDictionary, &buffer) == kCVReturnSuccess,
-            let pixelBuffer = buffer else { return nil }
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer),
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                data: base, width: width, height: height, bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                    | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return pixelBuffer
-    }
+    static func loadImageBuffer(_ url: URL) -> CVPixelBuffer? { ObjectCaptureImages.loadImageBuffer(url) }
 
     /// Builds a `DepthFloat32` pixel buffer from a frame's stored metric-depth
     /// artifact. Non-finite or non-positive samples become NaN so Object Capture

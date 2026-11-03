@@ -32,7 +32,10 @@ final class ScanSessionViewModel: ObservableObject {
     @Published var liveDetectionEnabled = false
     /// Debug acquisition option used to compare the primary lossless PNG with a
     /// compressed HEIC/JPEG encoding of the exact same sampled frame.
+    @Published var releaseCheckMessages: [String] = []
+    @Published var isCheckingRelease = false
     @Published var captureCompressedImageReferences = false
+    private var lastStillRequest = Date.distantPast
     @Published var isLiveDetecting = false
     @Published var liveElectrodes: [ElectrodeAnnotation] = []
     @Published var liveDetectionStatus = "Waiting for a saved frame."
@@ -227,8 +230,15 @@ final class ScanSessionViewModel: ObservableObject {
 
         refreshExportPreview()
         refreshSessions()
+        scanViewModel.storageCapacityProvider = { [weak self] in self?.artifactStore?.availableCapacityBytes }
         scanViewModel.eventHandler = { [weak self] event in
             self?.recordAcquisitionEvent(event)
+            if event.kind == "capture-storage-state",
+               let rawState = event.details["state"],
+               let state = CaptureStoragePolicy.State(rawValue: rawState), !state.allowsCapture {
+                self?.stopAutoSampling()
+                self?.statusMessage = event.message
+            }
         }
     }
 
@@ -243,6 +253,8 @@ final class ScanSessionViewModel: ObservableObject {
     /// meaningful action (sampling a frame, detecting, or renaming), so empty
     /// sessions don't clutter the library.
     func startNewSession(subjectLabel: String? = nil) {
+        releaseCheckMessages = []
+        scanViewModel.resetForNewCapture()
         stopAutoSampling()
         resetLiveDetection()
         fiducialPlacementKind = nil
@@ -263,6 +275,8 @@ final class ScanSessionViewModel: ObservableObject {
 
     /// Reopens a persisted session for review or reprocessing.
     func openSession(id: UUID) {
+        releaseCheckMessages = []
+        scanViewModel.lockArchivedCapture()
         guard let artifactStore else {
             statusMessage = "Could not access the app Documents folder."
             return
@@ -427,6 +441,7 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     func updateAcquisitionContext(_ update: (inout AcquisitionContext) -> Void) {
+        releaseCheckMessages = []
         var context = session.acquisitionContext ?? AcquisitionContext(
             netModel: session.layout.hasElectrodeNet ? session.layout.name : nil)
         update(&context)
@@ -558,6 +573,10 @@ final class ScanSessionViewModel: ObservableObject {
 
     func startLiveScan() {
         scanViewModel.start(captureMode: session.captureMode)
+        guard scanViewModel.status.isRunning else {
+            statusMessage = scanViewModel.status.message
+            return
+        }
         recordAcquisitionEvent(AcquisitionEvent(
             kind: "capture-started", message: "AR capture started.",
             details: ["autoSamplingIntervalSeconds": String(autoSamplingInterval)]))
@@ -571,7 +590,17 @@ final class ScanSessionViewModel: ObservableObject {
         }
     }
 
+    func applyCapturePreset(_ preset: CapturePreset) {
+        guard scanViewModel.canEditCaptureSettings, session.captureObservations.isEmpty else { return }
+        session.captureMode = .both
+        scanViewModel.selectBestFrames = preset.selectsBestFrames
+        scanViewModel.preserveComparisonFrames = preset.savesComparisonFrames
+        scanViewModel.highResolutionStills = preset.capturesHighResolutionStills
+        statusMessage = "\(preset.rawValue) selected for the next capture."
+    }
+
     func setCaptureMode(_ mode: CaptureMode) {
+        guard scanViewModel.canEditCaptureSettings, session.captureObservations.isEmpty else { return }
         session.captureMode = mode
         statusMessage = "Capture mode set to \(mode.rawValue)."
     }
@@ -1039,8 +1068,8 @@ final class ScanSessionViewModel: ObservableObject {
            !scanViewModel.status.hasSceneDepth {
             issues.append("scene depth is unavailable")
         }
-        if let bytes = artifactStore?.availableCapacityBytes, bytes < 2_000_000_000 {
-            issues.append("less than 2 GB free storage")
+        if let bytes = artifactStore?.availableCapacityBytes, bytes < CaptureStoragePolicy.warningBytes {
+            issues.append("less than 3 GB free storage")
         }
         return issues
     }
@@ -1093,6 +1122,10 @@ final class ScanSessionViewModel: ObservableObject {
             scanViewModel.start(captureMode: session.captureMode)
         }
 
+        guard scanViewModel.status.isRunning else {
+            statusMessage = scanViewModel.status.message
+            return
+        }
         autoSamplingTask?.cancel()
         isAutoSampling = true
         recordAcquisitionEvent(AcquisitionEvent(
@@ -1107,10 +1140,21 @@ final class ScanSessionViewModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
 
+                guard self.scanViewModel.status.isRunning else {
+                    self.stopAutoSampling()
+                    return
+                }
                 if self.canAutoSample {
-                    self.sampleCurrentARFrame()
+                    self.sampleCurrentARFrame(useBestFrame: true)
                 } else if self.scanViewModel.status.isRunning {
                     self.statusMessage = "Auto-sampling waiting for normal tracking and depth."
+                }
+
+                if !Task.isCancelled, self.scanViewModel.status.isRunning,
+                   self.scanViewModel.status.trackingSummary == "Normal",
+                   self.scanViewModel.highResolutionStills,
+                   Date().timeIntervalSince(self.lastStillRequest) >= 5 {
+                    await self.captureHighResolutionStill()
                 }
 
                 let nanoseconds = UInt64(max(0.25, self.autoSamplingInterval) * 1_000_000_000)
@@ -1129,22 +1173,30 @@ final class ScanSessionViewModel: ObservableObject {
         isAutoSampling = false
     }
 
-    func sampleCurrentARFrame() {
+    func sampleCurrentARFrame(useBestFrame: Bool = false) {
+        releaseCheckMessages = []
         guard let artifactStore else {
             statusMessage = "Could not access the app Documents folder."
             return
         }
 
         do {
+            try artifactStore.writeSession(session)
             guard let observation = try scanViewModel.sampleCurrentFrame(
                 artifactStore: artifactStore, session: session,
-                includeCompressedImage: captureCompressedImageReferences
+                includeCompressedImage: captureCompressedImageReferences, useBestFrame: useBestFrame
             ) else {
                 statusMessage = scanViewModel.status.message
                 return
             }
 
             session.captureObservations.append(observation)
+            try artifactStore.writeSession(session)
+            if let cadence = try scanViewModel.saveComparisonFrame(artifactStore: artifactStore,
+                session: session, includeCompressedImage: captureCompressedImageReferences) {
+                session.captureObservations.append(cadence)
+                try artifactStore.writeSession(session)
+            }
             recordAcquisitionEvent(AcquisitionEvent(
                 kind: "sample-saved", message: "RGB and available depth evidence saved.",
                 details: [
@@ -1172,8 +1224,65 @@ final class ScanSessionViewModel: ObservableObject {
         } catch {
             recordAcquisitionEvent(AcquisitionEvent(
                 kind: "sample-save-failed", message: error.localizedDescription))
-            statusMessage = "Could not save AR sample: \(error.localizedDescription)"
+            stopAutoSampling()
+            statusMessage = "Could not save AR sample; automatic capture stopped: \(error.localizedDescription)"
         }
+    }
+
+    func captureHighResolutionStill() async {
+        releaseCheckMessages = []
+        guard let artifactStore, !scanViewModel.isCapturingStill else { return }
+        lastStillRequest = Date()
+        let sessionID = session.id
+        do {
+            try artifactStore.writeSession(session)
+            guard let observation = try await scanViewModel.captureStill(
+                artifactStore: artifactStore, session: session,
+                includeCompressedImage: captureCompressedImageReferences), session.id == sessionID else {
+                statusMessage = scanViewModel.status.message
+                return
+            }
+            session.captureObservations.append(observation)
+            try artifactStore.writeSession(session)
+            enqueueLiveMetricDepthFusion(observation, frameID: session.captureObservations.count)
+            enqueueLiveDetection(observation)
+            diagnosticsPath = try artifactStore.writeDiagnostics(for: session, scanStatus: scanViewModel.status).path
+            persistSession()
+            statusMessage = "Saved experimental still \(observation.imageResolution.width)×\(observation.imageResolution.height); depth: \(observation.hasSceneDepth ? "present" : "absent")."
+        } catch {
+            recordAcquisitionEvent(AcquisitionEvent(kind: "high-resolution-still-failed", message: error.localizedDescription))
+            statusMessage = "Still capture failed: \(error.localizedDescription)"
+        }
+    }
+
+    func checkBeforeParticipantRelease() async {
+        guard let artifactStore, !isCheckingRelease else { return }
+        stopAutoSampling()
+        persistCurrentLiDARMesh()
+        scanViewModel.pause()
+        isCheckingRelease = true
+        defer { isCheckingRelease = false }
+        await Task.yield()
+        do {
+            try artifactStore.writeSession(session)
+            let result = try artifactStore.writeCaptureReceipt(for: session)
+            releaseCheckMessages = ["File validation: \(result.receipt.status.rawValue)",
+                "Decoded images: \(result.receipt.decodedImageCount)/\(result.receipt.observationCount)",
+                "Coverage sectors recorded: \(captureCoverageSectorCount)",
+                "Export prepared: \(session.lastRawExportedBundleID == nil ? "not yet" : "yes — confirm the destination copy")"]
+            releaseCheckMessages += result.receipt.checks.filter { $0.status != .passed }.map(\.message)
+            let sectors = Set(session.captureObservations.compactMap { $0.quality?.coverageSector })
+            let missing = (0..<8).filter { bin in !sectors.contains(where: { $0.hasPrefix("azimuth-\(bin)-") }) }
+            if !missing.isEmpty {
+                releaseCheckMessages.append("Unseen camera-direction azimuth bins: \(missing.map(String.init).joined(separator: ", ")). Inspect coverage overlays; these are not anatomical region labels.")
+            }
+            let blurry = session.captureObservations.filter { $0.quality?.warnings.contains("possible-motion-blur") == true }.count
+            if blurry > 0 { releaseCheckMessages.append("\(blurry) frames have blur warnings. Revisit those views before release.") }
+            if session.acquisitionContext?.pairedReferenceSessionID == nil { releaseCheckMessages.append("Record the paired GeoScan session ID.") }
+            if session.acquisitionContext?.referenceExportConfirmed != true { releaseCheckMessages.append("Obtain and confirm the GeoScan export.") }
+            if session.acquisitionContext?.repeatCaptureConfirmed != true { releaseCheckMessages.append("Confirm a separate repeat MANTA pass or document why it was omitted.") }
+            recordAcquisitionEvent(AcquisitionEvent(kind: "participant-release-check", message: result.receipt.status.rawValue))
+        } catch { releaseCheckMessages = ["Validation failed: \(error.localizedDescription)"] }
     }
 
     private func resetLiveMetricDepthFusion() {
@@ -1449,6 +1558,29 @@ final class ScanSessionViewModel: ObservableObject {
     /// Whether the export coordinates are in the head frame (vs raw world).
     var isExportHeadFramed: Bool {
         session.fiducialsReady && HeadCoordinateFrame.apply(to: session) != nil
+    }
+
+    func shareCoordinateExport() {
+        do {
+            let session = exportSession
+            let ext: String
+            let unit: String
+            switch selectedFormat {
+            case .sfp: (ext, unit) = ("sfp", "m")
+            case .sfpCentimeters: (ext, unit) = ("sfp", "cm")
+            case .geoScanTXT: (ext, unit) = ("txt", "cm")
+            default: return
+            }
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let url = folder.appendingPathComponent(
+                "manta_coordinates_\(session.coordinateSpace.frame.rawValue)_\(unit).\(ext)")
+            try ElectrodeExporters.export(session, as: selectedFormat)
+                .write(to: url, atomically: true, encoding: .utf8)
+            exportedBundle = ExportedBundle(urls: [url])
+        } catch {
+            statusMessage = "Coordinate export failed: \(error.localizedDescription)"
+        }
     }
 
     private func refreshExportPreview() {

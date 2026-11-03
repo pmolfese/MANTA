@@ -260,7 +260,7 @@ enum CoarseAlignment {
     }
 
     /// Similarity transform that matches centroids, principal axes, and spread of the two clouds.
-    /// Resolves the eigenvector sign ambiguity by trying the four proper-rotation candidates and
+    /// Resolves axis order/sign ambiguity by trying the 24 proper-rotation candidates and
     /// keeping the one with the lowest sampled residual. Intended as an ICP seed, not a final fit.
     static func pca(source: [SIMD3<Float>], target: [SIMD3<Float>]) -> WorldAlignmentResult? {
         guard source.count >= 3, target.count >= 3 else { return nil }
@@ -287,11 +287,12 @@ enum CoarseAlignment {
                 let c0 = signs.x * sourceMoments.axes[perm[0]]
                 let c1 = signs.y * sourceMoments.axes[perm[1]]
                 let c2 = signs.z * sourceMoments.axes[perm[2]]
-                // Keep only proper (right-handed) bases so the result is a rotation, not a reflection.
-                guard simd_dot(c0, simd_cross(c1, c2)) > 0 else { continue }
-
                 let candidate = simd_double3x3(c0, c1, c2)
                 let rotation = targetAxes * candidate.transpose
+                // Sorted eigenvectors can form either a left- or right-handed
+                // basis. Match the target basis's handedness: requiring only
+                // the source candidate to be right-handed can yield reflections.
+                guard simd_determinant(rotation) > 0 else { continue }
                 let translation = targetMoments.centroid - scale * (rotation * sourceMoments.centroid)
                 let transform = makeTransform(rotation: rotation, scale: scale, translation: translation)
                 let rms = sampledRMS(transform: transform, source: source, target: target)

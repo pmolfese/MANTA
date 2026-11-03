@@ -152,9 +152,26 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return url
     }
 
+    func writeObservationCheckpoint(_ observation: CaptureObservation, for session: ScanSession) throws {
+        _ = try sessionDirectory(for: session)
+        let directory = acquisitionDirectory(for: session).appendingPathComponent("observations")
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(observation)
+        try data.write(to: directory.appendingPathComponent(observation.id.uuidString + ".json"), options: .atomic)
+    }
+
     func loadSession(id: UUID) throws -> ScanSession {
         let data = try Data(contentsOf: sessionMetadataURL(for: id))
-        return try JSONDecoder().decode(ScanSession.self, from: data)
+        var session = try JSONDecoder().decode(ScanSession.self, from: data)
+        let directory = acquisitionDirectory(for: session).appendingPathComponent("observations")
+        let files = (try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        var known = Set(session.captureObservations.map(\.id))
+        for file in files where file.pathExtension == "json" {
+            let observation = try JSONDecoder().decode(CaptureObservation.self, from: Data(contentsOf: file))
+            if known.insert(observation.id).inserted { session.captureObservations.append(observation) }
+        }
+        session.captureObservations.sort { $0.capturedAt < $1.capturedAt }
+        return session
     }
 
     func deleteSession(id: UUID) throws {
@@ -370,7 +387,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
                 coordinateSystem: "arkit-world",
                 coordinate: [electrode.coordinate.x, electrode.coordinate.y, electrode.coordinate.z],
                 confidence: electrode.confidence,
-                state: electrode.state.rawValue)
+                state: electrode.state.rawValue, provenance: electrode.provenance)
         }) : []
         let reconstruction: MANTAReconstructionReference? = {
             let objectModel = variant == .solved ? session.photogrammetryModelFilename : nil

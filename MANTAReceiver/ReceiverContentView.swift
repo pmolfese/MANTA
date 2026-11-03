@@ -7,11 +7,17 @@ struct ReceiverContentView: View {
     @StateObject private var store = ReceiverStore()
     @StateObject private var display = ReceiverDisplaySettings()
     @State private var showsImporter = false
+    @State private var showsComparison = false
     @State private var isDropTargeted = false
 
     var body: some View {
         NavigationSplitView {
             List {
+                Section("Validation") {
+                    Button("Compare GeoScan…", systemImage: "chart.xyaxis.line") {
+                        showsComparison = true
+                    }
+                }
                 Section("Transfer") {
                     Button("Import MANTA Capture…", systemImage: "square.and.arrow.down") {
                         showsImporter = true
@@ -106,6 +112,16 @@ struct ReceiverContentView: View {
                 )
             }
         }
+        .sheet(isPresented: $showsComparison) {
+            VStack {
+                HStack {
+                    Text("GeoScan Comparison").font(.headline)
+                    Spacer()
+                    Button("Done") { showsComparison = false }
+                }.padding()
+                ReceiverComparisonView(bundle: store.bundle)
+            }.frame(minWidth: 850, minHeight: 650)
+        }
         .dropDestination(for: URL.self) { urls, _ in
             handleDrop(urls)
         } isTargeted: { targeted in
@@ -190,6 +206,9 @@ private struct BundleInspector: View {
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
             ReceiverElectrodeWorkspace(store: store, display: display, bundle: bundle)
                 .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
+            ReceiverComparisonView(bundle: bundle)
+                .id(bundle.manifest.bundleID)
+                .tabItem { Label("Compare", systemImage: "chart.xyaxis.line") }
             ReceiverExportView(
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)

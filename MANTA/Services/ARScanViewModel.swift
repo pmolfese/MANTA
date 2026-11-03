@@ -22,12 +22,80 @@ struct FiducialRaycastResult {
 #if canImport(ARKit) && canImport(RealityKit)
 import ARKit
 import RealityKit
+import Vision
 
 @MainActor
 final class ARScanViewModel: NSObject, ObservableObject {
     @Published var status = LiveScanStatus(isSupported: ARWorldTrackingConfiguration.isSupported)
     @Published var observations: [CaptureObservation] = []
     var eventHandler: ((AcquisitionEvent) -> Void)?
+    @Published var preserveComparisonFrames = false
+    @Published var captureSafetyMessage: String?
+    @Published private(set) var activeSettingsSummary: String?
+    @Published private(set) var storageMessage: String?
+    var storageCapacityProvider: (() -> Int64?)?
+    private var storageMonitor: Task<Void, Never>?
+    private var lastStorageState: CaptureStoragePolicy.State?
+    var canEditCaptureSettings: Bool { !status.isRunning && observations.isEmpty && !worldInvalidated }
+
+    func settingsSummary(captureMode: CaptureMode) -> String {
+        let name = CapturePreset.name(usesDepth: captureMode.usesLiDAR, bestFrames: selectBestFrames,
+            comparisonFrames: preserveComparisonFrames, highResolutionStills: highResolutionStills)
+        return "\(name) · \(captureMode.rawValue) · Best frames \(selectBestFrames ? "on" : "off") · Cadence pairs \(preserveComparisonFrames ? "on" : "off") · Hi-res stills \(highResolutionStills ? "on" : "off")"
+    }
+
+    /// Called before each observation's artifact writes and by the independent monitor.
+    @discardableResult
+    func checkStorage(_ bytes: Int64?) -> Bool {
+        let state = CaptureStoragePolicy.evaluate(availableBytes: bytes)
+        switch state {
+        case .ready: storageMessage = nil
+        case .warning:
+            storageMessage = "Storage is below 3 GB. Capture will pause at 1 GB; finish this pass soon."
+        case .stop:
+            storageMessage = "Capture paused: 1 GB storage reserve reached. Free space, then resume capture. Saved frames remain available."
+        case .unavailable:
+            storageMessage = "Capture paused: available storage could not be checked. Restore storage access before resuming."
+        }
+        if !state.allowsCapture {
+            pause()
+            comparisonFrame = nil
+            status.message = storageMessage ?? "Capture paused for storage."
+        }
+        if state != lastStorageState {
+            lastStorageState = state
+            eventHandler?(AcquisitionEvent(kind: "capture-storage-state", message: storageMessage ?? "Storage available.",
+                details: ["state": state.rawValue, "availableBytes": bytes.map(String.init) ?? "unknown",
+                          "warningBytes": String(CaptureStoragePolicy.warningBytes),
+                          "reserveBytes": String(CaptureStoragePolicy.reserveBytes)]))
+        }
+        return state.allowsCapture
+    }
+
+    private func startStorageMonitor() {
+        storageMonitor?.cancel()
+        storageMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                guard let self, self.status.isRunning else { return }
+                if let provider = self.storageCapacityProvider, !self.checkStorage(provider()) { return }
+            }
+        }
+    }
+
+    private var worldInvalidated = false
+    private var comparisonFrame: (ARFrame, String, UUID)?
+    @Published var selectBestFrames = false
+    @Published var highResolutionStills = false
+    @Published var lensMessage = "Lens check has not run."
+    @Published var isCheckingLens = false
+    @Published var isCapturingStill = false
+    private var bestFrame: (frame: ARFrame, orientation: String, score: Double)?
+    private var scoredTimestamp: TimeInterval = 0
+    private var scoredRotation: simd_quatf?
+    private var requiresDepth = false
+    private var captureGeneration = UUID()
+
 
     // The capture session outlives an individual SwiftUI Camera/Model tab.
     // Keeping the ARView strongly owned here prevents a visual-mode switch from
@@ -72,11 +140,34 @@ final class ARScanViewModel: NSObject, ObservableObject {
             return
         }
 
+        guard !worldInvalidated else {
+            status.message = "Tracking was interrupted. Start a new session to avoid mixing coordinate worlds."
+            captureSafetyMessage = status.message
+            return
+        }
+        if let provider = storageCapacityProvider, !checkStorage(provider()) { return }
+        if !observations.isEmpty, let existing = arView?.session.configuration {
+            arView?.session.run(existing)
+            status.isRunning = true
+            startStorageMonitor()
+            status.message = "Resuming the existing coordinate world. Camera changes require a new session."
+            return
+        }
+        captureGeneration = UUID()
+        bestFrame = nil
+        scoredTimestamp = 0
+        scoredRotation = nil
+        requiresDepth = captureMode.usesLiDAR
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
         configuration.environmentTexturing = .automatic
 
         if let format = highestResolutionVideoFormat(usesLiDAR: captureMode.usesLiDAR) {
+            configuration.videoFormat = format
+        }
+
+        if highResolutionStills,
+           let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
             configuration.videoFormat = format
         }
 
@@ -97,6 +188,8 @@ final class ARScanViewModel: NSObject, ObservableObject {
         hasReportedFirstFrame = false
         arView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         status.isRunning = true
+        activeSettingsSummary = settingsSummary(captureMode: captureMode)
+        startStorageMonitor()
         status.message = captureMode.usesLiDAR
             ? "Move around the cap slowly; keep electrodes in view and avoid motion blur."
             : "Circle the head, keeping frames sharp and well-lit for photogrammetry."
@@ -112,6 +205,19 @@ final class ARScanViewModel: NSObject, ObservableObject {
                 "requestedWidth": String(Int(requested.width)),
                 "requestedHeight": String(Int(requested.height)),
                 "requestedFPS": String(configuration.videoFormat.framesPerSecond),
+                "deviceHardwareIdentifier": DeviceHardwareIdentifier.current,
+                "operatingSystem": ProcessInfo.processInfo.operatingSystemVersionString,
+                "applicationVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+                "applicationBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+                "coordinateTarget": "visibleDiscCupCenter",
+                "captureSettings": activeSettingsSummary ?? "unknown",
+                "cadenceComparisonFrames": String(preserveComparisonFrames),
+                "bestFrameSelection": String(selectBestFrames),
+                "frameSelectionVersion": "1",
+                "selectionWindowSeconds": "0.9",
+                "selectionScoringIntervalSeconds": "0.15",
+                "stillMinimumIntervalSeconds": "5",
+                "highResolutionStills": String(highResolutionStills),
                 "sceneDepthRequested": String(configuration.frameSemantics.contains(.sceneDepth)),
                 "sceneReconstructionMesh": String(configuration.sceneReconstruction == .mesh),
                 "supportedFormatCount": String(ARWorldTrackingConfiguration.supportedVideoFormats.count)
@@ -142,7 +248,47 @@ final class ARScanViewModel: NSObject, ObservableObject {
         }
     }
 
+    func resetForNewCapture() {
+        pause()
+        observations.removeAll()
+        meshAnchors.removeAll()
+        comparisonFrame = nil
+        worldInvalidated = false
+        captureSafetyMessage = nil
+        activeSettingsSummary = nil
+        storageMessage = nil
+        lastStorageState = nil
+    }
+
+    func lockArchivedCapture() {
+        pause()
+        worldInvalidated = true
+        activeSettingsSummary = nil
+        storageMessage = nil
+        captureSafetyMessage = "Reopened captures are review-only. Start a new session to acquire a new coordinate world."
+    }
+
+    func saveComparisonFrame(artifactStore: CaptureArtifactStore, session: ScanSession,
+                             includeCompressedImage: Bool) throws -> CaptureObservation? {
+        guard let (frame, orientation, selectedID) = comparisonFrame else { return nil }
+        comparisonFrame = nil
+        let observation = try saveFrame(frame, orientation: orientation, artifactStore: artifactStore,
+            session: session, includeCompressedImage: includeCompressedImage, source: "cadence-comparison")
+        eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Selected and ordinary cadence frames retained.",
+            details: ["selectedObservationID": selectedID.uuidString, "cadenceObservationID": observation.id.uuidString]))
+        return observation
+    }
+
+    func invalidatePendingCaptures() {
+        captureGeneration = UUID()
+        bestFrame = nil
+    }
+
     func pause() {
+        storageMonitor?.cancel()
+        storageMonitor = nil
+        captureGeneration = UUID()
+        bestFrame = nil
         arView?.session.pause()
         status.isRunning = false
         status.message = "Scan paused."
@@ -150,14 +296,44 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     func sampleCurrentFrame(
         artifactStore: CaptureArtifactStore, session: ScanSession,
-        includeCompressedImage: Bool = false
+        includeCompressedImage: Bool = false, useBestFrame: Bool = false
     ) throws -> CaptureObservation? {
-        guard let frame = arView?.session.currentFrame else {
+        guard status.isRunning, !worldInvalidated, let current = arView?.session.currentFrame else {
             status.message = "No AR frame is available yet."
             return nil
         }
 
+        let candidate = bestFrame
+        bestFrame = nil
+        let useCandidate = useBestFrame && selectBestFrames && candidate.map {
+            current.timestamp - $0.frame.timestamp >= 0 && current.timestamp - $0.frame.timestamp <= 0.9
+                && $0.frame.timestamp > (observations.last?.quality?.arFrameTimestamp ?? -1)
+        } == true
+        let frame = useCandidate ? candidate!.frame : current
+        guard frame.timestamp > (observations.last?.quality?.arFrameTimestamp ?? -1) else { return nil }
+        let saved = try saveFrame(frame, orientation: useCandidate ? candidate!.orientation : storedImageOrientation(),
+                             artifactStore: artifactStore, session: session,
+                             includeCompressedImage: includeCompressedImage,
+                             source: useCandidate ? "best-window-frame" : "current-frame")
+        if useBestFrame && preserveComparisonFrames && current.timestamp > frame.timestamp {
+            comparisonFrame = (current, storedImageOrientation(), saved.id)
+        } else if useBestFrame && preserveComparisonFrames {
+            eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Same frame selected; stored once.",
+                details: ["selectedObservationID": saved.id.uuidString, "cadenceObservationID": saved.id.uuidString]))
+        }
+        return saved
+    }
+
+    private func saveFrame(_ frame: ARFrame, orientation: String,
+                           artifactStore: CaptureArtifactStore, session: ScanSession,
+                           includeCompressedImage: Bool, source: String) throws -> CaptureObservation {
+        guard checkStorage(artifactStore.availableCapacityBytes) else {
+            throw NSError(domain: "MANTA.CaptureStorage", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: storageMessage ?? "Insufficient capture storage."])
+        }
         var observation = makeObservation(from: frame)
+        observation.imageOrientation = orientation
+        observation.capturedAt = Date(timeIntervalSinceNow: frame.timestamp - ProcessInfo.processInfo.systemUptime)
         let cameraArtifact = try artifactStore.writeCameraSnapshot(
             pixelBuffer: frame.capturedImage,
             observationID: observation.id,
@@ -195,6 +371,8 @@ final class ARScanViewModel: NSObject, ObservableObject {
             }
         }
 
+        try artifactStore.writeObservationCheckpoint(observation, for: session)
+        bestFrame = nil
         observations.append(observation)
         lastSampledTransform = frame.camera.transform
         status.sampledFrameCount = observations.count
@@ -202,7 +380,92 @@ final class ARScanViewModel: NSObject, ObservableObject {
         status.message = observation.depthSnapshotFilename == nil
             ? "Sampled frame \(observations.count) with camera snapshot."
             : "Sampled frame \(observations.count) with camera and depth snapshots."
+        eventHandler?(AcquisitionEvent(kind: "capture-frame-selected", message: source,
+            details: ["observationID": observation.id.uuidString,
+                      "frameTimestamp": String(frame.timestamp),
+                      "width": String(observation.imageResolution.width),
+                      "height": String(observation.imageResolution.height),
+                      "hasDepth": String(frame.sceneDepth != nil)]))
         return observation
+    }
+
+    func captureStill(artifactStore: CaptureArtifactStore, session: ScanSession,
+                      includeCompressedImage: Bool) async throws -> CaptureObservation? {
+        guard status.isRunning, highResolutionStills, !isCapturingStill,
+              let arSession = arView?.session,
+              let format = arSession.configuration?.videoFormat,
+              format.isRecommendedForHighResolutionFrameCapturing else {
+            status.message = "High-resolution stills need a supported format; enable the experiment before starting capture."
+            return nil
+        }
+        guard ProcessInfo.processInfo.thermalState != .serious,
+              ProcessInfo.processInfo.thermalState != .critical else {
+            status.message = "Still capture skipped while the device is hot."
+            return nil
+        }
+        isCapturingStill = true
+        defer { isCapturingStill = false }
+        let generation = captureGeneration
+        let orientation = storedImageOrientation()
+        let requestedAt = Date()
+        let frame: ARFrame = try await withCheckedThrowingContinuation { continuation in
+            arSession.captureHighResolutionFrame { frame, error in
+                if let error { continuation.resume(throwing: error) }
+                else if let frame { continuation.resume(returning: frame) }
+                else { continuation.resume(throwing: NSError(domain: "MANTA", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "No high-resolution frame returned."])) }
+            }
+        }
+        guard !Task.isCancelled, generation == captureGeneration, status.isRunning,
+              orientation == storedImageOrientation() else { return nil }
+        eventHandler?(AcquisitionEvent(kind: "still-delivered", message: "High-resolution request completed.",
+            details: ["latencySeconds": String(Date().timeIntervalSince(requestedAt)),
+                      "thermalState": String(ProcessInfo.processInfo.thermalState.rawValue)]))
+        return try saveFrame(frame, orientation: orientation, artifactStore: artifactStore,
+                             session: session, includeCompressedImage: includeCompressedImage,
+                             source: "high-resolution-still")
+    }
+
+    func checkLens() async {
+        guard !isCheckingLens, let frame = arView?.session.currentFrame else { return }
+        isCheckingLens = true
+        defer { isCheckingLens = false }
+        let generation = captureGeneration
+        do {
+            let observation = try await DetectLensSmudgeRequest(.revision1).perform(on: frame.capturedImage)
+            guard generation == captureGeneration else { return }
+            let confidence = observation.confidence
+            lensMessage = confidence >= 0.5
+                ? "Possible lens smudge. Inspect and clean the lens if needed."
+                : "No strong smudge indication; inspect image quality too."
+            eventHandler?(AcquisitionEvent(kind: "lens-smudge-check", message: lensMessage,
+                details: ["confidence": String(confidence), "advisoryThreshold": "0.5",
+                          "revision": "1", "frameTimestamp": String(frame.timestamp)]))
+        } catch {
+            guard generation == captureGeneration else { return }
+            lensMessage = "Lens check unavailable: \(error.localizedDescription)"
+            eventHandler?(AcquisitionEvent(kind: "lens-smudge-unavailable", message: lensMessage))
+        }
+    }
+
+    /// Retain at most one candidate ARFrame and score at most 7 frames/second.
+    private func considerFrame(_ frame: ARFrame) {
+        guard status.isRunning, selectBestFrames, frame.timestamp - scoredTimestamp >= 0.15,
+              case .normal = frame.camera.trackingState,
+              !requiresDepth || frame.sceneDepth != nil else { return }
+        let transform = frame.camera.transform
+        let rotation = simd_quatf(simd_float3x3(transform.columns.0.xyz, transform.columns.1.xyz, transform.columns.2.xyz))
+        let dt = frame.timestamp - scoredTimestamp
+        let speed = scoredRotation.map { Double(2 * acos(min(1, abs(simd_dot($0.vector, rotation.vector))))) * 180 / .pi / max(dt, 0.001) } ?? 0
+        scoredRotation = rotation
+        scoredTimestamp = frame.timestamp
+        let novelty = poseNovelty(transform)
+        let sharpness = imageQuality(frame.capturedImage).sharpness
+        let score = CaptureFrameScoring.score(sharpness: sharpness, angularSpeedDegrees: speed,
+            translationMeters: novelty.translation ?? 0.03, rotationDegrees: novelty.rotationDegrees ?? 10)
+        if bestFrame == nil || frame.timestamp - bestFrame!.frame.timestamp > 0.9 || score > bestFrame!.score {
+            bestFrame = (frame, storedImageOrientation(), score)
+        }
     }
 
     /// Ray-casts a point in the AR view (view coordinates) against the scanned
@@ -332,6 +595,11 @@ final class ARScanViewModel: NSObject, ObservableObject {
         let summary = trackingSummary(frame.camera.trackingState)
         status.trackingSummary = summary
         status.hasSceneDepth = frame.sceneDepth != nil
+        if highResolutionStills && requiresDepth && frame.sceneDepth == nil {
+            captureSafetyMessage = "Experimental format has no scene depth. Keep this RGB evidence, then start a NEW session with high-resolution stills off for the depth pass."
+        } else if highResolutionStills && summary != "Normal" {
+            captureSafetyMessage = "Tracking is limited. Automatic stills wait for normal tracking; if it persists, finish this pass and start a new baseline session."
+        }
         status.meshAnchorCount = meshAnchors.count
         if !hasReportedFirstFrame {
             hasReportedFirstFrame = true
@@ -560,6 +828,7 @@ extension ARScanViewModel: ARSessionDelegate {
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
         Task { @MainActor in
             self.updateStatus(from: frame)
+            self.considerFrame(frame)
         }
     }
 
@@ -591,6 +860,9 @@ extension ARScanViewModel: ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
         Task { @MainActor in
+            self.pause()
+            self.worldInvalidated = true
+            self.captureSafetyMessage = "AR failed. Start a new capture session; existing data remains available."
             self.eventHandler?(AcquisitionEvent(
                 kind: "ar-session-failed", message: error.localizedDescription))
         }
@@ -598,6 +870,9 @@ extension ARScanViewModel: ARSessionDelegate {
 
     nonisolated func sessionWasInterrupted(_ session: ARSession) {
         Task { @MainActor in
+            self.pause()
+            self.worldInvalidated = true
+            self.captureSafetyMessage = "AR was interrupted. Start a new session rather than mixing uncertain coordinate worlds."
             self.eventHandler?(AcquisitionEvent(
                 kind: "ar-session-interrupted", message: "AR session was interrupted."))
         }

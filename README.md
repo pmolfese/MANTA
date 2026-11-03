@@ -53,7 +53,7 @@ captures may contain identifiable imagery or PHI.
 - Non-destructive fiducial correction and audited PROCESSED-package updates. The
   imported RAW acquisition is never modified.
 - Surface export as PLY/STL, fused-depth point-cloud export as PLY, and coordinate
-  export as CSV, MNE SFP, or EGI XML in ARKit-world or fiducial-derived head-RAS
+  export as CSV, meter/centimeter SFP, GeoScan-style TXT, or EGI XML in ARKit-world or fiducial-derived head-RAS
   coordinates.
 
 ### Shared core and capture format
@@ -97,9 +97,9 @@ Additional design and project documentation:
 
 ## Requirements
 
-- Xcode with the iOS 26 and macOS 14 SDKs used by the project.
-- iOS/iPadOS 26+ for the `MANTA` app.
-- macOS 14+ for `MANTA Receiver` (`MANTACore` itself supports macOS 13+).
+- Xcode 27 or later with the iOS 27 and macOS 26 SDKs or later.
+- iOS/iPadOS 27+ for the `MANTA` app.
+- macOS 26+ for `MANTA Receiver` (`MANTACore` itself supports macOS 13+).
 - A LiDAR-equipped iPhone Pro or iPad Pro for LiDAR capture. Photogrammetry can
   run without LiDAR, while combined capture needs a supported LiDAR device.
 

@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "datasetID": "replace-with-frozen-dataset-id",
+  "configuration": {
+    "revision": 3,
+    "maximumImageDimension": 4096,
+    "minimumTextHeight": 0.008,
+    "orientations": ["up", "right", "down", "left"],
+    "channelCount": 256
+  },
+  "images": [
+    {
+      "id": "capture-a-frame-001",
+      "image": "images/frame-001.png",
+      "expectedLabels": ["E1", "E2"]
+    }
+  ],
+  "comparisons": [
+    {
+      "id": "paired-session-a",
+      "reference": "reference/geoscan.txt",
+      "referenceUnit": "centimeters",
+      "candidate": "results/manta_coordinates_head-ras_cm.txt",
+      "candidateUnit": "centimeters"
+    }
+  ]
+}

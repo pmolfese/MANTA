@@ -32,7 +32,7 @@ OPTIONS:
 
 OUTPUTS (written into --output):
   model.usdz           Reconstructed textured mesh.
-  poses.json           Per-image camera poses (ARKit world, meters).
+  poses.json           Source ARKit calibration plus estimated Object Capture poses/intrinsics/distortion.
   diagnostics.json     Timing, skipped samples, and LiDAR-alignment metrics.
 """
 

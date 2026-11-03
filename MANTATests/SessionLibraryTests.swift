@@ -26,6 +26,22 @@ struct SessionLibraryTests {
         return s
     }
 
+    @Test @MainActor func observationCheckpointRecoversInterruptedMetadataWriteWithoutDuplicates() throws {
+        let store = try makeStore()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        var original = session()
+        try store.writeSession(original)
+        let observation = CaptureObservation(capturedAt: Date(), cameraTransform: [], cameraIntrinsics: [],
+            imageResolution: ImageResolution(width: 1, height: 1), hasSceneDepth: false,
+            meshAnchorCount: 0, trackingSummary: "Normal")
+        try store.writeObservationCheckpoint(observation, for: original)
+        let recovered = try store.loadSession(id: original.id)
+        #expect(recovered.captureObservations == [observation])
+        original.captureObservations = [observation]
+        try store.writeSession(original)
+        #expect(try store.loadSession(id: original.id).captureObservations == [observation])
+    }
+
     // MARK: - Naming
 
     @Test func timestampNameMatchesExpectedFormat() {

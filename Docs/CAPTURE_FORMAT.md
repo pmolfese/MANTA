@@ -465,3 +465,51 @@ Before schema 1.0.0 is frozen, add:
   scaling.
 - Whether downstream EGI tools impose additional requirements beyond the
   captured `coordinates_mff` dialect and fixture.
+
+### Coordinate origin and paired validation metadata
+
+Electrode annotations and solved electrode records may include optional
+`provenance`, independent of `state`: `imageDepthObserved`,
+`visualLayoutAssigned`, `templateInferred`, `manualPlacement`, or `synthetic`.
+Absent provenance means unknown; decoding an older Reviewed/Detected record
+never invents an observation origin. Review-only changes retain provenance;
+manual replacement of a coordinate changes it to `manualPlacement`.
+
+GeoScan-style export writes Estimated=0 only for `imageDepthObserved`. All other
+origins, including unknown, use 1. This flag describes acquisition origin, not
+accuracy, label correctness, or confidence. Manually placed fiducials retain
+existing placement evidence and remain conservatively flagged in TXT. CSV also
+includes a provenance column. Coordinate-frame conversion preserves provenance.
+
+The optional acquisition context fields `pairedReferenceSessionID`,
+`acquisitionOrder`, `netMovementNotes`, and `coordinateTarget` are saved with the
+existing acquisition/context.json artifact. The iPad validation form uses
+`mantaThenGeoScan` or `geoScanThenManta` for acquisition order and
+`visibleDiscCupCenter` for the target. Empty fields remain absent. These are
+operator-entered study metadata, not evidence that a paired scan took place.
+
+The video-format-selected acquisition event additionally records device hardware
+identifier, OS/build, app version/build, and coordinate target alongside requested
+camera size/FPS and depth settings. Existing per-frame pose, calibration,
+orientation, tracking, and image-quality records remain the acquisition evidence.
+
+### Receiver evidence version 4: RGB-only localization
+
+Electrode provenance additionally supports `imageMeshObserved` for an image
+observation localized on an aligned reconstruction. Like image/depth observations,
+it is a directly observed image feature, not a template-filled position; this
+origin does not establish absolute measurement accuracy.
+
+Receiver electrode evidence version 4 adds optional `depthSource` to localized
+OCR and unlabeled cup evidence (`alignedMesh` or `sceneDepth`). The existing
+`depthMeters` is optical-axis depth and `depthPoint` is world position for either
+source. Mesh points use 0 in the legacy depth-confidence field, with source-aware
+weighting; no LiDAR confidence is fabricated. Older missing source fields retain
+legacy depth interpretation.
+
+`unlocalizedObservations` retains observation IDs, native-image points, calibrated
+ray origins/directions, OCR text/candidate labels/confidences and bounding boxes
+where present, and a reason localization failed. These records have no world
+coordinate and never enter scientific coordinate exports. All original images
+remain available for offline re-detection. Evidence-only runs keep pre-existing
+coordinates and require Save Sensors to persist, like other Receiver drafts.

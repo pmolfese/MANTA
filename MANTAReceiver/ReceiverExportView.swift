@@ -46,11 +46,17 @@ struct ReceiverExportView: View {
                     exportButton("MNE SFP", systemImage: "point.3.filled.connected.trianglepath.dotted") {
                         try exportCoordinates(.sfp)
                     }
+                    exportButton("SFP (cm)", systemImage: "doc.text") {
+                        try exportCoordinates(.sfpCentimeters)
+                    }
+                    exportButton("GeoScan TXT", systemImage: "doc.text") {
+                        try exportCoordinates(.geoScanTXT)
+                    }
                     exportButton("EGI XML", systemImage: "chevron.left.forwardslash.chevron.right") {
                         try exportCoordinates(.egiXML)
                     }
                 }
-                Text("CSV includes electrodes and fiducials with explicit frame, units, state, and confidence. SFP includes both using standard FidNz/FidT9/FidT10 labels.")
+                Text("CSV includes electrodes and fiducials with explicit frame, units, state, and confidence. SFP includes both using FidNz/FidT9/FidT10 labels: MNE SFP writes meters; SFP (cm) writes centimeters. GeoScan-style TXT writes centimeters in the selected frame, with Estimated=0 only for image/depth or image/mesh observations; all other origins use 1.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !ReceiverCoordinateExporter.hasHeadFrame(bundle) {
@@ -638,11 +644,12 @@ nonisolated enum ReceiverCoordinateExportFrame: String, CaseIterable, Identifiab
 }
 
 nonisolated enum ReceiverCoordinateExportFormat: Sendable {
-    case csv, sfp, egiXML
+    case csv, sfp, sfpCentimeters, geoScanTXT, egiXML
     var contentType: UTType {
         switch self {
         case .csv: .commaSeparatedText
-        case .sfp: UTType(filenameExtension: "sfp") ?? .plainText
+        case .sfp, .sfpCentimeters: UTType(filenameExtension: "sfp") ?? .plainText
+        case .geoScanTXT: .plainText
         case .egiXML: .xml
         }
     }
@@ -671,6 +678,7 @@ nonisolated enum ReceiverCoordinateExporter {
         var pointMeters: SIMD3<Double>
         var state: String
         var confidence: Double?
+        var provenance: CoordinateProvenance? = nil
     }
 
     static func hasHeadFrame(_ bundle: MANTAValidatedBundle) -> Bool {
@@ -704,17 +712,19 @@ nonisolated enum ReceiverCoordinateExporter {
             let unit = frame == .headRAS ? "mm" : "m"
             let coordinateSystem = frame == .headRAS ? "head-ras" : "arkit-world"
             let scale = frame == .headRAS ? 1000.0 : 1.0
-            let header = "type,label,x,y,z,unit,coordinate_system,state,confidence"
+            let header = "type,label,x,y,z,unit,coordinate_system,state,confidence,provenance"
             let rows = items.map { item in
                 [item.type, item.label,
                  number(item.pointMeters.x * scale), number(item.pointMeters.y * scale),
                  number(item.pointMeters.z * scale), unit, coordinateSystem,
-                 csvEscaped(item.state), item.confidence.map { String(format: "%.3f", $0) } ?? ""]
+                 csvEscaped(item.state), item.confidence.map { String(format: "%.3f", $0) } ?? "",
+                 item.provenance?.rawValue ?? "unknown"]
                     .joined(separator: ",")
             }
             text = ([header] + rows).joined(separator: "\n") + "\n"
             filename = "manta_coordinates_\(coordinateSystem).csv"
-        case .sfp:
+        case .sfp, .sfpCentimeters:
+            let scale = format == .sfpCentimeters ? 100.0 : 1.0
             text = items.map { item in
                 let label = switch item.label {
                 case FiducialKind.nasion.rawValue: "FidNz"
@@ -722,10 +732,27 @@ nonisolated enum ReceiverCoordinateExporter {
                 case FiducialKind.rightPreauricular.rawValue: "FidT10"
                 default: item.label
                 }
-                return [label, sfpNumber(item.pointMeters.x), sfpNumber(item.pointMeters.y),
-                        sfpNumber(item.pointMeters.z)].joined(separator: "\t")
+                return [label, sfpNumber(item.pointMeters.x * scale), sfpNumber(item.pointMeters.y * scale),
+                        sfpNumber(item.pointMeters.z * scale)].joined(separator: "\t")
             }.joined(separator: "\n") + "\n"
-            filename = "manta_coordinates_\(frame.filenameLabel).sfp"
+            filename = "manta_coordinates_\(frame.filenameLabel)_\(format == .sfpCentimeters ? "cm" : "m").sfp"
+        case .geoScanTXT:
+            let points = items.filter { $0.state != "Missing" && !($0.type == "fiducial" && $0.label == "Cz") }.map { item in
+                let label = switch item.label {
+                case FiducialKind.nasion.rawValue: "FidNz"
+                case FiducialKind.leftPreauricular.rawValue: "FidT9"
+                case FiducialKind.rightPreauricular.rawValue: "FidT10"
+                default: item.label
+                }
+                return GeoScanTextPoint(label: label, coordinate: Coordinate3D(
+                    x: item.pointMeters.x, y: item.pointMeters.y, z: item.pointMeters.z),
+                    isEstimated: item.provenance?.isDirectMeasurement != true)
+            }
+            let count = bundle.capture.layoutID.localizedCaseInsensitiveContains("256") ? 256 : 128
+            text = GeoScanTextExporter.export(
+                points, sourceUnit: .meters, coordinateFrame: frame.filenameLabel,
+                labellingTemplate: "hydrocel_\(count).xml")
+            filename = "manta_coordinates_\(frame.filenameLabel)_cm.txt"
         case .egiXML:
             let sensors = items.enumerated().map { index, item -> String in
                 let centimeters = item.pointMeters * 100
@@ -776,7 +803,7 @@ nonisolated enum ReceiverCoordinateExporter {
             return Item(
                 type: "electrode", label: value.label,
                 pointMeters: SIMD3(value.coordinate[0], value.coordinate[1], value.coordinate[2]),
-                state: value.state, confidence: value.confidence)
+                state: value.state, confidence: value.confidence, provenance: value.provenance)
         }
         let fiducials = (bundle.capture.fiducials ?? []).compactMap { value -> Item? in
             guard value.coordinateSystem == "arkit-world",

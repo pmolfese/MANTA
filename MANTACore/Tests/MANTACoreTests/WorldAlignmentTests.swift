@@ -191,6 +191,14 @@ struct WorldAlignmentTests {
             translation: SIMD3(0.2, -0.4, 0.1))
         let target = source.map { apply(truth, $0) }
 
+        let seed = try #require(CoarseAlignment.pca(source: source, target: target))
+        let linear = simd_float3x3(
+            SIMD3(seed.transform.columns.0.x, seed.transform.columns.0.y, seed.transform.columns.0.z),
+            SIMD3(seed.transform.columns.1.x, seed.transform.columns.1.y, seed.transform.columns.1.z),
+            SIMD3(seed.transform.columns.2.x, seed.transform.columns.2.y, seed.transform.columns.2.z))
+        #expect(simd_determinant(linear) > 0)
+        #expect(seed.rmsError < 0.0001)
+
         var input = WorldAlignmentInput()
         input.seed = .coarsePCA
         input.sourceCloud = source

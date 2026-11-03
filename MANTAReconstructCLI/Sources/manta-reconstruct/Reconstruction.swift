@@ -1,5 +1,6 @@
 import Foundation
 import MANTACore
+import MANTAProcessing
 import RealityKit
 import simd
 
@@ -97,6 +98,7 @@ struct MacReconstructionDiagnostics: Codable, Sendable {
     var alignmentSymmetricRMSMeters: Float?
     var alignmentAccepted: Bool
     var alignmentMethod: String
+    var run: ProcessingRunMetadata? = nil
 }
 
 enum ReconstructionError: LocalizedError {
@@ -150,7 +152,8 @@ final class PhotogrammetryRunner {
         configuration.sampleOrdering = .sequential
         configuration.featureSensitivity = .high
         let active = try PhotogrammetrySession(
-            input: preparation.inputDirectory, configuration: configuration)
+            input: ObjectCaptureImages(directory: preparation.inputDirectory,
+                    records: try JSONDecoder().decode([ReconstructionCameraRecord].self, from: Data(contentsOf: preparation.posesURL))), configuration: configuration)
         session = active
         defer { session = nil }
 
@@ -159,11 +162,14 @@ final class PhotogrammetryRunner {
             detail: preparation.detail.requestDetail)
         let startedAt = Date()
         var skipped = [String]()
+        var rejected = [Int: String]()
+        var estimatedPoses: PhotogrammetrySession.Poses?
+        var posesError: String?
         var automaticDownsampling = false
         var currentProgress = 0.0
         progress(0, "Starting Object Capture")
         log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
-        try active.process(requests: [request])
+        try active.process(requests: [request, .poses])
 
         do {
             for try await output in active.outputs {
@@ -175,20 +181,33 @@ final class PhotogrammetryRunner {
                 case .requestProgress(_, let fraction):
                     currentProgress = fraction
                     progress(fraction, "Reconstructing \(preparation.detail.title) model")
+                case .requestComplete(_, let result):
+                    if case .poses(let poses) = result { estimatedPoses = poses }
+                case .invalidSample(let id, let reason):
+                    rejected[id] = reason
+                    log(.warning, "Invalid sample \(id): \(reason)")
                 case .skippedSample(let id):
+                    rejected[id] = "Skipped by Object Capture"
                     let sample = String(describing: id)
                     skipped.append(sample)
                     log(.warning, "Object Capture skipped input sample \(sample).")
                 case .automaticDownsampling:
                     automaticDownsampling = true
                     log(.warning, "Object Capture enabled automatic image downsampling.")
-                case .requestError(_, let error):
+                case .requestError(let failedRequest, let error):
+                    if case .poses = failedRequest {
+                        posesError = error.localizedDescription
+                        log(.warning, "Estimated calibration unavailable: \(error.localizedDescription)")
+                        continue
+                    }
                     log(.error, "Object Capture request failed: \(error.localizedDescription)")
                     throw ReconstructionError.processing(error.localizedDescription)
                 case .processingCancelled:
                     log(.warning, "Object Capture reported cancellation at \(Int(currentProgress * 100))%.")
                     throw ReconstructionError.cancelled
                 case .processingComplete:
+                    try ObjectCaptureCalibration.write(poses: estimatedPoses, to: preparation.posesURL,
+                                                       rejected: rejected, requestError: posesError)
                     guard FileManager.default.fileExists(atPath: preparation.modelURL.path) else {
                         log(.error, "Object Capture completed but did not produce a model file.")
                         throw ReconstructionError.missingOutput
@@ -211,13 +230,7 @@ final class PhotogrammetryRunner {
 }
 
 enum ReconstructionWorkflow {
-    private struct PoseRecord: Codable {
-        var imageFilename: String
-        var observationID: UUID
-        var cameraToWorld: [Double]
-        var intrinsics: [Double]
-        var imageOrientation: String
-    }
+    private typealias PoseRecord = ReconstructionCameraRecord
 
     static func estimate(
         bundle: MANTAValidatedBundle,
@@ -261,7 +274,7 @@ enum ReconstructionWorkflow {
 
         var poses = [PoseRecord]()
         do {
-            for item in imageSources(bundle: bundle) {
+            for (index, item) in imageSources(bundle: bundle).enumerated() {
                 let extensionName = item.url.pathExtension.lowercased()
                 let filename = "\(item.observation.id.uuidString.lowercased()).\(extensionName)"
                 let destination = input.appendingPathComponent(filename)
@@ -271,7 +284,7 @@ enum ReconstructionWorkflow {
                     try fileManager.copyItem(at: item.url, to: destination)
                 }
                 poses.append(PoseRecord(
-                    imageFilename: filename,
+                    sampleID: index, imageFilename: filename,
                     observationID: item.observation.id,
                     cameraToWorld: item.observation.cameraToWorld,
                     intrinsics: item.observation.intrinsics,
@@ -365,7 +378,9 @@ enum ReconstructionWorkflow {
             alignmentScale: alignmentScale,
             alignmentSymmetricRMSMeters: symmetricRMS?.isFinite == true ? symmetricRMS : nil,
             alignmentAccepted: alignmentAccepted,
-            alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp")
+            alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp",
+            run: ProcessingRunMetadata(
+                sourceBundleID: bundle.manifest.bundleID, files: bundle.manifest.files))
         try MANTAJSON.makeEncoder().encode(diagnostics).write(
             to: preparation.diagnosticsURL, options: .atomic)
         log?(.info, "Wrote reconstruction diagnostics.")

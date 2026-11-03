@@ -44,6 +44,9 @@ struct ContentView: View {
                 .zIndex(10)
             }
         }
+        .overlay(alignment: .bottom) {
+            CaptureSafetyBanner(scan: viewModel.scanViewModel)
+        }
         .animation(.easeInOut(duration: 0.22), value: showSidebar)
         .sheet(isPresented: $viewModel.promptForModelFiducials) {
             ModelFiducialPickerView(viewModel: viewModel)
@@ -103,14 +106,20 @@ private struct SidebarView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @State private var showExportPreview = false
 
+    private func validationBinding(_ key: WritableKeyPath<AcquisitionContext, String?>) -> Binding<String> {
+        Binding(get: { viewModel.session.acquisitionContext?[keyPath: key] ?? "" }, set: { value in
+            viewModel.updateAcquisitionContext {
+                $0[keyPath: key] = value.isEmpty ? nil : value
+                $0.coordinateTarget = "visibleDiscCupCenter"
+            }
+        })
+    }
+
     var body: some View {
         List {
             Section("Capture") {
-                Picker("Mode", selection: $viewModel.session.captureMode) {
-                    ForEach(CaptureMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
+                CaptureModeControl(scan: viewModel.scanViewModel,
+                    mode: Binding(get: { viewModel.session.captureMode }, set: viewModel.setCaptureMode))
 
                 if viewModel.session.captureMode.usesPhotogrammetry && !viewModel.isPhotogrammetrySupported {
                     Label("Photogrammetry isn't supported on this device.", systemImage: "exclamationmark.triangle")
@@ -314,6 +323,38 @@ private struct SidebarView: View {
                 }
             }
 
+            Section("Capture Presets & Experiments") {
+                CaptureExperimentControls(scan: viewModel.scanViewModel,
+                    captureMode: viewModel.session.captureMode, applyPreset: viewModel.applyCapturePreset) {
+                    Task { await viewModel.captureHighResolutionStill() }
+                }
+            }
+
+            Section("Paired GeoScan Validation") {
+                TextField("Reference session ID (no participant name)", text: validationBinding(\.pairedReferenceSessionID))
+                Picker("Acquisition order", selection: validationBinding(\.acquisitionOrder)) {
+                    Text("Not recorded").tag("")
+                    Text("MANTA then GeoScan").tag("mantaThenGeoScan")
+                    Text("GeoScan then MANTA").tag("geoScanThenManta")
+                }
+                TextField("Net movement / adjustments", text: validationBinding(\.netMovementNotes), axis: .vertical)
+                Toggle("GeoScan export received", isOn: Binding(
+                    get: { viewModel.session.acquisitionContext?.referenceExportConfirmed == true },
+                    set: { value in viewModel.updateAcquisitionContext { $0.referenceExportConfirmed = value } }))
+                Toggle("Separate repeat MANTA pass collected", isOn: Binding(
+                    get: { viewModel.session.acquisitionContext?.repeatCaptureConfirmed == true },
+                    set: { value in viewModel.updateAcquisitionContext { $0.repeatCaptureConfirmed = value } }))
+                Button("Check Before Participant Release") {
+                    Task { await viewModel.checkBeforeParticipantRelease() }
+                }.disabled(viewModel.isCheckingRelease)
+                if viewModel.isCheckingRelease { ProgressView("Checking saved evidence…") }
+                ForEach(Array(viewModel.releaseCheckMessages.enumerated()), id: \.offset) { _, message in
+                    Text(message).font(.caption).textSelection(.enabled)
+                }
+                Text("Target: visible disc/cup center. Record any net movement between scans; contact-point offsets are separate.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Export") {
                 Button {
                     viewModel.exportRawSession(id: viewModel.session.id)
@@ -334,6 +375,14 @@ private struct SidebarView: View {
                     }
                     .onChange(of: viewModel.selectedFormat) { _, newValue in
                         viewModel.updateFormat(newValue)
+                    }
+
+                    if [.sfp, .sfpCentimeters, .geoScanTXT].contains(viewModel.selectedFormat) {
+                        Button("Share Coordinates", systemImage: "square.and.arrow.up") {
+                            viewModel.shareCoordinateExport()
+                        }
+                        Text("SFP uses meters; SFP (centimeters) and GeoScan TXT use centimeters. GeoScan Estimated=0 indicates image/depth or image/mesh observations; inferred, manually placed, and unverified points use 1.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
 
                     Button {
@@ -1287,5 +1336,80 @@ private struct ElectrodeRow: View {
 
     private func coordinate(_ value: Double) -> String {
         String(format: "%.1f", value)
+    }
+}
+
+private struct CaptureModeControl: View {
+    @ObservedObject var scan: ARScanViewModel
+    @Binding var mode: CaptureMode
+    var body: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(CaptureMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+        }
+        .disabled(!scan.canEditCaptureSettings)
+    }
+}
+
+private struct CaptureExperimentControls: View {
+    @ObservedObject var scan: ARScanViewModel
+    let captureMode: CaptureMode
+    let applyPreset: (CapturePreset) -> Void
+    let captureStill: () -> Void
+
+    var body: some View {
+        Text(scan.canEditCaptureSettings
+             ? "Ready: " + scan.settingsSummary(captureMode: captureMode)
+             : scan.activeSettingsSummary.map { "Capture settings: " + $0 } ?? "Review-only session")
+            .font(.callout.weight(.semibold))
+        ForEach(CapturePreset.allCases, id: \.self) { preset in
+            Button(preset.rawValue) { applyPreset(preset) }
+                .disabled(!scan.canEditCaptureSettings)
+        }
+        Text("Capture a baseline pass first. Validation enables best-frame selection, cadence pairs, and high-resolution stills; depth may be unavailable. Start a new session to switch presets after saving frames.")
+            .font(.caption).foregroundStyle(.secondary)
+        if let message = scan.storageMessage {
+            Text(message).foregroundStyle(.orange).font(.callout)
+        }
+        if let message = scan.captureSafetyMessage {
+            Text(message).foregroundStyle(.orange).font(.callout)
+        }
+        Toggle("Save cadence comparison frames", isOn: $scan.preserveComparisonFrames)
+            .disabled(!scan.canEditCaptureSettings)
+        Text("Validation mode saves the ordinary cadence frame alongside the selected frame, deduplicating identical timestamps. Uses additional storage.")
+            .font(.caption).foregroundStyle(.secondary)
+        Toggle("Select best recent frame", isOn: $scan.selectBestFrames)
+            .disabled(!scan.canEditCaptureSettings)
+        Toggle("High-resolution stills (experimental)", isOn: $scan.highResolutionStills)
+            .disabled(!scan.canEditCaptureSettings)
+        Text("Set options before starting capture. Stills may change depth availability; automatic stills run at most every 5 seconds while tracking is normal, even if depth is absent. Best-frame selection uses a 0.9-second window.")
+            .font(.caption).foregroundStyle(.secondary)
+        Button("Capture High-Resolution Still", action: captureStill)
+            .disabled(!scan.status.isRunning || !scan.highResolutionStills || scan.isCapturingStill)
+        Button("Check Lens") { Task { await scan.checkLens() } }
+            .disabled(!scan.status.isRunning || scan.isCheckingLens)
+        Text(scan.lensMessage).font(.caption).foregroundStyle(.secondary)
+    }
+}
+
+private struct CaptureSafetyBanner: View {
+    @ObservedObject var scan: ARScanViewModel
+    var body: some View {
+        if scan.status.isRunning || scan.captureSafetyMessage != nil || scan.storageMessage != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                if let summary = scan.activeSettingsSummary {
+                    Text(summary).font(.caption.weight(.semibold))
+                }
+                if let message = scan.captureSafetyMessage {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(.orange)
+                }
+                if let message = scan.storageMessage {
+                    Label(message, systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.callout).foregroundStyle(.orange)
+                }
+            }
+            .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .padding().allowsHitTesting(false)
+        }
     }
 }

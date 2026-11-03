@@ -1,5 +1,6 @@
 import Foundation
 import MANTACore
+import MANTAProcessing
 import RealityKit
 import simd
 
@@ -164,6 +165,7 @@ struct ReceiverMacReconstructionDiagnostics: Codable, Sendable {
     var alignmentSymmetricRMSMeters: Float?
     var alignmentAccepted: Bool
     var alignmentMethod: String
+    var run: ProcessingRunMetadata? = nil
 }
 
 enum ReceiverReconstructionError: LocalizedError {
@@ -230,7 +232,8 @@ final class ReceiverPhotogrammetryRunner {
             log(.info, "Object Capture started with \(preparation.sampleDescriptors.count) depth-guided samples (\(withDepth) carrying LiDAR depth) at \(preparation.detail.title) detail.")
         } else {
             active = try PhotogrammetrySession(
-                input: preparation.inputDirectory, configuration: configuration)
+                input: ObjectCaptureImages(directory: preparation.inputDirectory,
+                    records: try JSONDecoder().decode([ReconstructionCameraRecord].self, from: Data(contentsOf: preparation.posesURL))), configuration: configuration)
             log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
         }
         session = active
@@ -241,10 +244,13 @@ final class ReceiverPhotogrammetryRunner {
             detail: preparation.detail.requestDetail)
         let startedAt = Date()
         var skipped = [String]()
+        var rejected = [Int: String]()
+        var estimatedPoses: PhotogrammetrySession.Poses?
+        var posesError: String?
         var automaticDownsampling = false
         var currentProgress = 0.0
         progress(0, "Starting Object Capture")
-        try active.process(requests: [request])
+        try active.process(requests: [request, .poses])
 
         do {
             for try await output in active.outputs {
@@ -256,20 +262,33 @@ final class ReceiverPhotogrammetryRunner {
                 case .requestProgress(_, let fraction):
                     currentProgress = fraction
                     progress(fraction, "Reconstructing \(preparation.detail.title) model")
+                case .requestComplete(_, let result):
+                    if case .poses(let poses) = result { estimatedPoses = poses }
+                case .invalidSample(let id, let reason):
+                    rejected[id] = reason
+                    log(.warning, "Invalid sample \(id): \(reason)")
                 case .skippedSample(let id):
+                    rejected[id] = "Skipped by Object Capture"
                     let sample = String(describing: id)
                     skipped.append(sample)
                     log(.warning, "Object Capture skipped input sample \(sample).")
                 case .automaticDownsampling:
                     automaticDownsampling = true
                     log(.warning, "Object Capture enabled automatic image downsampling.")
-                case .requestError(_, let error):
+                case .requestError(let failedRequest, let error):
+                    if case .poses = failedRequest {
+                        posesError = error.localizedDescription
+                        log(.warning, "Estimated calibration unavailable: \(error.localizedDescription)")
+                        continue
+                    }
                     log(.error, "Object Capture request failed: \(error.localizedDescription)")
                     throw ReceiverReconstructionError.processing(error.localizedDescription)
                 case .processingCancelled:
                     log(.warning, "Object Capture reported cancellation at \(Int(currentProgress * 100))%.")
                     throw ReceiverReconstructionError.cancelled
                 case .processingComplete:
+                    try ObjectCaptureCalibration.write(poses: estimatedPoses, to: preparation.posesURL,
+                                                       rejected: rejected, requestError: posesError)
                     guard FileManager.default.fileExists(atPath: preparation.modelURL.path) else {
                         log(.error, "Object Capture completed but did not produce a model file.")
                         throw ReceiverReconstructionError.missingOutput
@@ -292,13 +311,7 @@ final class ReceiverPhotogrammetryRunner {
 }
 
 nonisolated enum ReceiverReconstructionWorkflow {
-    private struct PoseRecord: Codable {
-        var imageFilename: String
-        var observationID: UUID
-        var cameraToWorld: [Double]
-        var intrinsics: [Double]
-        var imageOrientation: String
-    }
+    private typealias PoseRecord = ReconstructionCameraRecord
 
     static func estimate(
         bundle: MANTAValidatedBundle,
@@ -354,7 +367,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
                     try fileManager.copyItem(at: item.url, to: destination)
                 }
                 poses.append(PoseRecord(
-                    imageFilename: filename,
+                    sampleID: index, imageFilename: filename,
                     observationID: item.observation.id,
                     cameraToWorld: item.observation.cameraToWorld,
                     intrinsics: item.observation.intrinsics,
@@ -500,7 +513,9 @@ nonisolated enum ReceiverReconstructionWorkflow {
             alignmentScale: alignmentScale,
             alignmentSymmetricRMSMeters: symmetricRMS?.isFinite == true ? symmetricRMS : nil,
             alignmentAccepted: alignmentAccepted,
-            alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp")
+            alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp",
+            run: ProcessingRunMetadata(
+                sourceBundleID: bundle.manifest.bundleID, files: bundle.manifest.files))
         try MANTAJSON.makeEncoder().encode(diagnostics).write(
             to: preparation.diagnosticsURL, options: .atomic)
         log?(.info, "Wrote reconstruction diagnostics.")

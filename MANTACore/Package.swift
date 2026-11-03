@@ -12,16 +12,18 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .library(name: "MANTACore", targets: ["MANTACore"])
+        .library(name: "MANTACore", targets: ["MANTACore"]),
+        .library(name: "MANTAProcessing", targets: ["MANTAProcessing"])
     ],
     targets: [
+        .target(name: "MANTAProcessing", dependencies: ["MANTACore"]),
         .target(
             name: "MANTACore",
             resources: [.copy("Schemas")]
         ),
         .testTarget(
             name: "MANTACoreTests",
-            dependencies: ["MANTACore"],
+            dependencies: ["MANTACore", "MANTAProcessing"],
             resources: [.copy("Fixtures")]
         )
     ]

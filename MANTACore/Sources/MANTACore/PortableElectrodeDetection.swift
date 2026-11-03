@@ -57,7 +57,8 @@ public enum ElectrodeAnnotationBuilder {
                     z: Double(electrode.position.z)),
                 confidence: confidence,
                 state: confidence >= confidenceThreshold
-                    && !suspectLabels.contains(electrode.label) ? .detected : .needsReview)
+                    && !suspectLabels.contains(electrode.label) ? .detected : .needsReview,
+                provenance: .imageDepthObserved)
         }
     }
 }

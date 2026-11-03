@@ -8,7 +8,7 @@ import simd
 
 nonisolated struct ReceiverElectrodeEvidenceDocument: Codable, Sendable {
     var format = "org.nih.manta.electrode-evidence"
-    var version = 3
+    var version = 4
     var sessionID: UUID
     var sourceBundleID: UUID
     var generatedAt: Date
@@ -21,6 +21,7 @@ nonisolated struct ReceiverElectrodeEvidenceDocument: Codable, Sendable {
     /// remain unlabeled evidence; assignments are recorded in summaries.
     var unlabeledCandidates: [ReceiverUnlabeledCupEvidence]? = nil
     var detectorMetadata: ReceiverElectrodeDetectorMetadata? = nil
+    var unlocalizedObservations: [ReceiverUnlocalizedObservation]? = nil
 }
 
 nonisolated struct ReceiverElectrodeDetectorMetadata: Codable, Sendable {
@@ -30,6 +31,32 @@ nonisolated struct ReceiverElectrodeDetectorMetadata: Codable, Sendable {
     var cupFusionRadiusMeters: Double
     var cupMinimumViews: Int
     var maximumAssignmentDistanceMeters: Double
+    var run: ProcessingRunMetadata? = nil
+    var ocrConfiguration: ReceiverOCRConfiguration? = nil
+    var meshMaximumDepthDisagreementMeters: Double? = nil
+}
+
+/// Persist the same values used to create the request and decode its image.
+nonisolated struct ReceiverOCRConfiguration: Codable, Sendable {
+    var version = 2
+    var revision = VNRecognizeTextRequestRevision3
+    var recognitionLevel = "accurate"
+    var usesLanguageCorrection = false
+    var minimumTextHeight: Float = 0.008
+    var maximumImageDimension = 4096
+}
+
+/// Retained rays for offline retry; these are not 3D electrode measurements.
+nonisolated struct ReceiverUnlocalizedObservation: Codable, Sendable {
+    var observationID: UUID
+    var rawImagePoint: [Double]
+    var recognizedText: String?
+    var candidateLabels: [String]
+    var candidateConfidences: [Double]
+    var rawBoundingBox: [Double]?
+    var rayOrigin: [Double]
+    var rayDirection: [Double]
+    var reason: String
 }
 
 nonisolated struct ReceiverUnlabeledCupEvidence: Codable, Identifiable, Sendable {
@@ -39,6 +66,7 @@ nonisolated struct ReceiverUnlabeledCupEvidence: Codable, Identifiable, Sendable
     var depthPoint: [Double]
     var appearanceScore: Double
     var depthConfidence: Int
+    var depthSource: ElectrodeDepthSource? = nil
 }
 
 nonisolated struct ReceiverElectrodeManualEdit: Codable, Identifiable, Sendable {
@@ -63,6 +91,7 @@ nonisolated struct ReceiverElectrodeObservationEvidence: Codable, Identifiable, 
     var rawBoundingBox: [Double]
     var ocrConfidence: Double
     var depthConfidence: Int
+    var depthSource: ElectrodeDepthSource? = nil
     var depthMeters: Double
     var depthPoint: [Double]
     var rayOrigin: [Double]
@@ -94,7 +123,7 @@ nonisolated enum ReceiverElectrodeDetectionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noCalibratedFrames:
-            "No saved images have both valid camera calibration and metric depth."
+            "No saved images have valid camera calibration. RGB-only frames need an aligned mesh for 3D localization."
         case .noRecognizedElectrodes:
             "Neither OCR nor visual cup detection found reliable electrode evidence."
         }
@@ -103,6 +132,7 @@ nonisolated enum ReceiverElectrodeDetectionError: LocalizedError {
 
 nonisolated enum ReceiverElectrodeDetector {
     typealias Progress = @Sendable (Double, String) -> Void
+    private static let ocrConfiguration = ReceiverOCRConfiguration()
 
     static func detect(
         bundle: MANTAValidatedBundle,
@@ -110,7 +140,7 @@ nonisolated enum ReceiverElectrodeDetector {
         progress: Progress? = nil
     ) throws -> ReceiverElectrodeDetectionResult {
         let frames = bundle.capture.observations.filter {
-            imagePath(for: $0) != nil && $0.depth != nil
+            imagePath(for: $0) != nil
                 && $0.intrinsics.count == 9 && $0.cameraToWorld.count == 16
         }
         guard !frames.isEmpty else { throw ReceiverElectrodeDetectionError.noCalibratedFrames }
@@ -123,6 +153,7 @@ nonisolated enum ReceiverElectrodeDetector {
         let surface = modelMesh.map(ReceiverSurfaceVertexIndex.init)
         var evidence = [ReceiverElectrodeObservationEvidence]()
         var unlabeledEvidence = [ReceiverUnlabeledCupEvidence]()
+        var unlocalized = [ReceiverUnlocalizedObservation]()
 
         for (index, observation) in frames.enumerated() {
             try Task.checkCancellation()
@@ -133,10 +164,29 @@ nonisolated enum ReceiverElectrodeDetector {
                   let image = loadImage(bundle.rootDirectory.appendingPathComponent(path)),
                   let camera = PinholeCamera(
                     intrinsics: observation.intrinsics.map(Float.init),
-                    transform: observation.cameraToWorld.map(Float.init)),
-                  let depth = ReceiverElectrodeDepthFrame(
-                    observation: observation, rootDirectory: bundle.rootDirectory)
+                    transform: observation.cameraToWorld.map(Float.init))
             else { continue }
+            let depth = ReceiverElectrodeDepthFrame(observation: observation, rootDirectory: bundle.rootDirectory)
+            func locate(_ pixel: SIMD2<Float>) -> (ReceiverDepthSample, SIMD3<Float>)? {
+                let sample = depth?.sample(rawImagePoint: pixel)
+                guard let result = ElectrodeRayLocalizer.locate(pixel: pixel, camera: camera,
+                    sceneDepth: sample?.depth, meshVertices: modelMesh?.vertices ?? [],
+                    meshIndices: modelMesh?.indices ?? []) else { return nil }
+                return (ReceiverDepthSample(depth: result.depthMeters,
+                    confidence: result.source == .sceneDepth ? (sample?.confidence ?? 0) : 0,
+                    source: result.source), result.point)
+            }
+            func retainRay(_ pixel: SIMD2<Float>, text: String?, labels: [String], confidences: [Double] = [], bounds: [Double]? = nil) {
+                let origin4 = camera.cameraToWorld.columns.3
+                let origin = SIMD3<Float>(origin4.x, origin4.y, origin4.z)
+                let direction = simd_normalize(camera.unproject(pixel: pixel, depth: 1) - origin)
+                guard direction.allFinite, origin.allFinite else { return }
+                unlocalized.append(ReceiverUnlocalizedObservation(observationID: observation.id,
+                    rawImagePoint: pixel.doubles, recognizedText: text, candidateLabels: labels,
+                    candidateConfidences: confidences, rawBoundingBox: bounds,
+                    rayOrigin: origin.doubles, rayDirection: direction.doubles,
+                    reason: modelMesh == nil ? "no-aligned-mesh-or-valid-depth" : "no-valid-mesh-hit-or-depth"))
+            }
 
             let recognized = try recognize(
                 image: image, observation: observation, validNumbers: validNumbers)
@@ -144,8 +194,11 @@ nonisolated enum ReceiverElectrodeDetector {
             let origin = camera.cameraToWorld.columns.3.xyz
             var bestByLabel = [String: ReceiverResolvedOCRHit]()
             for hit in recognized {
-                guard let sample = depth.sample(rawImagePoint: hit.rawPoint) else { continue }
-                let world = camera.unproject(pixel: hit.rawPoint, depth: sample.depth)
+                guard let (sample, world) = locate(hit.rawPoint) else {
+                    retainRay(hit.rawPoint, text: hit.text, labels: hit.candidates.map(\.label),
+                              confidences: hit.candidates.map { Double($0.confidence) }, bounds: hit.rawBoundingBox)
+                    continue
+                }
                 let direction = simd_normalize(camera.unproject(pixel: hit.rawPoint, depth: 1) - origin)
                 guard world.allFinite, direction.allFinite else { continue }
                 let choice = worldGuide?.resolve(candidates: hit.candidates, at: world)
@@ -172,35 +225,36 @@ nonisolated enum ReceiverElectrodeDetector {
                     rawBoundingBox: hit.rawBoundingBox,
                     ocrConfidence: Double(resolved.choice.candidate.confidence),
                     depthConfidence: Int(resolved.sample.confidence),
+                    depthSource: resolved.sample.source,
                     depthMeters: Double(resolved.sample.depth),
                     depthPoint: resolved.world.doubles, rayOrigin: resolved.origin.doubles,
                     rayDirection: resolved.direction.doubles))
             }
             let occupied = bestByLabel.values.map(\.hit.rawPoint)
-            let cvFrameStride = max(1, Int(ceil(Double(frames.count) / 24.0)))
-            let cupCandidates = index.isMultiple(of: cvFrameStride)
-                ? (discLocator?.locateAllDiscs(
+            let cupCandidates = discLocator?.locateAllDiscs(
                 orientation: ReceiverStoredImageOrientation(observation.imageOrientation),
                 rawSize: CGSize(
                     width: observation.imageDimensions.width,
-                    height: observation.imageDimensions.height)) ?? [])
-                : []
+                    height: observation.imageDimensions.height)) ?? []
             for candidate in cupCandidates {
                 guard !occupied.contains(where: {
                     simd_distance($0, candidate.rawPoint) < 18
-                }), let sample = depth.sample(rawImagePoint: candidate.rawPoint) else { continue }
-                let world = camera.unproject(pixel: candidate.rawPoint, depth: sample.depth)
+                }) else { continue }
+                guard let (sample, world) = locate(candidate.rawPoint) else {
+                    retainRay(candidate.rawPoint, text: nil, labels: [])
+                    continue
+                }
                 guard world.allFinite else { continue }
                 unlabeledEvidence.append(ReceiverUnlabeledCupEvidence(
                     id: UUID(), observationID: observation.id,
                     rawImagePoint: candidate.rawPoint.doubles,
                     depthPoint: world.doubles,
                     appearanceScore: Double(candidate.score),
-                    depthConfidence: Int(sample.confidence)))
+                    depthConfidence: Int(sample.confidence), depthSource: sample.source))
             }
         }
 
-        guard !evidence.isEmpty || !unlabeledEvidence.isEmpty else {
+        guard !evidence.isEmpty || !unlabeledEvidence.isEmpty || !unlocalized.isEmpty else {
             throw ReceiverElectrodeDetectionError.noRecognizedElectrodes
         }
         progress?(0.93, "Fusing repeated sensor sightings")
@@ -213,7 +267,10 @@ nonisolated enum ReceiverElectrodeDetector {
                 label: summary.label,
                 role: roles.contains(summary.label) ? "Cardinal" : "Regular",
                 coordinateSystem: "arkit-world", coordinate: summary.coordinate,
-                confidence: summary.confidence, state: summary.state)
+                confidence: summary.confidence, state: summary.state,
+                provenance: evidence.contains(where: { $0.label == summary.label })
+                    ? (evidence.contains(where: { $0.label == summary.label && $0.depthSource == .alignedMesh })
+                        ? .imageMeshObserved : .imageDepthObserved) : (summary.supportCount > 0 ? .visualLayoutAssigned : .templateInferred))
         }
         let reconstruction = bundle.capture.reconstruction
         let document = ReceiverElectrodeEvidenceDocument(
@@ -228,9 +285,17 @@ nonisolated enum ReceiverElectrodeDetector {
             unlabeledCandidates: unlabeledEvidence,
             detectorMetadata: ReceiverElectrodeDetectorMetadata(
                 engine: "vision-ocr+classical-cup-cv+global-layout-assignment",
-                engineVersion: 1, cupAppearanceThreshold: 0.16,
+                engineVersion: 2, cupAppearanceThreshold: 0.16,
                 cupFusionRadiusMeters: 0.012, cupMinimumViews: 2,
-                maximumAssignmentDistanceMeters: 0.04))
+                maximumAssignmentDistanceMeters: 0.04,
+                run: ProcessingRunMetadata(
+                    sourceBundleID: bundle.manifest.bundleID, files: bundle.manifest.files),
+                ocrConfiguration: ocrConfiguration, meshMaximumDepthDisagreementMeters: 0.03),
+            unlocalizedObservations: unlocalized)
+        if evidence.isEmpty && unlabeledEvidence.isEmpty {
+            progress?(1, "Retained 2D candidates for offline localization; use Save Sensors to persist")
+            return ReceiverElectrodeDetectionResult(electrodes: bundle.capture.electrodes ?? [], evidence: document)
+        }
         progress?(0.97, "Estimating unobserved sensors")
         let initial = ReceiverElectrodeDetectionResult(
             electrodes: electrodes, evidence: document)
@@ -250,7 +315,7 @@ nonisolated enum ReceiverElectrodeDetector {
     ) -> [ReceiverElectrodeSummary] {
         let detections = evidence.compactMap { item -> LabeledDetection? in
             guard let point = SIMD3<Float>(doubles: item.depthPoint) else { return nil }
-            let depthQuality = item.depthConfidence >= 2 ? 1.0 : 0.82
+            let depthQuality = item.depthSource == .alignedMesh ? 0.70 : (item.depthConfidence >= 2 ? 1.0 : 0.82)
             return LabeledDetection(
                 label: item.label, world: point,
                 quality: Float(item.ocrConfidence * depthQuality))
@@ -269,13 +334,11 @@ nonisolated enum ReceiverElectrodeDetector {
             let rayFit = ReceiverRayTriangulator.fit(rays)
             let rayResidual = rayFit.map { simd_distance($0.point, aggregate.position) }
 
-            var coordinate = aggregate.position
+            let coordinate = aggregate.position
             var surfaceDistance: Float?
             if let nearest = surface?.nearest(to: aggregate.position, maximumDistance: 0.03) {
                 surfaceDistance = nearest.distance
-                // A close photogrammetry surface removes depth noise. Larger gaps
-                // remain diagnostic rather than silently moving an electrode.
-                if nearest.distance <= 0.012 { coordinate = nearest.point }
+                // Diagnostic only: never slide a measured ray hit to a mesh vertex.
             }
 
             let supportFactor = min(1, Float(aggregate.observationCount) / 3)
@@ -442,7 +505,7 @@ nonisolated enum ReceiverElectrodeDetector {
     ) -> [ReceiverCupCluster] {
         var clusters = [ReceiverCupClusterAccumulator]()
         for item in evidence.sorted(by: { $0.appearanceScore > $1.appearanceScore }) {
-            guard item.depthConfidence >= 1,
+            guard item.depthSource == .alignedMesh || item.depthConfidence >= 1,
                   let point = SIMD3<Float>(doubles: item.depthPoint) else { continue }
             if let index = clusters.indices.min(by: {
                 simd_distance(clusters[$0].center, point)
@@ -524,9 +587,10 @@ nonisolated enum ReceiverElectrodeDetector {
         validNumbers: Set<Int>
     ) throws -> [ReceiverOCRHit] {
         let request = VNRecognizeTextRequest()
+        request.revision = ocrConfiguration.revision
         request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.008
+        request.usesLanguageCorrection = ocrConfiguration.usesLanguageCorrection
+        request.minimumTextHeight = ocrConfiguration.minimumTextHeight
         request.customWords = validNumbers.flatMap { [String($0), "E\($0)"] }
         let orientation = ReceiverStoredImageOrientation(observation.imageOrientation)
         let handler = VNImageRequestHandler(
@@ -606,7 +670,7 @@ nonisolated enum ReceiverElectrodeDetector {
         // every frame; points are still mapped through the manifest's raw size.
         return CGImageSourceCreateThumbnailAtIndex(source, 0, [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceThumbnailMaxPixelSize: 2048,
+            kCGImageSourceThumbnailMaxPixelSize: ocrConfiguration.maximumImageDimension,
             kCGImageSourceCreateThumbnailWithTransform: false,
             kCGImageSourceShouldCacheImmediately: true
         ] as CFDictionary)
@@ -1291,7 +1355,7 @@ nonisolated enum ReceiverElectrodeGuessSolver {
             output.append(MANTAElectrodeSolution(
                 label: definition.label, role: definition.role.rawValue,
                 coordinateSystem: "arkit-world", coordinate: coordinate.doubles,
-                confidence: confidence, state: "Guessed"))
+                confidence: confidence, state: "Guessed", provenance: .templateInferred))
             outputSummaries.append(ReceiverElectrodeSummary(
                 label: definition.label, coordinate: coordinate.doubles,
                 supportCount: 0, spreadMeters: 0, confidence: confidence,
@@ -1429,6 +1493,7 @@ nonisolated enum ReceiverElectrodeGuessSolver {
 nonisolated private struct ReceiverDepthSample {
     var depth: Float
     var confidence: UInt8
+    var source: ElectrodeDepthSource = .sceneDepth
 }
 
 nonisolated private struct ReceiverElectrodeDepthFrame {

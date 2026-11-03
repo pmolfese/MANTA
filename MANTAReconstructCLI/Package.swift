@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 // A standalone command-line photogrammetry reconstruction tool for MANTA.
@@ -12,16 +12,22 @@ import PackageDescription
 let package = Package(
     name: "MANTAReconstructCLI",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v26)
     ],
     dependencies: [
         .package(path: "../MANTACore")
     ],
     targets: [
+        .executableTarget(name: "manta-benchmark", dependencies: [.product(name: "MANTACore", package: "MANTACore")]),
+        .executableTarget(
+            name: "manta-compare",
+            dependencies: [.product(name: "MANTACore", package: "MANTACore")]
+        ),
         .executableTarget(
             name: "manta-reconstruct",
             dependencies: [
-                .product(name: "MANTACore", package: "MANTACore")
+                .product(name: "MANTACore", package: "MANTACore"),
+                .product(name: "MANTAProcessing", package: "MANTACore")
             ],
             // The reconstruction driver was ported from the receiver, which is
             // written for Swift 6 concurrency; the v5 language mode keeps this

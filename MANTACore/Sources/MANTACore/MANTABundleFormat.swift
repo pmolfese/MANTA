@@ -324,10 +324,11 @@ public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
     public var coordinate: [Double]
     public var confidence: Double
     public var state: String
+    public var provenance: CoordinateProvenance?
 
     public init(
         label: String, role: String, coordinateSystem: String,
-        coordinate: [Double], confidence: Double, state: String
+        coordinate: [Double], confidence: Double, state: String, provenance: CoordinateProvenance? = nil
     ) {
         self.label = label
         self.role = role
@@ -335,6 +336,7 @@ public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
         self.coordinate = coordinate
         self.confidence = confidence
         self.state = state
+        self.provenance = provenance
     }
 }
 
