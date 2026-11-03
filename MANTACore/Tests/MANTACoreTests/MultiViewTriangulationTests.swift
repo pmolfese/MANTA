@@ -39,6 +39,25 @@ struct MultiViewTriangulationTests {
         #expect(MultiViewTriangulation.triangulate(rays: rays) == nil)
     }
 
+    @Test func rejectsNearlyParallelAndBehindCameraIntersections() {
+        let a = SIMD3<Float>(-0.001, 0, 0)
+        let b = SIMD3<Float>(0.001, 0, 0)
+        let farPoint = SIMD3<Float>(0, 0, -1)
+        #expect(MultiViewTriangulation.triangulate(rays: [(a, farPoint - a), (b, farPoint - b)]) == nil)
+        // Both infinite lines meet, but the intersection is behind both cameras.
+        let left = SIMD3<Float>(-0.2, 0, 0)
+        let right = SIMD3<Float>(0.2, 0, 0)
+        #expect(MultiViewTriangulation.triangulate(rays: [(left, left - farPoint), (right, right - farPoint)]) == nil)
+    }
+
+    @Test func rejectsInvalidRaysAndCoincidentCameraCenters() {
+        let good = (origin: SIMD3<Float>(0.2, 0, 0), direction: SIMD3<Float>(-0.2, 0, -1))
+        #expect(MultiViewTriangulation.triangulate(rays: [good, (.zero, SIMD3(.nan, 0, -1))]) == nil)
+        #expect(MultiViewTriangulation.triangulate(rays: [good, (SIMD3(.infinity, 0, 0), SIMD3(0, 0, -1))]) == nil)
+        #expect(MultiViewTriangulation.triangulate(rays: [good, (.zero, .zero)]) == nil)
+        #expect(MultiViewTriangulation.triangulate(rays: [(.zero, SIMD3(0.2, 0, -1)), (.zero, SIMD3(-0.2, 0, -1))]) == nil)
+    }
+
     @Test func rejectsTooFewRays() {
         let rays: [(origin: SIMD3<Float>, direction: SIMD3<Float>)] = [
             (SIMD3(0, 0, 0), SIMD3(1, 0, -1))

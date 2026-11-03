@@ -35,7 +35,7 @@ nonisolated enum ReceiverProcessedPackage {
             atPath: url.appendingPathComponent(metadataFilename).path)
     }
 
-    static func load(at root: URL) throws -> MANTAValidatedBundle {
+    static func load(at root: URL, verifyIntegrity: Bool = false) throws -> MANTAValidatedBundle {
         let decoder = MANTAJSON.makeDecoder()
         let metadata = try decoder.decode(
             ReceiverProcessedPackageMetadata.self,
@@ -65,7 +65,9 @@ nonisolated enum ReceiverProcessedPackage {
             rootDirectory: root,
             manifest: manifest,
             capture: capture,
-            changeLog: changeLog)
+            changeLog: changeLog,
+            integrityWarnings: verifyIntegrity
+                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files) : [])
     }
 
     static func loadElectrodeEvidence(

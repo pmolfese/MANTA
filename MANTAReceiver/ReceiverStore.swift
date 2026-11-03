@@ -4,6 +4,7 @@ import MANTACore
 @MainActor
 final class ReceiverStore: ObservableObject {
     @Published private(set) var bundle: MANTAValidatedBundle?
+    @Published private(set) var importIntegrityWarnings = [MANTABundleIntegrityWarning]()
     @Published private(set) var importedArchiveURL: URL?
     @Published private(set) var isImporting = false
     @Published private(set) var isReconstructing = false
@@ -64,6 +65,7 @@ final class ReceiverStore: ObservableObject {
                 try Self.persistAndValidate(sourceURL)
             }.value
             bundle = result.bundle
+            importIntegrityWarnings = result.bundle.integrityWarnings
             importedArchiveURL = result.archiveURL
             processedPackageURL = ReceiverProcessedPackage.isPackage(result.bundle.rootDirectory)
                 ? result.bundle.rootDirectory : nil
@@ -530,7 +532,7 @@ final class ReceiverStore: ObservableObject {
 
         if isDirectory.boolValue {
             if ReceiverProcessedPackage.isPackage(sourceURL) {
-                return (try ReceiverProcessedPackage.load(at: sourceURL), sourceURL)
+                return (try ReceiverProcessedPackage.load(at: sourceURL, verifyIntegrity: true), sourceURL)
             }
             let manifestURL = sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename)
             let isRawSessionDirectory = fileManager.fileExists(

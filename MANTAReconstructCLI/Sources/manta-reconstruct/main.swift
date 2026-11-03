@@ -155,7 +155,8 @@ func loadBundle(at input: URL) throws -> (bundle: MANTAValidatedBundle, cleanup:
             MANTACaptureDocument.self,
             from: Data(contentsOf: captureURL))
         let bundle = MANTAValidatedBundle(
-            rootDirectory: root, manifest: manifest, capture: capture, changeLog: nil)
+            rootDirectory: root, manifest: manifest, capture: capture, changeLog: nil,
+            integrityWarnings: MANTABundleIntegrity.warnings(directory: root, files: manifest.files))
         return (bundle, nil)
     }
 
@@ -217,6 +218,7 @@ Task {
         log(.info, "Loading capture bundle: \(options.input.path)")
         let (bundle, cleanup) = try loadBundle(at: options.input)
         cleanupURL = cleanup
+        for warning in bundle.integrityWarnings { log(.warning, warning.message) }
 
         let estimate = ReconstructionWorkflow.estimate(bundle: bundle, detail: options.detail)
         log(.info, "\(estimate.imageCount) source images, \(bytesString(estimate.sourceImageBytes)).")

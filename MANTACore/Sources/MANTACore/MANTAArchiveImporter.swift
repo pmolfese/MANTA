@@ -73,7 +73,7 @@ public struct MANTAArchiveImporter {
             ".manta-import-\(UUID().uuidString).partial", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         do {
-            try extract(archiveURL, to: staging)
+            let archiveWarnings = try extract(archiveURL, to: staging)
             let validated = try MANTABundleValidator(fileManager: fileManager).validate(
                 directory: staging)
             try fileManager.moveItem(at: staging, to: destinationDirectory)
@@ -81,14 +81,15 @@ public struct MANTAArchiveImporter {
                 rootDirectory: destinationDirectory,
                 manifest: validated.manifest,
                 capture: validated.capture,
-                changeLog: validated.changeLog)
+                changeLog: validated.changeLog,
+                integrityWarnings: archiveWarnings + validated.integrityWarnings)
         } catch {
             try? fileManager.removeItem(at: staging)
             throw error
         }
     }
 
-    private func extract(_ archiveURL: URL, to root: URL) throws {
+    private func extract(_ archiveURL: URL, to root: URL) throws -> [MANTABundleIntegrityWarning] {
         let values = try archiveURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values.isRegularFile == true, let archiveSize = values.fileSize else {
             throw MANTAArchiveImportError.invalidArchive("source is not a regular file")
@@ -100,9 +101,11 @@ public struct MANTAArchiveImporter {
         defer { try? handle.close() }
         let entries = try readCentralDirectory(handle: handle, archiveSize: UInt64(archiveSize))
         try validateLimits(entries)
+        var warnings: [MANTABundleIntegrityWarning] = []
         for entry in entries {
-            try extract(entry, from: handle, to: root)
+            if let warning = try extract(entry, from: handle, to: root) { warnings.append(warning) }
         }
+        return warnings
     }
 
     private func readCentralDirectory(
@@ -234,7 +237,7 @@ public struct MANTAArchiveImporter {
         }
     }
 
-    private func extract(_ entry: ZIPEntry, from handle: FileHandle, to root: URL) throws {
+    private func extract(_ entry: ZIPEntry, from handle: FileHandle, to root: URL) throws -> MANTABundleIntegrityWarning? {
         let local = try read(handle, offset: UInt64(entry.localHeaderOffset), count: 30)
         guard local.u32(0) == 0x04034b50 else {
             throw MANTAArchiveImportError.invalidArchive("missing local header for \(entry.path)")
@@ -246,7 +249,6 @@ public struct MANTAArchiveImporter {
         guard String(data: nameData, encoding: .utf8) == entry.path,
               local.u16(6) == entry.flags,
               local.u16(8) == entry.method,
-              local.u32(14) == entry.crc32,
               local.u32(18) == entry.compressedSize,
               local.u32(22) == entry.uncompressedSize else {
             throw MANTAArchiveImportError.invalidArchive("local header mismatch for \(entry.path)")
@@ -257,7 +259,7 @@ public struct MANTAArchiveImporter {
                 throw MANTAArchiveImportError.invalidArchive("directory entry contains data")
             }
             try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-            return
+            return nil
         }
         try fileManager.createDirectory(
             at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -280,9 +282,11 @@ public struct MANTAArchiveImporter {
             remaining -= count
             offset += UInt64(count)
         }
-        guard crc.finalize() == entry.crc32 else {
-            throw MANTAArchiveImportError.checksumMismatch(entry.path)
+        if crc.finalize() != entry.crc32 || local.u32(14) != entry.crc32 {
+            return MANTABundleIntegrityWarning(path: entry.path, kind: .archiveChecksumMismatch,
+                message: "ZIP CRC differs for \(entry.path); extracted bytes may be damaged. Import remains available.")
         }
+        return nil
     }
 
     private func validate(path: String) throws {

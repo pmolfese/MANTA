@@ -47,9 +47,12 @@ depth.
 
 The input may be a `.manta` **directory package** or a `.manta` **zip
 archive**. Directory packages are loaded leniently — the manifest and capture
-document are read directly and per-file integrity gates (SHA / size) are not
-enforced — so a stray byte-count drift in a saved bundle never blocks a
-reconstruction.
+document are read directly. SHA-256 and byte counts are checked in bounded-memory
+streams and reported as warnings, never as import gates. Missing/malformed hashes
+also warn. Legacy ZIP CRC mismatches are advisory when the archive remains
+structurally readable. This preserves access to older or edited captures without
+silently describing them as integrity-verified. Files and manifests are not rewritten
+by the audit, and directory packages are never converted to ZIP.
 
 ### Outputs (written into `--output`)
 

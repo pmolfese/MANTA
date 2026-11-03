@@ -121,8 +121,8 @@ struct ReceiverAlignmentWorkspace: View {
     /// session's image clicks.
     private func worldTarget(for kind: FiducialKind) -> SIMD3<Float>? {
         if useArchivedFiducials, let archived = archivedFiducials[kind] { return archived }
-        if targetMode == .triangulate, let result = triangulation(for: kind) {
-            return result.point
+        if targetMode == .triangulate {
+            return triangulation(for: kind)?.point
         }
         return targetSummary(for: kind)?.center
     }
@@ -418,7 +418,14 @@ struct ReceiverAlignmentWorkspace: View {
                 Picker("Click resolution", selection: $targetMode) {
                     ForEach(availableModes) { Text($0.rawValue).tag($0) }
                 }
-                .onChange(of: targetMode) { _, _ in invalidateSolve() }
+                .onChange(of: targetMode) { _, _ in
+                    // Stored depth/mesh positions and pixel-only clicks are not
+                    // interchangeable. Never reuse placeholders in another mode.
+                    targetEvidence.removeAll()
+                    snapDistances.removeAll()
+                    placementError = nil
+                    invalidateSolve()
+                }
                 Text(targetMode.explanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -533,10 +540,14 @@ struct ReceiverAlignmentWorkspace: View {
 
     @ViewBuilder
     private func snapCell(_ kind: FiducialKind) -> some View {
-        if targetMode == .triangulate, let result = triangulation(for: kind) {
-            let mm = result.rmsMeters * 1_000
-            Text("\(mm.formatted(.number.precision(.fractionLength(1)))) mm · \(result.rayCount)v")
-                .foregroundStyle(mm > 15 ? .orange : (mm > 8 ? .yellow : .green))
+        if targetMode == .triangulate {
+            if let result = triangulation(for: kind) {
+                let mm = result.rmsMeters * 1_000
+                Text("\(mm.formatted(.number.precision(.fractionLength(1)))) mm · \(result.rayCount)v")
+                    .foregroundStyle(mm > 15 ? .orange : (mm > 8 ? .yellow : .green))
+            } else {
+                Text("Unresolved").foregroundStyle(.orange)
+            }
         } else if let delta = snapDistances[kind] {
             let mm = delta * 1_000
             Text(mm.formatted(.number.precision(.fractionLength(1))) + " mm")
@@ -556,6 +567,12 @@ struct ReceiverAlignmentWorkspace: View {
         let targetLabel: String
         if useArchivedFiducials, archivedFiducials[kind] != nil {
             targetLabel = "Archived (device)"
+        } else if targetMode == .triangulate {
+            if triangulation(for: kind) != nil {
+                targetLabel = "\(imageCount) views · triangulated"
+            } else {
+                targetLabel = imageCount < 2 ? "Needs 2+ views" : "Unstable rays · add another view"
+            }
         } else if imageCount > 0, let target {
             let views = "\(imageCount) view\(imageCount == 1 ? "" : "s")"
             targetLabel = target.outlierCount > 0
@@ -698,6 +715,9 @@ struct ReceiverAlignmentWorkspace: View {
         if imageCount == 3, modelCount < 3 {
             return "Image landmarks 3/3 · model landmarks \(modelCount)/3. Select each landmark above, then click it on the 3D model."
         }
+        if targetMode == .triangulate {
+            return "Resolved landmarks \(imageCount)/3 · model landmarks \(modelCount)/3. Each image landmark needs 2+ separated views with a valid forward intersection. No depth fallback is used."
+        }
         return "Image landmarks \(imageCount)/3 · model landmarks \(modelCount)/3. Each landmark needs a click in an RGB-D image and on the 3D model."
     }
 
@@ -762,6 +782,10 @@ struct ReceiverAlignmentWorkspace: View {
     }
 
     private func solve() {
+        guard canSolve else {
+            solveError = solveReadinessMessage
+            return
+        }
         var targets = [FiducialKind: SIMD3<Float>]()
         var counts = [FiducialKind: Int]()
         var usedCounts = [FiducialKind: Int]()
@@ -778,7 +802,8 @@ struct ReceiverAlignmentWorkspace: View {
                 centerMethods[kind] = "archived device fiducial"
                 continue
             }
-            if targetMode == .triangulate, let result = triangulation(for: kind) {
+            if targetMode == .triangulate {
+                guard let result = triangulation(for: kind) else { continue }
                 targets[kind] = result.point
                 counts[kind] = result.rayCount
                 usedCounts[kind] = result.rayCount
@@ -854,7 +879,8 @@ struct ReceiverAlignmentWorkspace: View {
     private func targetSummary(
         for kind: FiducialKind
     ) -> RobustPointSetCenterResult? {
-        guard let values = targetEvidence[kind]?.values, !values.isEmpty else { return nil }
+        guard targetMode != .triangulate,
+              let values = targetEvidence[kind]?.values, !values.isEmpty else { return nil }
         return RobustPointSetCenter.fit(values.map(\.worldPoint))
     }
 
@@ -866,7 +892,7 @@ struct ReceiverAlignmentWorkspace: View {
                     kind: kind.rawValue,
                     observationID: observationID,
                     rawImagePoint: [Double(hit.rawImagePoint.x), Double(hit.rawImagePoint.y)],
-                    worldPoint: [
+                    worldPoint: targetMode == .triangulate ? nil : [
                         Double(hit.worldPoint.x), Double(hit.worldPoint.y),
                         Double(hit.worldPoint.z)
                     ],

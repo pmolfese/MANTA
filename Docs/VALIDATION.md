@@ -519,3 +519,30 @@ recovery, and preset naming. iPad integration tests cover warning/pause/no autom
 restart and preset locking; the app and test bundle compile, but execution requires
 an iOS 27 device/runtime. Physical M5 camera/depth and storage-pressure behavior are
 not yet validated.
+
+## Receiver triangulation and advisory integrity checks
+
+Triangulation mode resolves image landmarks only from valid forward camera-ray
+intersections (or an explicitly enabled archived device landmark). Insufficient,
+nonfinite, degenerate, or behind-camera intersections stay unresolved. Required
+landmarks block landmark-seeded solves; optional unresolved Cz is omitted. The UI
+reports missing views or unstable rays. Switching resolution modes clears temporary
+click evidence so pixel-only placeholders cannot later become depth/mesh targets.
+Per-click triangulation evidence omits `worldPoint`; the combined solution is stored
+in the target-landmark diagnostics. A one-degree minimum ray-pair separation is a
+conservative geometry gate, not a clinical or metrological accuracy threshold.
+
+Bundle SHA-256 and size mismatches are warnings, as are absent/malformed checksums.
+Otherwise readable legacy ZIP CRC mismatches also warn. Receiver shows these under
+Imported Capture and the reconstruction CLI prints them; they do not disable
+processing/export. The audit never changes source bytes or rewrites hashes to hide
+a mismatch. Structural metadata/path checks remain enforced. An unreadable image
+can still fail its later processing step; advisory integrity does not repair data.
+
+Directory-package and mutable PROCESSED workflows remain intact. Hashing reads
+64 KiB at a time with 64-bit file sizes; it never builds a ZIP or loads the whole
+payload into memory. Fresh finalization/recovery skips a redundant hash pass, and
+processed-package edits do not trigger full scans. Regression tests cover clean,
+missing, malformed, mismatched hashes and sizes, imported legacy ZIP warnings, and
+a sparse 2 GiB + 16-byte file with an independently computed checksum. The latter
+checks bytes after the signed 32-bit boundary, not just file-size metadata.

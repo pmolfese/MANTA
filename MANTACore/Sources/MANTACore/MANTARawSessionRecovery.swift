@@ -147,7 +147,7 @@ public struct MANTARawSessionRecovery {
             to: staging.appendingPathComponent(MANTABundleFormat.manifestFilename),
             options: .atomic)
 
-        let validated = try MANTABundleValidator(fileManager: fileManager).validate(directory: staging)
+        let validated = try MANTABundleValidator(fileManager: fileManager).validate(directory: staging, verifyIntegrity: false)
         try fileManager.moveItem(at: staging, to: destinationDirectory)
         shouldRemoveStaging = false
         return MANTARawSessionRecoveryResult(

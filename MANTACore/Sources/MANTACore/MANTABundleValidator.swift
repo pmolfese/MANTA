@@ -2,7 +2,7 @@
 //  MANTABundleValidator.swift
 //  MANTACore
 //
-//  Strict validation of an already-extracted logical .manta bundle directory.
+//  Structural validation with nonblocking integrity warnings for a bundle directory.
 //
 
 import Foundation
@@ -12,17 +12,20 @@ public struct MANTAValidatedBundle: Sendable {
     public let manifest: MANTABundleManifest
     public let capture: MANTACaptureDocument
     public let changeLog: MANTAChangeLogDocument?
+    public let integrityWarnings: [MANTABundleIntegrityWarning]
 
     public init(
         rootDirectory: URL,
         manifest: MANTABundleManifest,
         capture: MANTACaptureDocument,
-        changeLog: MANTAChangeLogDocument?
+        changeLog: MANTAChangeLogDocument?,
+        integrityWarnings: [MANTABundleIntegrityWarning] = []
     ) {
         self.rootDirectory = rootDirectory
         self.manifest = manifest
         self.capture = capture
         self.changeLog = changeLog
+        self.integrityWarnings = integrityWarnings
     }
 }
 
@@ -75,6 +78,11 @@ public struct MANTABundleValidator {
     }
 
     public func validate(directory rootDirectory: URL) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: true)
+    }
+
+    // Finalization already streams every byte to compute hashes; avoid a second pass.
+    func validate(directory rootDirectory: URL, verifyIntegrity: Bool) throws -> MANTAValidatedBundle {
         let root = rootDirectory.standardizedFileURL
         let manifestURL = root.appendingPathComponent(MANTABundleFormat.manifestFilename)
         guard fileManager.fileExists(atPath: manifestURL.path) else {
@@ -105,7 +113,9 @@ public struct MANTABundleValidator {
             rootDirectory: root,
             manifest: manifest,
             capture: capture,
-            changeLog: changeLog
+            changeLog: changeLog,
+            integrityWarnings: verifyIntegrity
+                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files) : []
         )
     }
 
@@ -153,14 +163,8 @@ public struct MANTABundleValidator {
             guard values.isRegularFile == true, values.isSymbolicLink != true else {
                 throw MANTABundleValidationError.nonRegularFile(entry.path)
             }
-            let actualSize = Int64(values.fileSize ?? -1)
-            guard actualSize == entry.size else {
-                throw MANTABundleValidationError.sizeMismatch(
-                    path: entry.path,
-                    expected: entry.size,
-                    actual: actualSize
-                )
-            }
+            // Size/checksum mismatches are advisory. Keep legacy/edited packages
+            // importable; malformed metadata and unsafe paths still fail above.
         }
         return paths
     }

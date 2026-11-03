@@ -442,3 +442,17 @@ sampling, invalidates pending frames, and leaves existing evidence available for
 finalization. Recovery requires explicit resume. See VALIDATION.md for the bench
 protocol and the limits of capacity estimates. Core tests pass; unsigned iPad app
 and integration-test compilation pass. Device execution remains outstanding.
+
+### Receiver triangulation and nonblocking integrity follow-up
+
+Removed silent depth/placeholder fallbacks from triangulation readiness, solver
+inputs, and saved click evidence. Invalid forward intersections remain unresolved;
+mode changes clear incompatible temporary clicks. Added geometry regressions for
+nearly parallel rays, nonfinite input, coincident origins, and behind-camera points.
+
+Restored streamed SHA-256 auditing with advisory warnings in Receiver and the
+reconstruction CLI. Checksum/size discrepancies and legacy ZIP CRC mismatches do not
+block otherwise readable imports. Missing checksums in working/legacy manifests
+are accepted as unverified. Directory packages and in-place processed edits are
+preserved; no new ZIP conversion or payload-sized allocations were introduced.
+Regression coverage includes a known-hash sparse file larger than 2 GiB.

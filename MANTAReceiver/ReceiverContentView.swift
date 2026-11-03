@@ -29,8 +29,17 @@ struct ReceiverContentView: View {
 
                 if let bundle = store.bundle {
                     Section("Imported Capture") {
-                        Label("Validated", systemImage: "checkmark.seal.fill")
-                            .foregroundStyle(.green)
+                        Label("Imported", systemImage: "checkmark.circle")
+                        if !store.importIntegrityWarnings.isEmpty {
+                            DisclosureGroup("Import integrity: \(store.importIntegrityWarnings.count) warnings") {
+                                Text("Import succeeded. These warnings do not block processing or export.")
+                                    .font(.caption)
+                                ForEach(Array(store.importIntegrityWarnings.enumerated()), id: \.offset) { _, warning in
+                                    Text(warning.message).font(.caption).textSelection(.enabled)
+                                }
+                            }
+                            .foregroundStyle(.orange)
+                        }
                         LabeledContent("Observations", value: "\(bundle.capture.observations.count)")
                         LabeledContent("Files", value: "\(bundle.manifest.files.count)")
                         LabeledContent(

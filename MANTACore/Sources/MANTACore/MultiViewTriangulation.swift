@@ -44,10 +44,22 @@ public enum MultiViewTriangulation {
         var normalized = [(origin: SIMD3<Double>, direction: SIMD3<Double>)]()
         for ray in rays {
             let length = simd_length(ray.direction)
-            guard length > 1e-9 else { continue }
+            guard ray.origin.x.isFinite, ray.origin.y.isFinite, ray.origin.z.isFinite,
+                  length.isFinite, length > 1e-9 else { return nil }
             normalized.append((SIMD3<Double>(ray.origin), SIMD3<Double>(ray.direction) / Double(length)))
         }
         guard normalized.count >= 2 else { return nil }
+
+        // Require at least one ray pair separated by one degree from parallel
+        // or antiparallel. This is a geometry guard, not an accuracy guarantee.
+        let minimumSineSquared = pow(sin(Double.pi / 180), 2)
+        let hasBaseline = normalized.indices.contains { i in
+            normalized.indices.contains { j in
+                i < j && simd_length_squared(simd_cross(normalized[i].direction,
+                    normalized[j].direction)) >= minimumSineSquared
+            }
+        }
+        guard hasBaseline else { return nil }
 
         var a = simd_double3x3(0)
         var b = SIMD3<Double>(repeating: 0)
@@ -64,15 +76,20 @@ public enum MultiViewTriangulation {
         guard let inverse = invert(a) else { return nil }
         let solution = inverse * b
         let point = SIMD3<Float>(solution)
+        guard point.x.isFinite, point.y.isFinite, point.z.isFinite else { return nil }
 
         var sumSquared = 0.0
         for ray in normalized {
             let delta = solution - ray.origin
             let along = simd_dot(delta, ray.direction)
+            // Line intersections behind a camera (or at its center) are not
+            // valid intersections of the forward viewing rays.
+            guard along.isFinite, along > 1e-6 else { return nil }
             let perpendicular = delta - along * ray.direction
             sumSquared += simd_length_squared(perpendicular)
         }
         let rms = Float((sumSquared / Double(normalized.count)).squareRoot())
+        guard rms.isFinite else { return nil }
         return Result(point: point, rmsMeters: rms, rayCount: normalized.count)
     }
 

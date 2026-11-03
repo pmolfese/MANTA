@@ -158,7 +158,8 @@ nonisolated struct ReceiverManualImageEvidence: Codable, Sendable {
     var kind: String
     var observationID: UUID
     var rawImagePoint: [Double]
-    var worldPoint: [Double]
+    /// Nil for pixel-only triangulation evidence; the resolved point is in targetLandmarks.
+    var worldPoint: [Double]?
     var depthMeters: Double
     var confidence: UInt8
     var contributingDepthPixels: Int

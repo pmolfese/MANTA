@@ -220,6 +220,23 @@ public struct MANTAFileEntry: Codable, Equatable, Sendable {
         self.size = size
         self.sha256 = sha256
     }
+
+    private enum CodingKeys: String, CodingKey { case path, mediaType, role, size, sha256 }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        path = try values.decode(String.self, forKey: .path)
+        mediaType = try values.decode(String.self, forKey: .mediaType)
+        role = try values.decode(String.self, forKey: .role)
+        size = try values.decode(Int64.self, forKey: .size)
+        // Legacy/working packages may omit checksums. A malformed checksum is
+        // advisory too; it must not make otherwise readable metadata undecodable.
+        if !values.contains(.sha256) || (try? values.decodeNil(forKey: .sha256)) == true {
+            sha256 = ""
+        } else {
+            sha256 = (try? values.decode(String.self, forKey: .sha256)) ?? "<invalid checksum encoding>"
+        }
+    }
 }
 
 public struct MANTACaptureDocument: Codable, Equatable, Sendable {

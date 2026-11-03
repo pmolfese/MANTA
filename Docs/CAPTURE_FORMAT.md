@@ -60,8 +60,12 @@ Archive readers must reject:
 
 Extraction is streamed through bounded buffers into a private partial
 directory. The partial directory is deleted on any error and is moved to its
-requested destination only after manifest, size, SHA-256, lineage, and capture
-validation succeeds. Default reader limits are 10,000 entries, 16 GiB archive
+requested destination after structural manifest, lineage, and capture validation
+succeeds. SHA-256, ZIP CRC, and manifest byte-count discrepancies are advisory:
+import succeeds and retains warnings for the user. Missing or malformed SHA-256
+values also warn instead of rejecting readable data. Invalid paths, unsupported
+archive structures, truncated payloads, and undecodable required metadata still
+fail because the data cannot be safely or meaningfully loaded. Default reader limits are 10,000 entries, 16 GiB archive
 and expanded totals, 8 GiB per entry, and a 200:1 expansion ratio; applications
 may impose tighter limits.
 
@@ -168,7 +172,9 @@ Rules:
 - UUIDs use lowercase canonical hyphenated strings on write; readers may accept
   uppercase.
 - Dates use RFC 3339 UTC with fractional seconds.
-- SHA-256 is computed over each file's exact uncompressed bytes.
+- SHA-256 is computed over each file's exact uncompressed bytes. Readers report
+  mismatches or unavailable checksums without blocking import; writers continue
+  to record checksums for finalized RAW payloads.
 - `manifest.json` is not listed in `files`, avoiding a recursive self-hash.
 - A transport may hash/sign the complete archive separately.
 - Paths are relative, normalized, case-sensitive, and unique.
@@ -415,8 +421,21 @@ lineage and a change-log entry describing the migration.
 
 ## Integrity versus authenticity
 
-Per-file SHA-256 detects corruption and incomplete transfer but does not prove
-who created the bundle. A later security profile should add a detached digital
+Per-file SHA-256 can reveal changed bytes or incomplete transfer but does not prove
+who created the bundle. Import-time scans use 64 KiB reads and warnings rather than
+rejection. Receiver lists import warnings; the reconstruction CLI prints them.
+Mutable PROCESSED packages may intentionally have unrecorded checksums; these are
+reported as unverified, not as proven corruption. Ordinary edits do not rescan the
+whole package, and finalization/recovery avoid rehashing freshly hashed payloads.
+Directory packages remain directories; the integrity scan does not zip, rewrite,
+or duplicate their payloads. A sparse file exceeding 2 GiB is covered by regression
+tests, including a known nonzero tail beyond the 2 GiB boundary.
+
+Checksums do not repair corrupted data or guarantee a downstream image/mesh decoder
+can use it. Unsupported ZIP64/compression variants remain outside the legacy ZIP
+reader's capabilities; these changes do not introduce a new archive format.
+
+A checksum does not prove who created the bundle. A later security profile should add a detached digital
 signature over a canonical manifest representation or an archive digest. Do not
 describe an unsigned hash list as tamper-proof.
 
