@@ -217,7 +217,7 @@ public struct MANTABundleFinalizer {
         // SHA-256 was just computed from every staged byte above. Repeating the
         // hashes here adds a full payload pass without increasing assurance.
         _ = try MANTABundleValidator(fileManager: fileManager).validate(
-            directory: staging, verifyFileHashes: false)
+            directory: staging)
         progress?(0.76, "Creating archive")
         if preferDirectoryPackage {
             progress?(0.90, "Saving package folder")

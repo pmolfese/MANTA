@@ -75,6 +75,10 @@ public struct WorldAlignmentInput {
     public var targetCloud: [SIMD3<Float>] = []
     /// Metric scale (target units per source unit) measured from LiDAR depth, for depth-assisted.
     public var metricScaleHint: Float?
+    /// Degrees of freedom allowed for landmark fits (fiducial / depth-assisted).
+    /// `.affine` relaxes the uniform-scale assumption; ignored by ICP, which fits
+    /// its own scale from the dense clouds.
+    public var landmarkFitModel: LandmarkFitModel = .similarity
     public var icpMaxIterations: Int = 30
     public var icpTolerance: Float = 1e-5
 
@@ -101,13 +105,19 @@ public enum WorldAlignmentSolver {
     public static func solve(strategy: WorldAlignmentStrategy, input: WorldAlignmentInput) -> WorldAlignmentResult {
         switch strategy {
         case .fiducial:
+            // Affine has no closed-form robust variant here and needs every
+            // point (>=4, non-coplanar); fit it directly.
+            if input.landmarkFitModel == .affine {
+                return AffineLandmarkFit.fit(
+                    source: input.sourceLandmarks, target: input.targetLandmarks) ?? .identity
+            }
             // Robust to a single bad landmark when a 4th (e.g. Cz) is placed:
             // with only the anatomical minimum of 3, any 3 points fit each
             // other perfectly, so there is no redundancy to catch a bad one.
             return AbsoluteOrientation.fitRobust(
                 source: input.sourceLandmarks,
                 target: input.targetLandmarks,
-                scale: .estimate
+                scale: input.landmarkFitModel.scaleMode
             )?.result ?? .identity
 
         case .depthAssisted:

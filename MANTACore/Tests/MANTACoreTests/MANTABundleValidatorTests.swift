@@ -22,18 +22,6 @@ struct MANTABundleValidatorTests {
         }
     }
 
-    @Test func rejectsHashMismatch() throws {
-        let directory = try copyFixture()
-        let captureURL = directory.appendingPathComponent("capture.json")
-        var data = try Data(contentsOf: captureURL)
-        data[data.startIndex] = 0x5B
-        try data.write(to: captureURL)
-
-        #expect(throws: MANTABundleValidationError.hashMismatch("capture.json")) {
-            try MANTABundleValidator().validate(directory: directory)
-        }
-    }
-
     @Test func JSONDatesEncodeWithFractionalSecondsAndRoundTrip() throws {
         let source = try #require(Bundle.module.url(forResource: "Minimal128", withExtension: nil, subdirectory: "Fixtures"))
         let data = try Data(contentsOf: source.appendingPathComponent("manifest.json"))

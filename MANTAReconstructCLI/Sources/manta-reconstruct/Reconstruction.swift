@@ -16,6 +16,25 @@ enum ReconstructionLogLevel: String, Codable, Sendable {
     case success
 }
 
+enum PhotogrammetryInputMode: String, CaseIterable, Identifiable, Sendable {
+    case imagesOnly = "images"
+    case depthGuided = "depth"
+
+    var id: String { rawValue }
+    var title: String { self == .depthGuided ? "Depth-guided" : "Images only" }
+    var usesDepth: Bool { self == .depthGuided }
+}
+
+struct ReconstructionSampleDescriptor: Sendable {
+    var sampleID: Int
+    var imageURL: URL
+    var depthURL: URL?
+    var depthWidth: Int
+    var depthHeight: Int
+    var depthCompression: String
+    var cameraToWorld: [Double]
+}
+
 enum PhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
     case medium
     case full
@@ -62,6 +81,8 @@ struct ReconstructionPreparation: Sendable {
     var detail: PhotogrammetryDetail
     var imageCount: Int
     var sourceImageBytes: Int64
+    var inputMode: PhotogrammetryInputMode = .imagesOnly
+    var sampleDescriptors: [ReconstructionSampleDescriptor] = []
 }
 
 struct PhotogrammetryRun: Sendable {
@@ -83,6 +104,8 @@ struct EphemeralReconstruction: Sendable {
 
 struct MacReconstructionDiagnostics: Codable, Sendable {
     var detail: String
+    var inputMode: String = PhotogrammetryInputMode.imagesOnly.rawValue
+    var depthGuidedSampleCount: Int = 0
     var inputImageCount: Int
     var sourceImageBytes: Int64
     var startedAt: Date
@@ -151,9 +174,25 @@ final class PhotogrammetryRunner {
         var configuration = PhotogrammetrySession.Configuration()
         configuration.sampleOrdering = .sequential
         configuration.featureSensitivity = .high
-        let active = try PhotogrammetrySession(
-            input: ObjectCaptureImages(directory: preparation.inputDirectory,
-                    records: try JSONDecoder().decode([ReconstructionCameraRecord].self, from: Data(contentsOf: preparation.posesURL))), configuration: configuration)
+        let active: PhotogrammetrySession
+        if preparation.inputMode.usesDepth, !preparation.sampleDescriptors.isEmpty {
+            let withDepth = preparation.sampleDescriptors.count(where: { $0.depthURL != nil })
+            active = try PhotogrammetrySession(
+                input: PhotogrammetrySampleSequence(
+                    descriptors: preparation.sampleDescriptors),
+                configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.sampleDescriptors.count) depth-guided samples (\(withDepth) carrying LiDAR depth) at \(preparation.detail.title) detail.")
+        } else {
+            // Explicit sample IDs keep estimated calibration paired with the
+            // original observations in images-only and depth-guided modes.
+            let records = try JSONDecoder().decode(
+                [ReconstructionCameraRecord].self,
+                from: Data(contentsOf: preparation.posesURL))
+            active = try PhotogrammetrySession(
+                input: ObjectCaptureImages(directory: preparation.inputDirectory, records: records),
+                configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
+        }
         session = active
         defer { session = nil }
 
@@ -168,7 +207,6 @@ final class PhotogrammetryRunner {
         var automaticDownsampling = false
         var currentProgress = 0.0
         progress(0, "Starting Object Capture")
-        log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
         try active.process(requests: [request, .poses])
 
         do {
@@ -252,7 +290,8 @@ enum ReconstructionWorkflow {
 
     static func prepare(
         bundle: MANTAValidatedBundle,
-        detail: PhotogrammetryDetail
+        detail: PhotogrammetryDetail,
+        inputMode: PhotogrammetryInputMode = .imagesOnly
     ) throws -> ReconstructionPreparation {
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReconstructionError.noImages }
@@ -273,6 +312,7 @@ enum ReconstructionWorkflow {
         try fileManager.createDirectory(at: input, withIntermediateDirectories: true)
 
         var poses = [PoseRecord]()
+        var sampleDescriptors = [ReconstructionSampleDescriptor]()
         do {
             for (index, item) in imageSources(bundle: bundle).enumerated() {
                 let extensionName = item.url.pathExtension.lowercased()
@@ -289,11 +329,58 @@ enum ReconstructionWorkflow {
                     cameraToWorld: item.observation.cameraToWorld,
                     intrinsics: item.observation.intrinsics,
                     imageOrientation: item.observation.imageOrientation))
+
+                guard inputMode.usesDepth else { continue }
+                // Link the frame's depth alongside its image so the runner is
+                // self-contained. A frame missing usable depth still yields an
+                // RGB+gravity sample, so record it with a nil depth URL.
+                var depthURL: URL?
+                var depthWidth = 0
+                var depthHeight = 0
+                var depthCompression = "none"
+                if let depth = item.observation.depth,
+                   depth.scalarType.lowercased() == "float32",
+                   depth.units == .meters,
+                   depth.byteOrder.lowercased() == "little-endian",
+                   depth.layout.lowercased().replacingOccurrences(of: "-", with: "")
+                       .hasPrefix("rowmajor"),
+                   depth.imageMapping.lowercased() == "resolution-scale" {
+                    let source = bundle.rootDirectory.appendingPathComponent(depth.path)
+                    if fileManager.fileExists(atPath: source.path) {
+                        let depthFilename = "\(item.observation.id.uuidString.lowercased()).depth"
+                        let depthDestination = input.appendingPathComponent(depthFilename)
+                        do {
+                            try fileManager.linkItem(at: source, to: depthDestination)
+                        } catch {
+                            try? fileManager.copyItem(at: source, to: depthDestination)
+                        }
+                        if fileManager.fileExists(atPath: depthDestination.path) {
+                            depthURL = depthDestination
+                            depthWidth = depth.dimensions.width
+                            depthHeight = depth.dimensions.height
+                            depthCompression = depth.compression
+                        }
+                    }
+                }
+                sampleDescriptors.append(ReconstructionSampleDescriptor(
+                    sampleID: index,
+                    imageURL: destination,
+                    depthURL: depthURL,
+                    depthWidth: depthWidth,
+                    depthHeight: depthHeight,
+                    depthCompression: depthCompression,
+                    cameraToWorld: item.observation.cameraToWorld))
             }
             let posesURL = workspace.appendingPathComponent("macos-poses.json")
             let encoder = MANTAJSON.makeEncoder()
             try encoder.encode(poses).write(to: posesURL, options: .atomic)
+            // A depth-guided run with no frame carrying usable depth would be
+            // identical to images-only but mislabeled; fall back explicitly.
+            let resolvedMode: PhotogrammetryInputMode =
+                inputMode.usesDepth && sampleDescriptors.contains { $0.depthURL != nil }
+                    ? .depthGuided : .imagesOnly
             let stem = "macos_\(detail.rawValue)"
+                + (resolvedMode.usesDepth ? "_depthguided" : "")
             return ReconstructionPreparation(
                 workspace: workspace,
                 inputDirectory: input,
@@ -302,7 +389,9 @@ enum ReconstructionWorkflow {
                 diagnosticsURL: workspace.appendingPathComponent("\(stem)_diagnostics.json"),
                 detail: detail,
                 imageCount: poses.count,
-                sourceImageBytes: estimate.sourceImageBytes)
+                sourceImageBytes: estimate.sourceImageBytes,
+                inputMode: resolvedMode,
+                sampleDescriptors: resolvedMode.usesDepth ? sampleDescriptors : [])
         } catch {
             try? fileManager.removeItem(at: workspace)
             throw error
@@ -364,6 +453,8 @@ enum ReconstructionWorkflow {
             forKeys: [.fileSizeKey]).fileSize) ?? 0)
         let diagnostics = MacReconstructionDiagnostics(
             detail: preparation.detail.rawValue,
+            inputMode: preparation.inputMode.rawValue,
+            depthGuidedSampleCount: preparation.sampleDescriptors.count(where: { $0.depthURL != nil }),
             inputImageCount: preparation.imageCount,
             sourceImageBytes: preparation.sourceImageBytes,
             startedAt: run.startedAt,
