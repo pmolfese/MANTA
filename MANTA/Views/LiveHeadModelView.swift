@@ -15,18 +15,21 @@ import UIKit
 /// cheap when nothing new has been captured.
 struct LiveHeadModelView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
+    @ObservedObject private var scan: ARScanViewModel
+
+    init(viewModel: ScanSessionViewModel) {
+        self.viewModel = viewModel
+        self.scan = viewModel.scanViewModel
+    }
 
     /// Whether the model camera tracks the physical device pose. A drag on the
     /// model (or entering fiducial placement) drops to manual orbit; follow
-    /// resumes automatically 5 s after the last touch.
+    /// resumes automatically 5 s after the last touch while scanning. Paused
+    /// review always keeps manual camera control.
     @State private var followDevice = true
     /// Sticky manual: set by the toggle to hold manual orbit indefinitely (no
     /// auto-resume), so the operator can study the model as long as they like.
     @State private var manualHold = false
-
-    /// Total azimuth×elevation coverage buckets (`coverageSector` in ARScanViewModel:
-    /// 8 azimuth bins × {upper, level, lower}).
-    private static let coverageSectorTotal = 24
 
     var body: some View {
         // 2.0s keeps the live surface current without paying for a full snapshot
@@ -41,9 +44,7 @@ struct LiveHeadModelView: View {
                 fiducials: fiducials,
                 snapshot: snapshot,
                 depthPoints: depthPoints,
-                channelCount: viewModel.session.layout.channelCount,
-                coverageSectors: viewModel.captureCoverageSectorCount,
-                coverageSectorTotal: Self.coverageSectorTotal)
+                channelCount: viewModel.session.layout.channelCount)
 
             HeadMeshSceneView(
                 snapshot: snapshot,
@@ -53,10 +54,11 @@ struct LiveHeadModelView: View {
                 refreshDate: context.date,
                 placementActive: viewModel.isModelSurfacePlacementActive,
                 // Placement wants a steady view, so follow yields to manual there.
-                followDevice: followDevice && !viewModel.isModelSurfacePlacementActive,
+                followDevice: scan.status.isRunning && followDevice && !viewModel.isModelSurfacePlacementActive,
                 // Don't auto-resume while placing or when manual is held.
-                manualSticky: manualHold || viewModel.isModelSurfacePlacementActive,
-                deviceTransform: { viewModel.scanViewModel.currentCameraTransform() },
+                manualSticky: !scan.status.isRunning || manualHold || viewModel.isModelSurfacePlacementActive,
+                reviewingPausedCapture: !scan.status.isRunning,
+                deviceTransform: { scan.status.isRunning ? scan.currentCameraTransform() : nil },
                 onManualOverride: { followDevice = false; manualHold = false },
                 onAutoResumeFollow: { followDevice = true; manualHold = false },
                 onSurfaceRay: { origin, direction in
@@ -64,12 +66,17 @@ struct LiveHeadModelView: View {
                 }
             )
             .overlay(alignment: .topLeading) {
-                modelStatus(stats: stats)
-                    .padding(12)
-            }
-            .overlay(alignment: .topTrailing) {
-                coverageBadge(stats: stats)
-                    .padding(12)
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top) {
+                        modelStatus(stats: stats).fixedSize(horizontal: true, vertical: false)
+                        Spacer(minLength: 8)
+                        coverageBadge.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        modelStatus(stats: stats)
+                        coverageBadge
+                    }
+                }.padding(12)
             }
             .overlay(alignment: .bottomLeading) {
                 markerLegend
@@ -77,8 +84,15 @@ struct LiveHeadModelView: View {
             }
             .overlay(alignment: .bottomTrailing) {
                 if stats.hasSurface, !viewModel.isModelSurfacePlacementActive {
-                    followToggle
-                        .padding(12)
+                    if scan.status.isRunning {
+                        followToggle.padding(12)
+                    } else {
+                        Text("Drag to rotate · Pinch to zoom")
+                            .font(.caption.weight(.semibold))
+                            .padding(10)
+                            .background(.regularMaterial, in: Capsule())
+                            .padding(12)
+                    }
                 }
             }
             .overlay(alignment: .bottom) {
@@ -146,9 +160,15 @@ struct LiveHeadModelView: View {
                     .fill(stats.hasSurface ? Color.teal : Color.secondary)
                     .frame(width: 8, height: 8)
                 Text(stats.hasSurface
-                     ? "Building head surface · \(stats.coveragePercent)% coverage"
-                     : "Start scanning to build the head surface")
+                     ? (scan.status.isRunning
+                        ? "Building head surface"
+                        : "Captured head · Scanning paused")
+                     : (scan.status.isRunning ? "Building head surface…" : "No captured surface yet"))
                     .font(.caption.weight(.semibold))
+            }
+            if !stats.hasSurface && !scan.status.isRunning {
+                Text("Scan with LiDAR to review a surface here. RGB-only captures need reconstruction in Receiver.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             if stats.hasSurface {
                 Text(stats.channelCount > 0
@@ -168,23 +188,17 @@ struct LiveHeadModelView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func coverageBadge(stats: ModelStats) -> some View {
+    private var coverageBadge: some View {
         HStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .stroke(Color.secondary.opacity(0.3), lineWidth: 3)
-                Circle()
-                    .trim(from: 0, to: stats.coverageFraction)
-                    .stroke(Color.teal, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-            }
-            .frame(width: 22, height: 22)
+            Image(systemName: "circle.grid.3x3")
             VStack(alignment: .leading, spacing: 0) {
-                Text("Coverage")
+                Text("View coverage")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Text("\(stats.coverageSectors)/\(stats.coverageSectorTotal)")
+                Text(viewModel.viewCoverageText)
                     .font(.caption.weight(.semibold).monospacedDigit())
+                Text("Not surface completeness")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 12)
@@ -218,14 +232,11 @@ private struct ModelStats {
     var localizedCount: Int
     var predictedCount: Int
     var channelCount: Int
-    var coverageSectors: Int
-    var coverageSectorTotal: Int
 
     init(
         electrodes: [ElectrodeAnnotation], fiducials: [FiducialAnnotation],
         snapshot: LiDARMeshSnapshot, depthPoints: MetricDepthPointCloudSnapshot,
-        channelCount: Int,
-        coverageSectors: Int, coverageSectorTotal: Int
+        channelCount: Int
     ) {
         hasMeshSurface = !snapshot.vertices.isEmpty
         hasSurface = hasMeshSurface || !depthPoints.points.isEmpty
@@ -234,15 +245,8 @@ private struct ModelStats {
         localizedCount = electrodes.filter { $0.confidence > 0 }.count
         predictedCount = electrodes.filter { $0.confidence == 0 }.count
         self.channelCount = channelCount
-        self.coverageSectors = coverageSectors
-        self.coverageSectorTotal = coverageSectorTotal
     }
 
-    var coverageFraction: CGFloat {
-        guard coverageSectorTotal > 0 else { return 0 }
-        return min(1, CGFloat(coverageSectors) / CGFloat(coverageSectorTotal))
-    }
-    var coveragePercent: Int { Int((coverageFraction * 100).rounded()) }
 }
 
 private struct LegendDot: View {
@@ -275,6 +279,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
     var followDevice: Bool = false
     /// When true, manual orbit is held and follow does not auto-resume.
     var manualSticky: Bool = false
+    var reviewingPausedCapture: Bool = false
     var deviceTransform: @MainActor () -> simd_float4x4? = { nil }
     /// Called when the operator drags to take manual control of the camera.
     var onManualOverride: () -> Void = {}
@@ -322,7 +327,8 @@ private struct HeadMeshSceneView: UIViewRepresentable {
             snapshot: snapshot,
             depthPoints: depthPoints,
             electrodes: electrodes,
-            fiducials: fiducials
+            fiducials: fiducials,
+            reviewingPausedCapture: reviewingPausedCapture
         )
     }
 
@@ -373,6 +379,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
         private var lastVertexCount = -1
         private var lastDepthPointRevision = -1
         private var lastMarkerSignature = 0
+        private var wasReviewingPausedCapture = false
 
         func attach(view: SCNView) {
             scnView = view
@@ -449,9 +456,12 @@ private struct HeadMeshSceneView: UIViewRepresentable {
             snapshot: LiDARMeshSnapshot,
             depthPoints: MetricDepthPointCloudSnapshot,
             electrodes: [ElectrodeAnnotation],
-            fiducials: [FiducialAnnotation]
+            fiducials: [FiducialAnnotation],
+            reviewingPausedCapture: Bool
         ) {
             guard let scene = view.scene else { return }
+            let enteringReview = reviewingPausedCapture && !wasReviewingPausedCapture
+            defer { wasReviewingPausedCapture = reviewingPausedCapture }
             if !installed {
                 scene.rootNode.addChildNode(meshHolder)
                 scene.rootNode.addChildNode(depthPointHolder)
@@ -474,10 +484,10 @@ private struct HeadMeshSceneView: UIViewRepresentable {
             let bounds = MeshBounds(vertices:
                 depthPoints.points.isEmpty ? snapshot.vertices : depthPoints.points)
 
-            // Rebuild the mesh geometry only when the vertex count changes. ARKit
-            // grows the mesh vertex-by-vertex, so this catches real refinement
-            // while skipping identical ticks.
-            if snapshot.vertices.count != lastVertexCount {
+            // Refresh once on entering review even if ARKit refined positions or
+            // faces without changing vertex count. Other ticks retain the cheap
+            // live change check and leave the operator's orbit camera alone.
+            if enteringReview || snapshot.vertices.count != lastVertexCount {
                 meshHolder.childNodes.forEach { $0.removeFromParentNode() }
                 if !snapshot.vertices.isEmpty {
                     meshHolder.addChildNode(meshNode(snapshot: snapshot))
@@ -500,7 +510,7 @@ private struct HeadMeshSceneView: UIViewRepresentable {
                 lastMarkerSignature = signature
             }
 
-            if view.pointOfView == nil {
+            if enteringReview || view.pointOfView == nil {
                 frame(bounds: bounds, in: scene, view: view)
             }
         }
@@ -702,15 +712,19 @@ private struct HeadMeshSceneView: UIViewRepresentable {
         }
 
         private func frame(bounds: MeshBounds, in scene: SCNScene, view: SCNView) {
-            let camera = SCNNode()
+            view.defaultCameraController.stopInertia()
+            let camera = view.pointOfView ?? SCNNode()
+            camera.simdTransform = matrix_identity_float4x4
             camera.camera = SCNCamera()
             camera.camera?.zNear = 0.001
             camera.camera?.zFar = 20
             let distance = max(bounds.diagonal * 1.8, 0.35)
             camera.simdPosition = bounds.center + SIMD3(0, 0, distance)
             camera.look(at: SCNVector3(bounds.center.x, bounds.center.y, bounds.center.z))
-            scene.rootNode.addChildNode(camera)
+            if camera.parent == nil { scene.rootNode.addChildNode(camera) }
             view.pointOfView = camera
+            view.defaultCameraController.automaticTarget = false
+            view.defaultCameraController.target = SCNVector3(bounds.center.x, bounds.center.y, bounds.center.z)
         }
     }
 }

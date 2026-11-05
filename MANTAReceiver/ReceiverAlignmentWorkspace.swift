@@ -915,7 +915,7 @@ struct ReceiverAlignmentWorkspace: View {
         }
         orientedImage = ReceiverOrientedFrameImage.load(
             from: bundle.rootDirectory.appendingPathComponent(path),
-            orientation: ReceiverStoredImageOrientation(observation.imageOrientation))
+            orientation: ReceiverStoredImageOrientation.displayOrientation(for: observation))
     }
 
     private func imagePath(for observation: MANTACaptureObservation) -> String? {

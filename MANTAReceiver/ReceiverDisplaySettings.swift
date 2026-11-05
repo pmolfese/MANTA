@@ -137,6 +137,10 @@ final class ReceiverDisplaySettings: ObservableObject {
         self.hasAnnotations = hasAnnotations
         self.annotationsSpatiallyValid = annotationsSpatiallyValid
         self.canOverlay = canOverlay
+        if !canOverlay, showPhotogrammetry {
+            showLiDAR = false
+            showFusedDepth = false
+        }
     }
 
     /// LiDAR and photogrammetry are mutually exclusive until a model-to-world
@@ -151,7 +155,17 @@ final class ReceiverDisplaySettings: ObservableObject {
     var photogrammetryBinding: Binding<Bool> {
         Binding(get: { self.showPhotogrammetry }, set: { on in
             self.showPhotogrammetry = on
-            if on, self.showLiDAR, !self.canOverlay { self.showLiDAR = false }
+            if on, !self.canOverlay {
+                self.showLiDAR = false
+                self.showFusedDepth = false
+            }
+        })
+    }
+
+    var fusedDepthBinding: Binding<Bool> {
+        Binding(get: { self.showFusedDepth }, set: { on in
+            self.showFusedDepth = on
+            if on, !self.canOverlay { self.showPhotogrammetry = false }
         })
     }
 
@@ -195,7 +209,7 @@ struct ReceiverDisplayControls: View {
             }
 
             ReceiverInfoRow(help: ReceiverGlossary.fusedDepth) {
-                Toggle("Fused Depth", isOn: $display.showFusedDepth)
+                Toggle("Fused Depth", isOn: display.fusedDepthBinding)
                     .disabled(!display.fusedDepthAvailable)
             }
 

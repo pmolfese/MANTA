@@ -135,6 +135,11 @@ xcodebuild test \
 Real-device capture guidance and fixture hand-off instructions are in
 [Validation](Docs/VALIDATION.md).
 
+Experimental Mac recovery of explicitly reviewed stable intervals from separate
+passes is available through `manta-recover-segments`; see the
+[segment recovery workflow](Docs/SEGMENT_RECOVERY.md). It preserves originals and
+does not enable continuous-motion capture or cross-segment Object Capture.
+
 ## Remaining work
 
 The main gaps before lab use are real-device convention and accuracy validation,

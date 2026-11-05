@@ -94,8 +94,15 @@ struct MANTABundleIntegrityTests {
             role: "test", size: Int64(boundary) + 16,
             sha256: "20a68b932b62eb2077bcf5d71fdf262f2e3870b97c28a9cf6a652959bc2f50cf"))
         try MANTAJSON.makeEncoder().encode(manifest).write(to: manifestURL)
-        let bundle = try MANTABundleValidator().validate(directory: root)
+        var updates: [MANTACaptureReadProgress] = []
+        let bundle = try MANTABundleValidator().validate(directory: root) { updates.append($0) }
         #expect(bundle.integrityWarnings.isEmpty)
+        let fractions = updates.compactMap(\.fraction)
+        #expect(fractions.allSatisfy { (0...1).contains($0) })
+        #expect(fractions == fractions.sorted())
+        #expect(fractions.last == 1)
+        // A single large file must report bytes read before it completes.
+        #expect(updates.contains { $0.detail?.contains("large.bin") == true && ($0.fraction ?? 0) > 0.1 && ($0.fraction ?? 1) < 0.95 })
         #expect(FileManager.default.fileExists(atPath: url.path))
         #expect(bundle.rootDirectory.path == root.path)
     }

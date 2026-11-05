@@ -20,7 +20,11 @@ import UIKit
 
 struct CaptureArtifactStore: @unchecked Sendable {
     private let fileManager: FileManager
-    let rootDirectory: URL
+    nonisolated let rootDirectory: URL
+
+    #if canImport(CoreImage) && canImport(UIKit)
+    nonisolated private let cameraImageContext = CIContext()
+    #endif
 
     init(fileManager: FileManager = .default) throws {
         self.fileManager = fileManager
@@ -40,20 +44,21 @@ struct CaptureArtifactStore: @unchecked Sendable {
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
     }
 
-    var availableCapacityBytes: Int64? {
+    nonisolated var availableCapacityBytes: Int64? {
         let values = try? rootDirectory.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         return values?.volumeAvailableCapacityForImportantUsage
     }
 
-    func sessionDirectory(for session: ScanSession) throws -> URL {
+    nonisolated func sessionDirectory(for session: ScanSession) throws -> URL {
+        let fileManager = FileManager()
         let directory = rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: assetsDirectory(for: session), withIntermediateDirectories: true)
         return directory
     }
 
-    func assetsDirectory(for session: ScanSession) -> URL {
+    nonisolated func assetsDirectory(for session: ScanSession) -> URL {
         rootDirectory
             .appendingPathComponent(session.id.uuidString, isDirectory: true)
             .appendingPathComponent("assets", isDirectory: true)
@@ -65,7 +70,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
             .appendingPathComponent("diagnostics.json")
     }
 
-    func acquisitionDirectory(for session: ScanSession) -> URL {
+    nonisolated func acquisitionDirectory(for session: ScanSession) -> URL {
         rootDirectory
             .appendingPathComponent(session.id.uuidString, isDirectory: true)
             .appendingPathComponent("acquisition", isDirectory: true)
@@ -118,8 +123,10 @@ struct CaptureArtifactStore: @unchecked Sendable {
     }
 
     @discardableResult
-    func writeCaptureReceipt(for session: ScanSession) throws -> (url: URL, receipt: CaptureReceipt) {
-        let directory = try sessionDirectory(for: session)
+    nonisolated func writeCaptureReceipt(for session: ScanSession) throws -> (url: URL, receipt: CaptureReceipt) {
+        let directory = rootDirectory.appendingPathComponent(session.id.uuidString, isDirectory: true)
+        // This worker owns its file manager; UI-owned store helpers stay on the main actor.
+        try FileManager().createDirectory(at: directory, withIntermediateDirectories: true)
         let receipt = CaptureReceiptBuilder.build(session: session, sessionDirectory: directory)
         let url = directory.appendingPathComponent("capture-receipt.json")
         let encoder = JSONEncoder()
@@ -152,7 +159,8 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return url
     }
 
-    func writeObservationCheckpoint(_ observation: CaptureObservation, for session: ScanSession) throws {
+    nonisolated func writeObservationCheckpoint(_ observation: CaptureObservation, for session: ScanSession) throws {
+        let fileManager = FileManager()
         _ = try sessionDirectory(for: session)
         let directory = acquisitionDirectory(for: session).appendingPathComponent("observations")
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -161,17 +169,9 @@ struct CaptureArtifactStore: @unchecked Sendable {
     }
 
     func loadSession(id: UUID) throws -> ScanSession {
-        let data = try Data(contentsOf: sessionMetadataURL(for: id))
-        var session = try JSONDecoder().decode(ScanSession.self, from: data)
-        let directory = acquisitionDirectory(for: session).appendingPathComponent("observations")
-        let files = (try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        var known = Set(session.captureObservations.map(\.id))
-        for file in files where file.pathExtension == "json" {
-            let observation = try JSONDecoder().decode(CaptureObservation.self, from: Data(contentsOf: file))
-            if known.insert(observation.id).inserted { session.captureObservations.append(observation) }
-        }
-        session.captureObservations.sort { $0.capturedAt < $1.capturedAt }
-        return session
+        try MANTAWorkingSessionLoader.load(
+            from: rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true),
+            fileManager: fileManager)
     }
 
     func deleteSession(id: UUID) throws {
@@ -252,37 +252,8 @@ struct CaptureArtifactStore: @unchecked Sendable {
         progress: (@Sendable (Double, String) -> Void)? = nil,
         verifyFinalArchive: Bool = true
     ) throws -> MANTAStoreExportResult {
-        let bundleID = UUID()
-        let capture = makeCaptureDocument(session, variant: variant)
-        let layout = layoutReferenceSources(for: session)
-        let sources = bundleFileSources(session, in: directory, variant: variant) + layout.sources
-        let parentBundleID = variant == .raw
-            ? session.lastRawExportedBundleID : session.lastExportedBundleID
-        let changes: [MANTAChangeRecord]
-        if parentBundleID == nil {
-            changes = []
-        } else {
-            changes = [
-                MANTAChangeRecord(
-                    changedAt: finalizedAt,
-                    category: variant == .raw ? "raw-capture-export" : "solved-session-export",
-                    summary: variant == .raw
-                        ? "Exported a revised immutable acquisition snapshot."
-                        : "Exported a revised capture and processing snapshot.",
-                    targets: ["capture.json"])
-            ]
-        }
-        let request = MANTABundleFinalizationRequest(
-            capture: capture,
-            producer: producerMetadata(),
-            createdAt: session.createdAt,
-            finalizedAt: finalizedAt,
-            bundleID: bundleID,
-            parentBundleID: parentBundleID,
-            changes: changes,
-            files: sources,
-            layoutPath: layout.layoutPath,
-            filenameTag: variant.rawValue)
+        let request = makeFinalizationRequest(session, directory: directory, finalizedAt: finalizedAt, variant: variant)
+        let bundleID = request.bundleID
         let outputDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("MANTA Exports", isDirectory: true)
             .appendingPathComponent(bundleID.uuidString, isDirectory: true)
@@ -312,6 +283,64 @@ struct CaptureArtifactStore: @unchecked Sendable {
         progress?(1.0, "Raw bundle ready")
         return MANTAStoreExportResult(
             url: finalized.archiveURL, bundleID: bundleID, container: finalized.container)
+    }
+
+    private func makeFinalizationRequest(
+        _ session: ScanSession, directory: URL, finalizedAt: Date, variant: MANTAExportVariant
+    ) -> MANTABundleFinalizationRequest {
+        let bundleID = UUID()
+        let capture = makeCaptureDocument(session, variant: variant)
+        let layout = layoutReferenceSources(for: session)
+        let sources = bundleFileSources(session, in: directory, variant: variant) + layout.sources
+        let parentBundleID = variant == .raw
+            ? session.lastRawExportedBundleID : session.lastExportedBundleID
+        let changes: [MANTAChangeRecord]
+        if parentBundleID == nil {
+            changes = []
+        } else {
+            changes = [
+                MANTAChangeRecord(
+                    changedAt: finalizedAt,
+                    category: variant == .raw ? "raw-capture-export" : "solved-session-export",
+                    summary: variant == .raw
+                        ? "Exported a revised immutable acquisition snapshot."
+                        : "Exported a revised capture and processing snapshot.",
+                    targets: ["capture.json"])
+            ]
+        }
+        return MANTABundleFinalizationRequest(
+            capture: capture,
+            producer: producerMetadata(),
+            createdAt: session.createdAt,
+            finalizedAt: finalizedAt,
+            bundleID: bundleID,
+            parentBundleID: parentBundleID,
+            changes: changes,
+            files: sources,
+            layoutPath: layout.layoutPath,
+            filenameTag: variant.rawValue)
+    }
+
+    /// Main-actor preparation captures UIKit producer information and mutable
+    /// metadata before a worker receives only Sendable values and immutable assets.
+    func prepareSessionExport(id: UUID, rawOnly: Bool) throws -> CaptureBundleExportJob {
+        let directory = rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        let session = try loadSession(id: id)
+        _ = try writeAcquisitionContext(for: session)
+        _ = try writeFiducialPlacementEvidence(for: session)
+        let finalizedAt = Date()
+        let variants: [MANTAExportVariant] = rawOnly ? [.raw] : [.raw, .solved]
+        let requests = variants.map { makeFinalizationRequest(session, directory: directory, finalizedAt: finalizedAt, variant: $0) }
+        var metadata: [String: Data] = [:]
+        for request in requests {
+            for source in request.files where ["json", "jsonl"].contains(source.sourceURL.pathExtension.lowercased())
+                && source.path != "capture-receipt.json" && metadata[source.path] == nil {
+                metadata[source.path] = try Data(contentsOf: source.sourceURL)
+            }
+        }
+        return CaptureBundleExportJob(session: session, sourceDirectory: directory, requests: requests,
+            metadata: metadata, outputDirectory: fileManager.temporaryDirectory
+                .appendingPathComponent("MANTA Exports").appendingPathComponent(UUID().uuidString))
     }
 
     private func makeCaptureDocument(
@@ -429,6 +458,10 @@ struct CaptureArtifactStore: @unchecked Sendable {
     ) -> [MANTABundleFileSource] {
         var items = [String: (mediaType: String, role: String)]()
         for observation in session.captureObservations {
+            let evidencePath = "acquisition/live-labels/\(observation.id.uuidString).json"
+            if fileManager.fileExists(atPath: directory.appendingPathComponent(evidencePath).path) {
+                items[evidencePath] = ("application/json", "live-label-evidence")
+            }
             if let path = observation.cameraSnapshotFilename {
                 let mediaType = imageMediaType(for: path)
                 items[path] = (mediaType, "camera-image")
@@ -716,7 +749,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
 
     /// Parses the specific binary-little-endian PLY layout written above:
     /// float32 xyz vertices followed by `uchar(3) + uint32×3` faces.
-    static func parseBinaryLittleEndianPLY(_ data: Data) -> LiDARMeshSnapshot? {
+    nonisolated static func parseBinaryLittleEndianPLY(_ data: Data) -> LiDARMeshSnapshot? {
         let marker = Data("end_header\n".utf8)
         guard let headerRange = data.range(of: marker) else { return nil }
         let header = String(decoding: data[data.startIndex..<headerRange.lowerBound], as: UTF8.self)
@@ -818,15 +851,13 @@ struct CaptureArtifactStore: @unchecked Sendable {
     }
 
     #if canImport(CoreImage) && canImport(UIKit)
-    func writeCameraSnapshot(
+    nonisolated func writeCameraSnapshot(
         pixelBuffer: CVPixelBuffer, observationID: UUID, for session: ScanSession,
         includeCompressedImage: Bool = false
     ) throws -> CameraSnapshotArtifact {
         _ = try sessionDirectory(for: session)
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+        guard let cgImage = cameraImageContext.createCGImage(ciImage, from: ciImage.extent) else {
             throw CaptureArtifactStoreError.imageEncodingFailed
         }
 
@@ -845,7 +876,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
     /// Writes the frame as HEIC at the highest quality the encoder exposes.
     /// Returns `nil` (rather than throwing) when HEIC is unsupported so the caller
     /// can fall back to JPEG.
-    private func writeHEICSnapshot(
+    private nonisolated func writeHEICSnapshot(
         cgImage: CGImage, observationID: UUID, for session: ScanSession
     ) throws -> String? {
         let filename = "camera_\(observationID.uuidString).heic"
@@ -861,7 +892,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return "assets/\(filename)"
     }
 
-    private func writeLosslessPNGSnapshot(
+    private nonisolated func writeLosslessPNGSnapshot(
         cgImage: CGImage, observationID: UUID, for session: ScanSession
     ) throws -> String {
         let filename = "camera_\(observationID.uuidString).png"
@@ -873,7 +904,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return "assets/\(filename)"
     }
 
-    private func writeCompressedSnapshot(
+    private nonisolated func writeCompressedSnapshot(
         cgImage: CGImage, observationID: UUID, for session: ScanSession
     ) throws -> String {
         if let heicPath = try writeHEICSnapshot(
@@ -890,7 +921,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return "assets/\(filename)"
     }
 
-    func writeDepthSnapshot(
+    nonisolated func writeDepthSnapshot(
         depthMap: CVPixelBuffer,
         confidenceMap: CVPixelBuffer?,
         observationID: UUID,
@@ -916,7 +947,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         )
     }
 
-    private func makeDepthPNG(depthMap: CVPixelBuffer, destinationURL: URL) throws -> DepthSnapshotSummary {
+    private nonisolated func makeDepthPNG(depthMap: CVPixelBuffer, destinationURL: URL) throws -> DepthSnapshotSummary {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
@@ -1003,7 +1034,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         )
     }
 
-    private func writeRawDepth(depthMap: CVPixelBuffer, observationID: UUID, for session: ScanSession) throws -> RawDepthArtifact {
+    private nonisolated func writeRawDepth(depthMap: CVPixelBuffer, observationID: UUID, for session: ScanSession) throws -> RawDepthArtifact {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
@@ -1045,7 +1076,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return RawDepthArtifact(filename: "assets/\(filename)", format: format)
     }
 
-    private func writeRawConfidence(
+    private nonisolated func writeRawConfidence(
         confidenceMap: CVPixelBuffer,
         observationID: UUID,
         for session: ScanSession
@@ -1116,7 +1147,7 @@ struct CaptureArtifactStore: @unchecked Sendable {
         return RawConfidenceArtifact(filename: "assets/\(filename)", format: format, summary: summary)
     }
 
-    private func compress(_ data: Data) throws -> Data {
+    private nonisolated func compress(_ data: Data) throws -> Data {
         try data.withUnsafeBytes { sourceBuffer in
             guard let sourcePointer = sourceBuffer.bindMemory(to: UInt8.self).baseAddress else {
                 return Data()
@@ -1149,7 +1180,7 @@ private extension Data {
     }
 }
 
-enum CaptureArtifactStoreError: LocalizedError {
+nonisolated enum CaptureArtifactStoreError: LocalizedError {
     case imageEncodingFailed
     case depthEncodingFailed
     case rawDepthEncodingFailed
@@ -1181,24 +1212,24 @@ enum CaptureArtifactStoreError: LocalizedError {
     }
 }
 
-enum MANTAExportVariant: String {
+nonisolated enum MANTAExportVariant: String, Sendable {
     case raw
     case solved
 }
 
-struct MANTAStoreExportResult: Sendable {
+nonisolated struct MANTAStoreExportResult: Sendable {
     var url: URL
     var bundleID: UUID
     var container: MANTAFinalizedBundle.Container = .archive
 }
 
-struct MANTAStoreExportPair: Sendable {
+nonisolated struct MANTAStoreExportPair: Sendable {
     var raw: MANTAStoreExportResult
     var solved: MANTAStoreExportResult
     var receipt: CaptureReceipt
 }
 
-struct MANTAStoreValidatedExportResult: Sendable {
+nonisolated struct MANTAStoreValidatedExportResult: Sendable {
     var export: MANTAStoreExportResult
     var receipt: CaptureReceipt
 }
@@ -1213,6 +1244,7 @@ struct SessionSummary: Identifiable, Equatable {
     var observationCount: Int
     var detectedElectrodeCount: Int
     var hasReconstructedModel: Bool
+    var endedAt: Date?
 
     init(session: ScanSession) {
         id = session.id
@@ -1223,10 +1255,11 @@ struct SessionSummary: Identifiable, Equatable {
         observationCount = session.captureObservations.count
         detectedElectrodeCount = session.detectedElectrodeCount
         hasReconstructedModel = session.hasReconstructedModel
+        endedAt = session.endedAt
     }
 }
 
-struct DepthSnapshotArtifact {
+nonisolated struct DepthSnapshotArtifact: Sendable {
     var filename: String
     var rawDepthFilename: String
     var rawDepthFormat: RawDepthFormat
@@ -1236,17 +1269,17 @@ struct DepthSnapshotArtifact {
     var summary: DepthSnapshotSummary
 }
 
-struct CameraSnapshotArtifact {
+nonisolated struct CameraSnapshotArtifact: Sendable {
     var primaryFilename: String
     var compressedFilename: String?
 }
 
-struct RawDepthArtifact {
+nonisolated struct RawDepthArtifact: Sendable {
     var filename: String
     var format: RawDepthFormat
 }
 
-struct RawConfidenceArtifact {
+nonisolated struct RawConfidenceArtifact: Sendable {
     var filename: String
     var format: RawConfidenceFormat
     var summary: ConfidenceMapSummary
@@ -1305,5 +1338,107 @@ struct LiveScanStatusSnapshot: Codable, Equatable {
         hasSceneDepth = status.hasSceneDepth
         lastSampledAt = status.lastSampledAt
         message = status.message
+    }
+}
+
+
+nonisolated struct CaptureBundleExportOutcome: Sendable {
+    let exports: [MANTAStoreExportResult]
+    let receipt: CaptureReceipt
+}
+
+/// One export owns its file manager, scratch files, and output directory. It never
+/// accesses the view model, UIKit, or the main-actor store from its worker.
+nonisolated struct CaptureBundleExportJob: Sendable {
+    let session: ScanSession
+    let sourceDirectory: URL
+    let requests: [MANTABundleFinalizationRequest]
+    let metadata: [String: Data]
+    let outputDirectory: URL
+
+    func execute(progress: @escaping @MainActor @Sendable (Double, String) -> Void) async throws -> CaptureBundleExportOutcome {
+        try Task.checkCancellation()
+        let updates = AsyncStream<(Double, String)>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let relay = Task { @MainActor in
+            for await (fraction, stage) in updates.stream { progress(fraction, stage) }
+        }
+        let worker = Task.detached(priority: .userInitiated) {
+            defer { updates.continuation.finish() }
+            return try run { fraction, stage in updates.continuation.yield((fraction, stage)) }
+        }
+        var completedOutput = false
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: { worker.cancel() }
+            completedOutput = true
+            await relay.value // No progress task can overwrite the cleared UI later.
+            try Task.checkCancellation()
+            return result
+        } catch {
+            await relay.value
+            // Cancellation during a synchronous file copy completes that copy,
+            // then removes the uncommitted output at the next worker boundary.
+            if completedOutput {
+                await Task.detached { try? FileManager().removeItem(at: outputDirectory) }.value
+            }
+            throw error
+        }
+    }
+
+    func run(progress: @escaping @Sendable (Double, String) -> Void) throws -> CaptureBundleExportOutcome {
+        let files = FileManager()
+        guard !files.fileExists(atPath: outputDirectory.path) else {
+            throw MANTABundleFinalizationError.destinationExists(outputDirectory.lastPathComponent)
+        }
+        var completed = false
+        defer { if !completed { try? files.removeItem(at: outputDirectory) } }
+        try Task.checkCancellation()
+        progress(0.01, "Validating saved capture")
+        let receipt = CaptureReceiptBuilder.build(session: session, sessionDirectory: sourceDirectory)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let receiptData = try encoder.encode(receipt)
+        try receiptData.write(to: sourceDirectory.appendingPathComponent("capture-receipt.json"), options: .atomic)
+        guard receipt.status != .failed else { throw CaptureArtifactStoreError.captureReceiptFailed }
+        try Task.checkCancellation()
+        let scratch = outputDirectory.appendingPathComponent("metadata")
+        try files.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: scratch) }
+        var frozenMetadata = metadata
+        frozenMetadata["capture-receipt.json"] = receiptData
+        var metadataURLs: [String: URL] = [:]
+        for (path, data) in frozenMetadata {
+            // A flat scratch name avoids interpreting source-relative paths here.
+            let url = scratch.appendingPathComponent(UUID().uuidString)
+            try data.write(to: url, options: .atomic)
+            metadataURLs[path] = url
+        }
+        progress(0.1, "Sealing capture")
+        var exports: [MANTAStoreExportResult] = []
+        for (index, original) in requests.enumerated() {
+            try Task.checkCancellation()
+            var request = original
+            request.files = request.files.filter { $0.path != "capture-receipt.json" }.map { source in
+                var frozen = source
+                if let url = metadataURLs[source.path] { frozen.sourceURL = url }
+                return frozen
+            }
+            request.files.append(.init(path: "capture-receipt.json", sourceURL: metadataURLs["capture-receipt.json"]!,
+                mediaType: "application/json", role: "capture-validation-receipt"))
+            let result = try MANTABundleFinalizer(fileManager: files).finalize(request,
+                in: outputDirectory.appendingPathComponent(request.bundleID.uuidString), preferDirectoryPackage: true) { fraction, stage in
+                    progress(0.1 + 0.8 * (Double(index) + fraction) / Double(requests.count), stage)
+                }
+            try Task.checkCancellation()
+            // The paired workflow keeps its additional, independent verification.
+            if requests.count > 1 { _ = try MANTABundleValidator(fileManager: files).validate(directory: result.archiveURL) }
+            exports.append(.init(url: result.archiveURL, bundleID: result.manifest.bundleID, container: result.container))
+        }
+        try Task.checkCancellation()
+        progress(1, "Bundle ready")
+        completed = true
+        return .init(exports: exports, receipt: receipt)
     }
 }

@@ -36,12 +36,13 @@ final class ARScanViewModel: NSObject, ObservableObject {
     var storageCapacityProvider: (() -> Int64?)?
     private var storageMonitor: Task<Void, Never>?
     private var lastStorageState: CaptureStoragePolicy.State?
-    var canEditCaptureSettings: Bool { !status.isRunning && observations.isEmpty && !worldInvalidated }
+    var canEditCaptureSettings: Bool { !hasStartedTracking && observations.isEmpty && !worldInvalidated }
+    private(set) var hasStartedTracking = false
 
     func settingsSummary(captureMode: CaptureMode) -> String {
-        let name = CapturePreset.name(usesDepth: captureMode.usesLiDAR, bestFrames: selectBestFrames,
+        let name = adaptiveSampling ? "Custom adaptive capture" : CapturePreset.name(usesDepth: captureMode.usesLiDAR, bestFrames: selectBestFrames,
             comparisonFrames: preserveComparisonFrames, highResolutionStills: highResolutionStills)
-        return "\(name) · \(captureMode.rawValue) · Best frames \(selectBestFrames ? "on" : "off") · Cadence pairs \(preserveComparisonFrames ? "on" : "off") · Hi-res stills \(highResolutionStills ? "on" : "off")"
+        return "\(name) · \(captureMode.rawValue) · Best frames \(selectBestFrames ? "on" : "off") · Cadence pairs \(preserveComparisonFrames ? "on" : "off") · Hi-res stills \(highResolutionStills ? "on" : "off") · Auto stills \(automaticHighResolutionStills ? "on" : "off") · Adaptive \(adaptiveSampling ? "on" : "off")"
     }
 
     /// Called before each observation's artifact writes and by the independent monitor.
@@ -59,7 +60,6 @@ final class ARScanViewModel: NSObject, ObservableObject {
         }
         if !state.allowsCapture {
             pause()
-            comparisonFrame = nil
             status.message = storageMessage ?? "Capture paused for storage."
         }
         if state != lastStorageState {
@@ -83,10 +83,110 @@ final class ARScanViewModel: NSObject, ObservableObject {
         }
     }
 
+    @Published private(set) var motionMessage = "Motion check not armed. Set the head region and freeze a stable reference."
+    @Published private(set) var motionStopped = false
+    private var motionSegmentID = UUID()
+    private var motionReference: [SIMD3<Float>] = []
+    private var motionBounds: HeadBoundingBox?
+
+    func hasMotionReference(for bounds: HeadBoundingBox?) -> Bool {
+        !motionStopped && !motionReference.isEmpty && bounds != nil && bounds == motionBounds
+    }
+
+    func invalidateMotionReferenceForRegionChange() {
+        motionReference = []
+        motionBounds = nil
+        guard !motionStopped else { return }
+        motionMessage = "Head region changed. Scan the stationary head and freeze a new reference."
+    }
+
+    func freezeMotionReference(bounds: HeadBoundingBox?) {
+        guard status.isRunning, !motionStopped, let bounds else {
+            motionMessage = "Set the head region first. After movement, start a new pass."
+            return
+        }
+        let points = fullMeshSnapshot().cropped(to: bounds).vertices
+        guard points.count >= 50 else { motionMessage = "Scan more of the stationary head before freezing a reference."; return }
+        motionReference = stride(from: 0, to: points.count, by: max(1, points.count / 2048)).prefix(2048).map { points[$0] }
+        motionBounds = bounds
+        motionMessage = "Reference frozen. Depth consistency is advisory, not proof of a stationary head."
+        eventHandler?(AcquisitionEvent(kind: "motion-reference-frozen", message: motionMessage,
+            details: ["segmentID": motionSegmentID.uuidString, "referencePoints": String(motionReference.count)]))
+    }
+
+    func markSubjectMoved() {
+        guard !motionStopped else { return }
+        motionStopped = true
+        worldInvalidated = true
+        pause()
+        motionMessage = "Movement flagged. Evidence retained; start a new session/pass after the subject settles."
+        captureSafetyMessage = motionMessage
+        eventHandler?(AcquisitionEvent(kind: "subject-movement", message: motionMessage,
+            details: ["segmentID": motionSegmentID.uuidString]))
+    }
+
+    private func assessMotion(_ frame: ARFrame, bounds: HeadBoundingBox?) -> CaptureMotionAssessment {
+        guard !motionStopped else { return .init(segmentID: motionSegmentID, state: .suspected) }
+        guard !motionReference.isEmpty else { return .init(segmentID: motionSegmentID, state: .unassessed) }
+        guard bounds == motionBounds, let bounds, case .normal = frame.camera.trackingState,
+              let depth = frame.sceneDepth, let confidence = depth.confidenceMap else {
+            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+        }
+        let map = depth.depthMap
+        CVPixelBufferLockBaseAddress(map, .readOnly); CVPixelBufferLockBaseAddress(confidence, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly); CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
+        guard let raw = CVPixelBufferGetBaseAddress(map), let conf = CVPixelBufferGetBaseAddress(confidence) else {
+            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+        }
+        let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
+        guard CVPixelBufferGetWidth(confidence) == width, CVPixelBufferGetHeight(confidence) == height else {
+            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+        }
+        let camera = PinholeCamera(fx: frame.camera.intrinsics[0][0], fy: frame.camera.intrinsics[1][1],
+            cx: frame.camera.intrinsics[2][0], cy: frame.camera.intrinsics[2][1], cameraToWorld: frame.camera.transform)
+        var points: [SIMD3<Float>] = []
+        for y in stride(from: 0, to: height, by: max(1, height / 16)) {
+            for x in stride(from: 0, to: width, by: max(1, width / 16)) {
+                guard conf.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(confidence) + x, as: UInt8.self) >= 2 else { continue }
+                let z = raw.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(map) + x * 4, as: Float.self)
+                guard z.isFinite, z > 0.2, z < 2 else { continue }
+                let point = camera.unproject(pixel: SIMD2(Float(x) * Float(frame.camera.imageResolution.width) / Float(width),
+                    Float(y) * Float(frame.camera.imageResolution.height) / Float(height)), depth: z)
+                if abs(Double(point.x) - bounds.center.x) <= bounds.widthMeters / 2,
+                   abs(Double(point.y) - bounds.center.y) <= bounds.heightMeters / 2,
+                   abs(Double(point.z) - bounds.center.z) <= bounds.depthMeters / 2 { points.append(point) }
+            }
+        }
+        return CaptureMotionCheck.assess(points: points, reference: motionReference, segmentID: motionSegmentID)
+    }
+
     private var worldInvalidated = false
-    private var comparisonFrame: (ARFrame, String, UUID)?
+    private let frameWriter = BoundedCaptureWriter(capacity: 3)
+    private let captureBuffers = CaptureBufferPool()
+    private var lastSubmittedTimestamp: TimeInterval = -1
+    var observationSavedHandler: ((UUID, Result<CaptureObservation, Error>) -> Void)?
+    var pendingWriteCount: Int { frameWriter.pendingCount }
+    func drainWrites() async { await frameWriter.drain() }
+    @Published var adaptiveSampling = false
+    @Published private(set) var stillGuidance = "Hold the iPad steady for a label photo; the participant should remain still."
+    private var stableSince: TimeInterval?
+    private var latestSharpness: Double = 0
+    private var latestSector = ""
+    private var scoredPosition: SIMD3<Float>?
+    private var savedStillSectors: Set<String> = []
+    private var sampledSectors: Set<String> = []
+    private var lastAutomaticSampleTimestamp: TimeInterval?
+    var automaticStillReady: Bool {
+        AdaptiveCapturePolicy.canTakeStill(stableSeconds: stableSince.map { scoredTimestamp - $0 } ?? 0,
+            sharpness: latestSharpness, fresh: ProcessInfo.processInfo.systemUptime - scoredTimestamp < 0.5,
+            sectorSaved: savedStillSectors.contains(latestSector))
+    }
     @Published var selectBestFrames = false
-    @Published var highResolutionStills = false
+    @Published var highResolutionStills = true
+    @Published var automaticHighResolutionStills = false
+    var supportsHighResolutionStillCapture: Bool {
+        arView?.session.configuration?.videoFormat.isRecommendedForHighResolutionFrameCapturing == true
+    }
     @Published var lensMessage = "Lens check has not run."
     @Published var isCheckingLens = false
     @Published var isCapturingStill = false
@@ -146,7 +246,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
             return
         }
         if let provider = storageCapacityProvider, !checkStorage(provider()) { return }
-        if !observations.isEmpty, let existing = arView?.session.configuration {
+        if hasStartedTracking, let existing = arView?.session.configuration {
             arView?.session.run(existing)
             status.isRunning = true
             startStorageMonitor()
@@ -185,8 +285,10 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
         meshAnchors.removeAll()
         lastSampledTransform = nil
+        lastSubmittedTimestamp = -1
         hasReportedFirstFrame = false
         arView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        hasStartedTracking = true
         status.isRunning = true
         activeSettingsSummary = settingsSummary(captureMode: captureMode)
         startStorageMonitor()
@@ -213,11 +315,14 @@ final class ARScanViewModel: NSObject, ObservableObject {
                 "captureSettings": activeSettingsSummary ?? "unknown",
                 "cadenceComparisonFrames": String(preserveComparisonFrames),
                 "bestFrameSelection": String(selectBestFrames),
+                "adaptiveSampling": String(adaptiveSampling),
+                "automaticStillPolicy": "hold-0.3s-sharp-new-direction",
                 "frameSelectionVersion": "1",
                 "selectionWindowSeconds": "0.9",
                 "selectionScoringIntervalSeconds": "0.15",
                 "stillMinimumIntervalSeconds": "5",
                 "highResolutionStills": String(highResolutionStills),
+                "automaticHighResolutionStills": String(automaticHighResolutionStills),
                 "sceneDepthRequested": String(configuration.frameSemantics.contains(.sceneDepth)),
                 "sceneReconstructionMesh": String(configuration.sceneReconstruction == .mesh),
                 "supportedFormatCount": String(ARWorldTrackingConfiguration.supportedVideoFormats.count)
@@ -250,9 +355,20 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     func resetForNewCapture() {
         pause()
+        hasStartedTracking = false
+        motionStopped = false
+        savedStillSectors = []
+        sampledSectors = []
+        lastAutomaticSampleTimestamp = nil
+        stableSince = nil
+        scoredPosition = nil
+        motionReference = []
+        motionBounds = nil
+        motionSegmentID = UUID()
+        motionMessage = "Motion check not armed. Set the head region and freeze a stable reference."
+        lastSubmittedTimestamp = -1
         observations.removeAll()
         meshAnchors.removeAll()
-        comparisonFrame = nil
         worldInvalidated = false
         captureSafetyMessage = nil
         activeSettingsSummary = nil
@@ -268,15 +384,11 @@ final class ARScanViewModel: NSObject, ObservableObject {
         captureSafetyMessage = "Reopened captures are review-only. Start a new session to acquire a new coordinate world."
     }
 
-    func saveComparisonFrame(artifactStore: CaptureArtifactStore, session: ScanSession,
-                             includeCompressedImage: Bool) throws -> CaptureObservation? {
-        guard let (frame, orientation, selectedID) = comparisonFrame else { return nil }
-        comparisonFrame = nil
-        let observation = try saveFrame(frame, orientation: orientation, artifactStore: artifactStore,
-            session: session, includeCompressedImage: includeCompressedImage, source: "cadence-comparison")
-        eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Selected and ordinary cadence frames retained.",
-            details: ["selectedObservationID": selectedID.uuidString, "cadenceObservationID": observation.id.uuidString]))
-        return observation
+    func lockEndedCapture() {
+        pause()
+        worldInvalidated = true
+        captureSafetyMessage = nil
+        status.message = "Session ended. Start a new session to collect more data."
     }
 
     func invalidatePendingCaptures() {
@@ -289,6 +401,8 @@ final class ARScanViewModel: NSObject, ObservableObject {
         storageMonitor = nil
         captureGeneration = UUID()
         bestFrame = nil
+        stableSince = nil
+        scoredPosition = nil
         arView?.session.pause()
         status.isRunning = false
         status.message = "Scan paused."
@@ -296,7 +410,8 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     func sampleCurrentFrame(
         artifactStore: CaptureArtifactStore, session: ScanSession,
-        includeCompressedImage: Bool = false, useBestFrame: Bool = false
+        includeCompressedImage: Bool = false, useBestFrame: Bool = false, minimumGap: Double = 0.75,
+        recaptureTargetLabel: String? = nil
     ) throws -> CaptureObservation? {
         guard status.isRunning, !worldInvalidated, let current = arView?.session.currentFrame else {
             status.message = "No AR frame is available yet."
@@ -307,90 +422,135 @@ final class ARScanViewModel: NSObject, ObservableObject {
         bestFrame = nil
         let useCandidate = useBestFrame && selectBestFrames && candidate.map {
             current.timestamp - $0.frame.timestamp >= 0 && current.timestamp - $0.frame.timestamp <= 0.9
-                && $0.frame.timestamp > (observations.last?.quality?.arFrameTimestamp ?? -1)
+                && $0.frame.timestamp > lastSubmittedTimestamp
         } == true
         let frame = useCandidate ? candidate!.frame : current
-        guard frame.timestamp > (observations.last?.quality?.arFrameTimestamp ?? -1) else { return nil }
+        guard frame.timestamp > lastSubmittedTimestamp else { return nil }
+        if useBestFrame && adaptiveSampling {
+            let novelty = poseNovelty(frame.camera.transform)
+            let elapsed = lastAutomaticSampleTimestamp.map { frame.timestamp - $0 } ?? max(3, minimumGap)
+            guard AdaptiveCapturePolicy.shouldSample(elapsed: elapsed, minimumGap: minimumGap,
+                sharpness: imageQuality(frame.capturedImage).sharpness,
+                translation: novelty.translation ?? 1, rotationDegrees: novelty.rotationDegrees ?? 180,
+                newSector: !sampledSectors.contains(coverageSector(frame.camera.transform))) else {
+                status.message = "Waiting for a sharp, useful view. Move slowly; manual capture remains available."
+                return nil
+            }
+        }
+        let wantsPair = useBestFrame && preserveComparisonFrames && current.timestamp > frame.timestamp
+        guard admitFrames(wantsPair ? 2 : 1) else { return nil }
         let saved = try saveFrame(frame, orientation: useCandidate ? candidate!.orientation : storedImageOrientation(),
-                             artifactStore: artifactStore, session: session,
-                             includeCompressedImage: includeCompressedImage,
-                             source: useCandidate ? "best-window-frame" : "current-frame")
-        if useBestFrame && preserveComparisonFrames && current.timestamp > frame.timestamp {
-            comparisonFrame = (current, storedImageOrientation(), saved.id)
-        } else if useBestFrame && preserveComparisonFrames {
-            eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Same frame selected; stored once.",
+                                  artifactStore: artifactStore, session: session,
+                                  includeCompressedImage: includeCompressedImage,
+                                  source: useCandidate ? "best-window-frame" : "current-frame", recaptureTargetLabel: recaptureTargetLabel)
+        if useBestFrame {
+            lastAutomaticSampleTimestamp = frame.timestamp
+            sampledSectors.insert(coverageSector(frame.camera.transform))
+        }
+        if wantsPair && !motionStopped {
+            let cadence = try saveFrame(current, orientation: storedImageOrientation(), artifactStore: artifactStore,
+                                        session: session, includeCompressedImage: includeCompressedImage,
+                                        source: "cadence-comparison")
+            eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Selected and cadence frames queued; check their save outcomes.",
+                details: ["selectedObservationID": saved.id.uuidString, "cadenceObservationID": cadence.id.uuidString]))
+        } else if !wantsPair && useBestFrame && preserveComparisonFrames {
+            eventHandler?(AcquisitionEvent(kind: "frame-comparison-pair", message: "Same frame selected; queued once.",
                 details: ["selectedObservationID": saved.id.uuidString, "cadenceObservationID": saved.id.uuidString]))
         }
         return saved
     }
 
+    private func admitFrames(_ count: Int) -> Bool {
+        guard frameWriter.canAccept(count) else {
+            status.message = "Capture writer busy; candidate skipped."
+            eventHandler?(AcquisitionEvent(kind: "capture-queue-full", message: status.message,
+                details: ["pendingWrites": String(frameWriter.pendingCount), "droppedCandidates": String(count)]))
+            return false
+        }
+        return true
+    }
+
+    /// Returns reserved identity/calibration only. The completion handler publishes
+    /// the saved observation after all artifacts and its checkpoint are durable.
     private func saveFrame(_ frame: ARFrame, orientation: String,
                            artifactStore: CaptureArtifactStore, session: ScanSession,
-                           includeCompressedImage: Bool, source: String) throws -> CaptureObservation {
-        guard checkStorage(artifactStore.availableCapacityBytes) else {
-            throw NSError(domain: "MANTA.CaptureStorage", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: storageMessage ?? "Insufficient capture storage."])
-        }
+                           includeCompressedImage: Bool, source: String, guidedView: CaptureGuidedView? = nil,
+                           recaptureTargetLabel: String? = nil) throws -> CaptureObservation {
+        guard checkStorage(artifactStore.availableCapacityBytes) else { throw CaptureFrameWriteError.storageUnavailable }
         var observation = makeObservation(from: frame)
+        observation.quality?.captureSource = source
+        observation.quality?.guidedView = guidedView
+        observation.quality?.recaptureTargetLabel = recaptureTargetLabel
+        let motion = assessMotion(frame, bounds: session.headBoundingBox)
+        observation.quality?.motionAssessment = motion
         observation.imageOrientation = orientation
-        observation.capturedAt = Date(timeIntervalSinceNow: frame.timestamp - ProcessInfo.processInfo.systemUptime)
-        let cameraArtifact = try artifactStore.writeCameraSnapshot(
-            pixelBuffer: frame.capturedImage,
-            observationID: observation.id,
-            for: session,
-            includeCompressedImage: includeCompressedImage
-        )
-        observation.cameraSnapshotFilename = cameraArtifact.primaryFilename
-        observation.compressedCameraSnapshotFilename = cameraArtifact.compressedFilename
-
-        if session.captureMode.usesLiDAR, let depthMap = frame.sceneDepth?.depthMap {
-            let depthArtifact = try artifactStore.writeDepthSnapshot(
-                depthMap: depthMap,
-                confidenceMap: frame.sceneDepth?.confidenceMap,
-                observationID: observation.id,
-                for: session
-            )
-            observation.depthSnapshotFilename = depthArtifact.filename
-            observation.rawDepthFilename = depthArtifact.rawDepthFilename
-            observation.rawDepthFormat = depthArtifact.rawDepthFormat
-            observation.rawConfidenceFilename = depthArtifact.rawConfidenceFilename
-            observation.rawConfidenceFormat = depthArtifact.rawConfidenceFormat
-            observation.confidenceSummary = depthArtifact.confidenceSummary
-            observation.depthSummary = depthArtifact.summary
-            let totalDepthPixels = depthArtifact.summary.width * depthArtifact.summary.height
-            observation.quality?.validDepthFraction = totalDepthPixels > 0
-                ? Double(depthArtifact.summary.validPixelCount) / Double(totalDepthPixels) : nil
-            if let summary = depthArtifact.confidenceSummary {
-                let total = summary.lowConfidenceCount + summary.mediumConfidenceCount
-                    + summary.highConfidenceCount + summary.unknownConfidenceCount
-                observation.quality?.highConfidenceDepthFraction = total > 0
-                    ? Double(summary.highConfidenceCount) / Double(total) : nil
-            }
-            if let fraction = observation.quality?.validDepthFraction, fraction < 0.5 {
-                observation.quality?.warnings.append("low-depth-coverage")
-            }
+        motionMessage = switch motion.state {
+        case .unassessed: "Motion check not armed. Freeze a stable head reference."
+        case .insufficientEvidence: "Insufficient head overlap/depth for a motion check. Revisit the reference view; use Subject Moved if uncertain."
+        case .consistent: "Depth consistent with frozen reference (advisory only)."
+        case .suspected: "Possible subject movement; preserving this frame and stopping capture."
         }
-
-        try artifactStore.writeObservationCheckpoint(observation, for: session)
+        observation.capturedAt = Date(timeIntervalSinceNow: frame.timestamp - ProcessInfo.processInfo.systemUptime)
+        let copyStarted = ProcessInfo.processInfo.systemUptime
+        let depth = session.captureMode.usesLiDAR ? frame.sceneDepth : nil
+        let buffers = try OwnedCaptureBuffers(image: captureBuffers.copy(frame.capturedImage),
+            depth: depth.map { try captureBuffers.copy($0.depthMap) },
+            confidence: depth?.confidenceMap.map { try captureBuffers.copy($0) })
+        let enqueuedAt = ProcessInfo.processInfo.systemUptime
+        let copyMs = (enqueuedAt - copyStarted) * 1_000
+        let initial = observation
+        let sessionID = session.id
+        // The worker needs capture identity only, not a growing copy of all observations.
+        var destination = ScanSession.newSession(layout: .headMeshOnly)
+        destination.id = sessionID
+        let writeSession = destination
+        let accepted = frameWriter.submit(operation: {
+            try CaptureFrameWriter.write(buffers: buffers, observation: initial, store: artifactStore,
+                session: writeSession, includeCompressedImage: includeCompressedImage, enqueuedAt: enqueuedAt)
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let written):
+                if source == "high-resolution-still", (initial.quality?.sharpnessScore ?? 0) >= 0.025,
+                   let sector = initial.quality?.coverageSector { self.savedStillSectors.insert(sector) }
+                self.observations.append(written.observation)
+                self.observations.sort { $0.capturedAt < $1.capturedAt }
+                self.status.sampledFrameCount = self.observations.count
+                self.status.lastSampledAt = self.observations.last?.capturedAt
+                var details = written.timings
+                details["observationID"] = initial.id.uuidString
+                details["frameTimestamp"] = String(initial.quality?.arFrameTimestamp ?? 0)
+                details["width"] = String(initial.imageResolution.width)
+                details["height"] = String(initial.imageResolution.height)
+                details["hasDepth"] = String(written.observation.rawDepthFilename != nil)
+                details["bufferCopyDurationMs"] = String(copyMs)
+                self.eventHandler?(AcquisitionEvent(kind: "capture-frame-selected", message: source, details: details))
+                self.eventHandler?(AcquisitionEvent(kind: "sample-saved", message: "Artifacts and observation checkpoint committed.", details: details))
+                self.observationSavedHandler?(sessionID, .success(written.observation))
+            case .failure(let error):
+                self.pause()
+                self.eventHandler?(AcquisitionEvent(kind: "sample-save-failed", message: error.localizedDescription,
+                    details: ["observationID": initial.id.uuidString, "source": source]))
+                self.observationSavedHandler?(sessionID, .failure(error))
+            }
+        })
+        precondition(accepted, "Admission and submission must remain on the main actor without suspension")
         bestFrame = nil
-        observations.append(observation)
-        lastSampledTransform = frame.camera.transform
-        status.sampledFrameCount = observations.count
-        status.lastSampledAt = observation.capturedAt
-        status.message = observation.depthSnapshotFilename == nil
-            ? "Sampled frame \(observations.count) with camera snapshot."
-            : "Sampled frame \(observations.count) with camera and depth snapshots."
-        eventHandler?(AcquisitionEvent(kind: "capture-frame-selected", message: source,
-            details: ["observationID": observation.id.uuidString,
-                      "frameTimestamp": String(frame.timestamp),
-                      "width": String(observation.imageResolution.width),
-                      "height": String(observation.imageResolution.height),
-                      "hasDepth": String(frame.sceneDepth != nil)]))
+        if frame.timestamp >= lastSubmittedTimestamp {
+            lastSubmittedTimestamp = frame.timestamp
+            lastSampledTransform = frame.camera.transform
+        }
+        status.message = "Frame queued for saving."
+        eventHandler?(AcquisitionEvent(kind: "capture-frame-queued", message: source,
+            details: ["observationID": observation.id.uuidString, "pendingWrites": String(frameWriter.pendingCount),
+                      "capacity": String(frameWriter.capacity), "bufferCopyDurationMs": String(copyMs)]))
+        if motion.state == .suspected { markSubjectMoved() }
         return observation
     }
 
     func captureStill(artifactStore: CaptureArtifactStore, session: ScanSession,
-                      includeCompressedImage: Bool) async throws -> CaptureObservation? {
+                      includeCompressedImage: Bool, automatic: Bool = false, guidedView: CaptureGuidedView? = nil,
+                      recaptureTargetLabel: String? = nil) async throws -> CaptureObservation? {
         guard status.isRunning, highResolutionStills, !isCapturingStill,
               let arSession = arView?.session,
               let format = arSession.configuration?.videoFormat,
@@ -403,6 +563,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
             status.message = "Still capture skipped while the device is hot."
             return nil
         }
+        if automatic && !automaticStillReady { return nil }
         isCapturingStill = true
         defer { isCapturingStill = false }
         let generation = captureGeneration
@@ -421,9 +582,15 @@ final class ARScanViewModel: NSObject, ObservableObject {
         eventHandler?(AcquisitionEvent(kind: "still-delivered", message: "High-resolution request completed.",
             details: ["latencySeconds": String(Date().timeIntervalSince(requestedAt)),
                       "thermalState": String(ProcessInfo.processInfo.thermalState.rawValue)]))
+        if automatic && imageQuality(frame.capturedImage).sharpness < 0.025 {
+            eventHandler?(AcquisitionEvent(kind: "automatic-still-rejected", message: "Delivered still failed sharpness gate; retry the view."))
+            return nil
+        }
+        guard admitFrames(1) else { return nil }
         return try saveFrame(frame, orientation: orientation, artifactStore: artifactStore,
                              session: session, includeCompressedImage: includeCompressedImage,
-                             source: "high-resolution-still")
+                             source: "high-resolution-still", guidedView: guidedView,
+                             recaptureTargetLabel: recaptureTargetLabel)
     }
 
     func checkLens() async {
@@ -450,17 +617,29 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     /// Retain at most one candidate ARFrame and score at most 7 frames/second.
     private func considerFrame(_ frame: ARFrame) {
-        guard status.isRunning, selectBestFrames, frame.timestamp - scoredTimestamp >= 0.15,
-              case .normal = frame.camera.trackingState,
-              !requiresDepth || frame.sceneDepth != nil else { return }
+        guard status.isRunning, (selectBestFrames || adaptiveSampling || highResolutionStills),
+              case .normal = frame.camera.trackingState else { stableSince = nil; return }
+        guard frame.timestamp - scoredTimestamp >= 0.15 else { return }
         let transform = frame.camera.transform
         let rotation = simd_quatf(simd_float3x3(transform.columns.0.xyz, transform.columns.1.xyz, transform.columns.2.xyz))
         let dt = frame.timestamp - scoredTimestamp
         let speed = scoredRotation.map { Double(2 * acos(min(1, abs(simd_dot($0.vector, rotation.vector))))) * 180 / .pi / max(dt, 0.001) } ?? 0
+        let position = transform.columns.3.xyz
+        let translationSpeed = scoredPosition.map { Double(simd_distance($0, position)) / max(dt, 0.001) } ?? .infinity
+        if dt > 0.4 || speed > 5 || translationSpeed > 0.02 { stableSince = nil }
+        else if stableSince == nil { stableSince = frame.timestamp }
+        scoredPosition = position
         scoredRotation = rotation
         scoredTimestamp = frame.timestamp
         let novelty = poseNovelty(transform)
         let sharpness = imageQuality(frame.capturedImage).sharpness
+        latestSharpness = sharpness
+        latestSector = coverageSector(transform)
+        stillGuidance = savedStillSectors.contains(latestSector)
+            ? "Sharp still saved for this camera direction. Move to another view or take a manual photo."
+            : (automaticStillReady ? "Ready for a label photo. Keep the participant still."
+               : "Hold the iPad steady for a label photo; keep the participant still.")
+        guard selectBestFrames, !requiresDepth || frame.sceneDepth != nil else { return }
         let score = CaptureFrameScoring.score(sharpness: sharpness, angularSpeedDegrees: speed,
             translationMeters: novelty.translation ?? 0.03, rotationDegrees: novelty.rotationDegrees ?? 10)
         if bestFrame == nil || frame.timestamp - bestFrame!.frame.timestamp > 0.9 || score > bestFrame!.score {
@@ -710,11 +889,18 @@ final class ARScanViewModel: NSObject, ObservableObject {
     /// ARKit supplies sensor-native landscape pixels. Record the EXIF transform
     /// consumers must apply to display those pixels in the interface orientation.
     private func storedImageOrientation() -> String {
-        switch arView?.window?.windowScene?.interfaceOrientation {
+        Self.imageOrientation(for: arView?.window?.windowScene?.interfaceOrientation)
+    }
+
+    static func imageOrientation(for interfaceOrientation: UIInterfaceOrientation?) -> String {
+        // UIInterfaceOrientation's landscape directions are opposite to
+        // UIDeviceOrientation's. Sensor-native rear-camera pixels are upright
+        // in interface landscapeRight, not landscapeLeft.
+        switch interfaceOrientation {
         case .portrait: "right"
         case .portraitUpsideDown: "left"
-        case .landscapeLeft: "up"
-        case .landscapeRight: "down"
+        case .landscapeLeft: "down"
+        case .landscapeRight: "up"
         default: "up"
         }
     }
@@ -787,7 +973,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
     }
 }
 
-struct LiDARMeshSnapshot {
+nonisolated struct LiDARMeshSnapshot: Sendable {
     var vertices: [SIMD3<Float>]
     var triangleIndices: [UInt32]
 

@@ -122,6 +122,7 @@ enum ReceiverDepthFusion {
         voxelSize: Float = 0.004,
         minimumConfidence: UInt8 = 2
     ) throws -> ReceiverFusedDepthCloud {
+        try CaptureMotionPolicy.requireStationary(input.observations.map(\.quality))
         let resolved = try resolveBounds(input)
         var voxels = [VoxelKey: Accumulator]()
         voxels.reserveCapacity(100_000)

@@ -10,7 +10,7 @@
 		C0FFEE0000000000000000A4 /* MANTACore in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000A2 /* MANTACore */; };
 		C0FFEE0000000000000000A5 /* MANTACore in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000A3 /* MANTACore */; };
 		C0FFEE0000000000000000B5 /* MANTACore in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000B2 /* MANTACore */; };
-		C0FFEE0000000000000000D1 = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000D2; };
+		C0FFEE0000000000000000D1 /* MANTAProcessing in Frameworks */ = {isa = PBXBuildFile; productRef = C0FFEE0000000000000000D2 /* MANTAProcessing */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -89,7 +89,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				C0FFEE0000000000000000B5 /* MANTACore in Frameworks */,
-                C0FFEE0000000000000000D1,
+				C0FFEE0000000000000000D1 /* MANTAProcessing in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -209,7 +209,7 @@
 			name = "MANTA Receiver";
 			packageProductDependencies = (
 				C0FFEE0000000000000000B2 /* MANTACore */,
-                C0FFEE0000000000000000D2,
+				C0FFEE0000000000000000D2 /* MANTAProcessing */,
 			);
 			productName = MANTAReceiver;
 			productReference = C0FFEE0000000000000000B0 /* MANTA Receiver.app */;
@@ -472,12 +472,12 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "MANTA-Info.plist";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -506,12 +506,12 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "MANTA-Info.plist";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "MANTA uses the camera and LiDAR depth stream to triangulate EEG electrode locations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -734,7 +734,10 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = MANTACore;
 		};
-		C0FFEE0000000000000000D2 = {isa = XCSwiftPackageProductDependency; productName = MANTAProcessing; };
+		C0FFEE0000000000000000D2 /* MANTAProcessing */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MANTAProcessing;
+		};
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 770D1D8F300171FF0036B8E4 /* Project object */;

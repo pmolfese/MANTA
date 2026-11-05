@@ -88,6 +88,12 @@ struct CombinedModelViewer: View {
         } else if let modelToWorldOverride {
             assets.modelToWorld = modelToWorldOverride
         }
+        if modelToWorldOverride != nil, photogrammetryPlacementLabel != nil {
+            assets.alignmentAssessment = .manual
+        }
+        if assets.alignmentAssessment.rejectsTransform {
+            assets.modelToWorld = nil
+        }
         self.assets = assets
         self.photogrammetryPlacementLabel = photogrammetryPlacementLabel
         self.modelLandmarks = modelLandmarks
@@ -138,9 +144,9 @@ struct CombinedModelViewer: View {
                         assets: assets,
                         fusedDepth: fusedDepth,
                         settings: ReceiverSceneSettings(
-                            showLiDAR: showLiDAR,
+                            showLiDAR: showLiDAR && !(showPhotogrammetry && assets.modelToWorld == nil),
                             showPhotogrammetry: showPhotogrammetry,
-                            showFusedDepth: showFusedDepth,
+                            showFusedDepth: showFusedDepth && !(showPhotogrammetry && assets.modelToWorld == nil),
                             showAnnotations: showAnnotations && annotationsAreSpatiallyValid,
                             lidarChoice: lidarChoice,
                             lidarStyle: lidarStyle,
@@ -267,15 +273,18 @@ struct CombinedModelViewer: View {
 
     @ViewBuilder private var statusOverlay: some View {
         VStack(alignment: .leading, spacing: 5) {
-            if showLiDAR, showPhotogrammetry, assets.canOverlay {
-                Label("LiDAR + photogrammetry in ARKit world", systemImage: "checkmark.seal.fill")
-                    .foregroundStyle(.green)
-            } else if assets.photogrammetryURL != nil,
-                      assets.defaultLiDARChoice != nil,
-                      !assets.canOverlay {
-                Label("No model-to-world transform", systemImage: "exclamationmark.triangle.fill")
+            if assets.photogrammetryURL != nil, assets.alignmentAssessment.rejectsTransform {
+                Label(assets.alignmentAssessment.message, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Text("The two surfaces can be inspected separately but are not overlaid.")
+                Text("Inspect the photo model separately. Use Align to review its placement.")
+                    .foregroundStyle(.secondary)
+            } else if showPhotogrammetry, assets.modelToWorld != nil {
+                Label(assets.alignmentAssessment.message, systemImage: "info.circle")
+                    .foregroundStyle(.orange)
+            } else if assets.photogrammetryURL != nil, assets.modelToWorld == nil {
+                Label("No model-to-world alignment", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Photo and depth surfaces are inspected separately until aligned.")
                     .foregroundStyle(.secondary)
             } else if showLiDAR {
                 Label("LiDAR · ARKit world", systemImage: "dot.scope")
@@ -422,7 +431,7 @@ struct CombinedModelViewer: View {
             }.value
             guard !Task.isCancelled else { return }
             fusedDepth = cloud
-            if autoShowsFusedDepth { showFusedDepth = true }
+            if autoShowsFusedDepth, !(showPhotogrammetry && assets.modelToWorld == nil) { showFusedDepth = true }
             fusionState = .ready
             frameRequest &+= 1
         } catch {
@@ -506,6 +515,7 @@ private struct ReceiverSceneAssets {
     var headLiDARURL: URL?
     var photogrammetryURL: URL?
     var modelToWorld: simd_float4x4?
+    var alignmentAssessment: ReceiverAlignmentPolicy.Assessment
     var fiducials: [MANTAFiducialSolution]
     var fusionInput: ReceiverDepthFusionInput?
     /// The scene is only rebuilt when `sceneSignature` changes, which is
@@ -518,6 +528,7 @@ private struct ReceiverSceneAssets {
 
     init(bundle: MANTAValidatedBundle, photogrammetryURLOverride: URL? = nil) {
         let reconstruction = bundle.capture.reconstruction
+        alignmentAssessment = ReceiverAlignmentPolicy.assessment(for: bundle, modelURLOverride: photogrammetryURLOverride)
         fullLiDARURL = Self.existingURL(
             root: bundle.rootDirectory, path: reconstruction?.lidarMeshPath)
         headLiDARURL = Self.existingURL(
@@ -531,7 +542,8 @@ private struct ReceiverSceneAssets {
         fiducials = captureFiducials.isEmpty
             ? Self.rawFiducials(root: bundle.rootDirectory)
             : captureFiducials
-        if let values = reconstruction?.modelToWorld, values.count == 16 {
+        if !alignmentAssessment.rejectsTransform,
+           let values = reconstruction?.modelToWorld, values.count == 16 {
             modelToWorld = simd_float4x4(
                 SIMD4(Float(values[0]), Float(values[1]), Float(values[2]), Float(values[3])),
                 SIMD4(Float(values[4]), Float(values[5]), Float(values[6]), Float(values[7])),
@@ -559,7 +571,7 @@ private struct ReceiverSceneAssets {
         fullLiDARURL != nil || headLiDARURL != nil || photogrammetryURL != nil
     }
     var canOverlay: Bool {
-        photogrammetryURL != nil && defaultLiDARChoice != nil && modelToWorld != nil
+        photogrammetryURL != nil && modelToWorld != nil
     }
     var defaultLiDARChoice: ReceiverLiDARChoice? {
         if headLiDARURL != nil { return .headRegion }

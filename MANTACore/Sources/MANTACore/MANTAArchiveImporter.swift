@@ -62,7 +62,8 @@ public struct MANTAArchiveImporter {
     /// its logical bundle. The destination is never partially populated.
     public func importBundle(
         at archiveURL: URL,
-        to destinationDirectory: URL
+        to destinationDirectory: URL,
+        progress: ((MANTACaptureReadProgress) -> Void)? = nil
     ) throws -> MANTAValidatedBundle {
         guard !fileManager.fileExists(atPath: destinationDirectory.path) else {
             throw MANTAArchiveImportError.destinationExists
@@ -73,9 +74,10 @@ public struct MANTAArchiveImporter {
             ".manta-import-\(UUID().uuidString).partial", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         do {
+            progress?(.init(stage: "Extracting legacy archive"))
             let archiveWarnings = try extract(archiveURL, to: staging)
             let validated = try MANTABundleValidator(fileManager: fileManager).validate(
-                directory: staging)
+                directory: staging, progress: progress)
             try fileManager.moveItem(at: staging, to: destinationDirectory)
             return MANTAValidatedBundle(
                 rootDirectory: destinationDirectory,

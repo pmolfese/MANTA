@@ -101,13 +101,26 @@ may impose tighter limits.
    └─ <review-uuid>.json
 ```
 
-MANTA exposes two package roles. **RAW** is the immutable acquisition ZIP and is
-never modified. **PROCESSED** is one editable directory package for that session.
-The first saved reconstruction, review, or solve promotes the Receiver's existing
-extracted RAW workspace into PROCESSED, gives it a stable `bundleID`, and records
-RAW as `parentBundleID`. Later macOS edits atomically replace only the assets or
-JSON they changed and append to `log_manta.json`. PROCESSED is intentionally not
-re-zipped, fully re-hashed, or RAW-validated after each edit.
+MANTA preserves original acquisition files and stores Receiver results in
+`derivatives/receiver/` inside the same capture folder. The effective processed
+`capture.json`, `manifest.json`, `processed.json`, `log_manta.json`, reconstructed
+models, regenerated head crops, alignment diagnostics, and electrode evidence all
+live there. Their asset paths are relative to the original capture root, so images,
+depth, and original meshes are reused without copying. The first saved edit gets a
+new stable bundle ID with the source bundle as its parent. Subsequent edits retain
+that identity and append changes. Per-file replacement is atomic; a multi-file edit
+is not a transaction. Legacy root-level PROCESSED packages remain readable, but new
+edits migrate to the derivative paths without rewriting their original files.
+
+Native iPad working folders (`session.json` plus observation checkpoints) open in
+place. Receiver creates a small canonical index in `derivatives/acquisition/` and
+hashes referenced source files once. These hashes establish a first-Mac-read
+baseline; they do not independently verify acquisition quality or pre-transfer
+integrity. Reopening verifies that baseline and rejects acquisition metadata that
+changed since indexing. The index retains a stable source bundle ID. Root RAW
+validation permits the reserved `derivatives/` directory without adding its outputs
+to the protected manifest; undeclared files elsewhere still fail validation.
+Legacy ZIP captures still require extraction to a selected destination.
 
 The iPhone/iPad UI uses **Export**, not Save As. Export finalizes the current
 working session as a new immutable `.manta`, including any newly applied model
@@ -199,7 +212,8 @@ PROCESSED bundle includes both; they must agree with the IDs inside
 
 RAW manifests list and hash every protected file. PROCESSED still lists its
 working files for discovery, but modified entries do not carry an integrity
-promise and are not fed back through the RAW validator. A lightweight load checks
+promise. Processing-index validation checks referenced files and structure while
+allowing native acquisition sidecars. A lightweight load checks
 that the package, manifest, capture, and change-log IDs agree. Each update retains
 prior change records and appends the new operation before replacing only the
 changed files.
@@ -532,3 +546,80 @@ where present, and a reason localization failed. These records have no world
 coordinate and never enter scientific coordinate exports. All original images
 remain available for offline re-detection. Evidence-only runs keep pre-existing
 coordinates and require Save Sensors to persist, like other Receiver drafts.
+
+### Optional acquisition motion evidence (A3)
+
+`quality.motionAssessment` optionally records `segmentID` (UUID), `state`
+(`unassessed`, `insufficientEvidence`, `consistent`, or `suspected`), and optional
+`residualMeters` / `overlapFraction`. Missing fields in older captures remain unknown.
+These are advisory consistency measurements, not head transforms or corrected poses.
+A3 uses one segment per pass and requires a new session following suspected movement.
+Known suspect or multiple-segment inputs are rejected by automatic processing pending
+review/registration; RAW evidence remains readable and exportable.
+
+Working folders may contain `acquisition/motion-stop.json` (a JSONEncoder Date).
+The shared loader applies this durable marker to recovered observations with motion
+metadata, including checkpoints newer than `session.json`. The export carries the
+resulting state in observation quality; the marker is a working-folder recovery aid.
+
+### Optional A4 capture and live-label evidence
+
+`quality.captureSource` records the frame source (for example `high-resolution-still`,
+`current-frame`, `best-window-frame`, or `cadence-comparison`). Older records omit it.
+Advisory JSON files under `acquisition/live-labels/<UUID>.json` have `observationID`
+and `sightings` containing `label`, `confidence`, `imageX`, `imageY`, and `ambiguous`.
+Coordinates are native image pixels. These are OCR sightings, not 3D measurements
+or final electrode identities. The optional manifest role is `live-label-evidence`.
+
+### Optional A5 review and recapture metadata
+
+`quality.guidedView` is an operator-assigned `front`, `left`, `right`, `back`, or `top`
+view; left/right refer to the participant. `quality.recaptureTargetLabel` records the
+operator's intended electrode target and must never be treated as an OCR result.
+General/automatic photos omit these fields. Tags do not change pose or calibration.
+
+Acquisition context may contain `captureReview`: review time, saved-observation and
+processed-live-frame counts, missing view tags, unread/ambiguous/single-view label
+lists, and `motionFlagged`. This is an advisory snapshot, not a release or accuracy
+certificate. New evidence invalidates it. Legacy captures omit these optional fields.
+
+H1/H2 add optional `captureReview.geometry`: observation/depth/confidence counts,
+blur-warning and unknown-sharpness counts, consistent/unknown/suspect motion counts,
+head-region presence, recorded head-crop/full-mesh references, and optional
+`viewSectorCount` (unknown when no head region exists). View sectors describe camera
+positions around the chosen head center in capture-world axes, not surface area or
+anatomical completeness. Recorded files require separate receipt validation. Region
+edits invalidate prior review/crop/export references; raw frames and the full mesh
+remain intact. GeoScan-related legacy acquisition fields stay readable/exportable,
+but no GeoScan controls or reminders appear in iPad collection.
+
+### Optional A6 derived segment correction
+
+`quality.motionCorrection` records `runID`, `sourceBundleID`, `sourceSegmentID`,
+`referenceSegmentID`, `referenceFromSource`, `sourceFromReference`,
+`originalCameraToWorld`, and `method`. Matrices are column-major 4×4; coordinates
+use meters. Direction is explicit:
+
+```
+derivedCameraToWorld = referenceFromSource * originalCameraToWorld
+sourcePoint = sourceFromReference * referencePoint
+```
+
+The current method is `reviewed-stable-segment-rigid-v1-uncalibrated`. The original
+`motionAssessment`, including a suspect flag, stays unchanged. Processing accepts
+corrections only when all frames have valid correction records from one run/reference
+and each source segment has one consistent rigid transform. Structural validation
+checks that the actual camera pose agrees with the recorded original and transform.
+Missing, partial, or malformed corrections do not clear the movement guard.
+Object Capture has a separate guard: corrected captures remain ineligible until
+foreground masking and pose handling are validated.
+
+`recovery/registration.json` stores acceptance, residuals/overlap, rejected frame IDs,
+source capture/manifest hashes, integrity warnings, and explicitly uncalibrated
+confidence. `recovery/request.json` stores the reviewed selection, bounds, and matched
+landmarks. The first source is `parentBundleID`; the report identifies every source.
+The canonical reference-head frame uses `arkit-world` in the derived document for
+compatibility, with its definition in the coordinate-system description. Original
+metadata and selected raw assets are copied under `sources/`; source meshes,
+fiducials, electrode solutions, and coverage are not implicitly transformed/reused.
+See [recovery workflow and limitations](SEGMENT_RECOVERY.md).

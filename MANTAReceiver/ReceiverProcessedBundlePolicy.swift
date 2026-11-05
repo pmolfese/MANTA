@@ -22,24 +22,36 @@ struct ReceiverProcessedUpdate: Sendable {
     var alignmentAccepted: Bool
 }
 
-/// RAW is the protected interchange archive. PROCESSED is an app-managed
-/// directory package: the first edit promotes the Receiver's existing extracted
-/// RAW workspace, and later edits replace only their individual output files.
+/// Original acquisition files stay in place. Receiver edits and their effective
+/// manifest live under derivatives/receiver; legacy processed packages still open.
 nonisolated enum ReceiverProcessedPackage {
-    static let metadataFilename = "processed.json"
-    private static let logFilename = "log_manta.json"
-    private static let electrodeEvidencePath = "analysis/electrode_evidence.json"
+    static let metadataFilename = "derivatives/receiver/processed.json"
+    private static let logFilename = "derivatives/receiver/log_manta.json"
+    private static let electrodeEvidencePath = "derivatives/receiver/analysis/electrode_evidence.json"
 
     static func isPackage(_ url: URL) -> Bool {
-        FileManager.default.fileExists(
-            atPath: url.appendingPathComponent(metadataFilename).path)
+        FileManager.default.fileExists(atPath: url.appendingPathComponent(metadataFilename).path)
+            || FileManager.default.fileExists(atPath: url.appendingPathComponent("processed.json").path)
     }
 
-    static func load(at root: URL, verifyIntegrity: Bool = false) throws -> MANTAValidatedBundle {
+    static func load(at root: URL, verifyIntegrity: Bool = false,
+                     progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent(metadataFilename).path) {
+            let bundle = try MANTABundleValidator().validateProcessingIndex(directory: root,
+                verifyIntegrity: verifyIntegrity, progress: progress)
+            let metadata = try MANTAJSON.makeDecoder().decode(ReceiverProcessedPackageMetadata.self,
+                from: Data(contentsOf: root.appendingPathComponent(metadataFilename)))
+            guard metadata.sessionID == bundle.manifest.sessionID,
+                  metadata.processedBundleID == bundle.manifest.bundleID,
+                  metadata.rawBundleID == bundle.manifest.parentBundleID else {
+                throw ReceiverProcessedPackageError.inconsistentMetadata
+            }
+            return ReceiverAlignmentPolicy.applying(to: bundle)
+        }
         let decoder = MANTAJSON.makeDecoder()
         let metadata = try decoder.decode(
             ReceiverProcessedPackageMetadata.self,
-            from: Data(contentsOf: root.appendingPathComponent(metadataFilename)))
+            from: Data(contentsOf: root.appendingPathComponent("processed.json")))
         var manifest = try decoder.decode(
             MANTABundleManifest.self,
             from: Data(contentsOf: root.appendingPathComponent(MANTABundleFormat.manifestFilename)))
@@ -61,19 +73,22 @@ nonisolated enum ReceiverProcessedPackage {
         // unrecoverable.
         manifest.bundleID = metadata.processedBundleID
         manifest.parentBundleID = metadata.rawBundleID
-        return MANTAValidatedBundle(
+        return ReceiverAlignmentPolicy.applying(to: MANTAValidatedBundle(
             rootDirectory: root,
             manifest: manifest,
             capture: capture,
             changeLog: changeLog,
             integrityWarnings: verifyIntegrity
-                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files) : [])
+                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files, progress: progress) : []))
     }
 
     static func loadElectrodeEvidence(
         from bundle: MANTAValidatedBundle
     ) -> ReceiverElectrodeEvidenceDocument? {
-        let url = bundle.rootDirectory.appendingPathComponent(electrodeEvidencePath)
+        let preferred = bundle.rootDirectory.appendingPathComponent(electrodeEvidencePath)
+        let usesDerivatives = bundle.manifest.content.capture.hasPrefix("derivatives/receiver/")
+        let url = usesDerivatives || FileManager.default.fileExists(atPath: preferred.path) ? preferred
+            : bundle.rootDirectory.appendingPathComponent("analysis/electrode_evidence.json")
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? MANTAJSON.makeDecoder().decode(
             ReceiverElectrodeEvidenceDocument.self, from: data)
@@ -90,9 +105,9 @@ nonisolated enum ReceiverProcessedPackage {
             bundle: source, preparation: preparation, run: run,
             progress: progress, log: log)
         var state = try ensurePackage(for: source)
-        let modelPath = "reconstruction/macos_\(preparation.detail.rawValue).usdz"
-        let diagnosticsPath = "reconstruction/macos_\(preparation.detail.rawValue)_diagnostics.json"
-        let posesPath = "reconstruction/macos_poses.json"
+        let modelPath = "derivatives/receiver/reconstruction/macos_\(preparation.detail.rawValue).usdz"
+        let diagnosticsPath = "derivatives/receiver/reconstruction/macos_\(preparation.detail.rawValue)_diagnostics.json"
+        let posesPath = "derivatives/receiver/reconstruction/macos_poses.json"
         try replaceFile(preparation.modelURL, at: modelPath, in: state.root)
         try replaceFile(preparation.diagnosticsURL, at: diagnosticsPath, in: state.root)
         try replaceFile(preparation.posesURL, at: posesPath, in: state.root)
@@ -129,7 +144,7 @@ nonisolated enum ReceiverProcessedPackage {
         ephemeralReconstruction: ReceiverEphemeralReconstruction?
     ) throws -> ReceiverProcessedUpdate {
         var state = try ensurePackage(for: source)
-        let diagnosticsPath = "reconstruction/manual_alignment_diagnostics.json"
+        let diagnosticsPath = "derivatives/receiver/reconstruction/manual_alignment_diagnostics.json"
         try writeJSON(outcome.diagnostics, to: state.root.appendingPathComponent(diagnosticsPath))
 
         var capture = state.bundle.capture
@@ -142,9 +157,9 @@ nonisolated enum ReceiverProcessedPackage {
         ]
         var targets = ["capture.json", diagnosticsPath]
         if let ephemeralReconstruction {
-            let modelPath = "reconstruction/macos_\(ephemeralReconstruction.detail.rawValue).usdz"
-            let reconstructionDiagnosticsPath = "reconstruction/macos_\(ephemeralReconstruction.detail.rawValue)_diagnostics.json"
-            let posesPath = "reconstruction/macos_poses.json"
+            let modelPath = "derivatives/receiver/reconstruction/macos_\(ephemeralReconstruction.detail.rawValue).usdz"
+            let reconstructionDiagnosticsPath = "derivatives/receiver/reconstruction/macos_\(ephemeralReconstruction.detail.rawValue)_diagnostics.json"
+            let posesPath = "derivatives/receiver/reconstruction/macos_poses.json"
             try replaceFile(ephemeralReconstruction.modelURL, at: modelPath, in: state.root)
             try replaceFile(ephemeralReconstruction.diagnosticsURL, at: reconstructionDiagnosticsPath, in: state.root)
             try replaceFile(ephemeralReconstruction.posesURL, at: posesPath, in: state.root)
@@ -217,7 +232,7 @@ nonisolated enum ReceiverProcessedPackage {
             let fullURL = state.root.appendingPathComponent(fullPath)
             if let cropped = try? croppedLiDARMesh(fullMeshURL: fullURL, boundingBox: boundingBox),
                !cropped.vertices.isEmpty {
-                let croppedPath = "reconstruction/lidar_mesh_head.ply"
+                let croppedPath = "derivatives/receiver/reconstruction/lidar_mesh_head.ply"
                 let temporary = FileManager.default.temporaryDirectory
                     .appendingPathComponent("manta-lidar-crop-\(UUID().uuidString).ply")
                 do {
@@ -329,36 +344,31 @@ nonisolated enum ReceiverProcessedPackage {
         var role: String
     }
 
-    /// Everything about a capture lives in the one folder the user gave us -
-    /// wherever that is on disk. There is no promotion into an app-managed
-    /// location and no RAW/PROCESSED fork: the first edit stamps the folder with
-    /// local metadata in place, and every later edit reuses the same root and
-    /// the same bundle identity. Re-running a step (reconstruction, alignment,
-    /// electrode detection) simply overwrites its own output files in place.
+    /// Original capture files stay in place. All Receiver writes are scoped to
+    /// derivatives/receiver, including migrated legacy PROCESSED edits.
     private static func ensurePackage(for source: MANTAValidatedBundle) throws -> State {
         let root = source.rootDirectory
+        for path in ["derivatives", "derivatives/receiver", "derivatives/receiver/reconstruction", "derivatives/receiver/analysis"] {
+            let url = root.appendingPathComponent(path)
+            if FileManager.default.fileExists(atPath: url.path) {
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard values.isDirectory == true, values.isSymbolicLink != true else {
+                    throw ReceiverProcessedPackageError.inconsistentMetadata
+                }
+            }
+        }
         if isPackage(root) {
             let loaded = try load(at: root)
-            let metadata = try MANTAJSON.makeDecoder().decode(
-                ReceiverProcessedPackageMetadata.self,
-                from: Data(contentsOf: root.appendingPathComponent(metadataFilename)))
+            let path = FileManager.default.fileExists(atPath: root.appendingPathComponent(metadataFilename).path)
+                ? metadataFilename : "processed.json"
+            let metadata = try MANTAJSON.makeDecoder().decode(ReceiverProcessedPackageMetadata.self,
+                from: Data(contentsOf: root.appendingPathComponent(path)))
             return State(root: root, bundle: loaded, metadata: metadata)
         }
-
         let now = Date()
-        let metadata = ReceiverProcessedPackageMetadata(
-            processedBundleID: source.manifest.bundleID,
-            rawBundleID: source.manifest.parentBundleID ?? source.manifest.bundleID,
+        let metadata = ReceiverProcessedPackageMetadata(processedBundleID: UUID(), rawBundleID: source.manifest.bundleID,
             sessionID: source.manifest.sessionID, createdAt: now, updatedAt: now)
-        try writeJSON(metadata, to: root.appendingPathComponent(metadataFilename))
-        var manifest = source.manifest
-        manifest.finalizedAt = now
-        manifest.producer = producer()
-        manifest.content.changeLog = logFilename
-        let initial = MANTAValidatedBundle(
-            rootDirectory: root, manifest: manifest,
-            capture: source.capture, changeLog: source.changeLog)
-        return State(root: root, bundle: initial, metadata: metadata)
+        return State(root: root, bundle: source, metadata: metadata)
     }
 
     private static func invalidateElectrodes(
@@ -396,10 +406,9 @@ nonisolated enum ReceiverProcessedPackage {
             producer: producer(),
             changes: changes)
 
-        let capturePath = state.bundle.manifest.content.capture
+        let capturePath = "derivatives/receiver/capture.json"
         try writeJSON(capture, to: state.root.appendingPathComponent(capturePath))
         try writeJSON(log, to: state.root.appendingPathComponent(logFilename))
-        try writeJSON(metadata, to: state.root.appendingPathComponent(metadataFilename))
 
         var manifest = state.bundle.manifest
         manifest.bundleID = metadata.processedBundleID
@@ -407,6 +416,7 @@ nonisolated enum ReceiverProcessedPackage {
         manifest.finalizedAt = change.changedAt
         manifest.producer = producer()
         manifest.content.changeLog = logFilename
+        manifest.content.capture = capturePath
         let descriptions = changedFiles + [
             FileDescription(path: capturePath, mediaType: "application/json", role: "capture-metadata"),
             FileDescription(path: logFilename, mediaType: "application/json", role: "change-log")
@@ -417,11 +427,12 @@ nonisolated enum ReceiverProcessedPackage {
             manifest.files.append(entry)
         }
         manifest.files.sort { $0.path < $1.path }
-        // Commit manifest last. Readers therefore see either the previous state
-        // or the complete new state; no package-wide rebuild is involved.
+        // Publish the manifest after output files. Each write is atomic, but a
+        // multi-file edit is not a transaction; original acquisition is preserved.
         try writeJSON(
             manifest,
-            to: state.root.appendingPathComponent(MANTABundleFormat.manifestFilename))
+            to: state.root.appendingPathComponent("derivatives/receiver/manifest.json"))
+        try writeJSON(metadata, to: state.root.appendingPathComponent(metadataFilename))
         return MANTAValidatedBundle(
             rootDirectory: state.root, manifest: manifest,
             capture: capture, changeLog: log)

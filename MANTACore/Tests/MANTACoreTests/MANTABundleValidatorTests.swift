@@ -4,6 +4,35 @@ import Testing
 @testable import MANTACore
 
 struct MANTABundleValidatorTests {
+    @Test func permitsDerivativeOutputsWithoutChangingRawManifest() throws {
+        let root = try copyFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try Data(contentsOf: root.appendingPathComponent("manifest.json"))
+        let derivative = root.appendingPathComponent("derivatives/receiver")
+        try FileManager.default.createDirectory(at: derivative, withIntermediateDirectories: true)
+        try Data("output".utf8).write(to: derivative.appendingPathComponent("notes.txt"))
+        #expect(try MANTABundleValidator().validate(directory: root).integrityWarnings.isEmpty)
+        #expect(try Data(contentsOf: root.appendingPathComponent("manifest.json")) == original)
+    }
+
+    @Test func rejectsIndexManifestOutsideCapture() throws {
+        let root = try copyFixture()
+        let outside = try copyFixture()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("derivatives"), withDestinationURL: outside)
+        #expect(throws: MANTABundleValidationError.self) {
+            try MANTABundleValidator().validate(directory: root)
+        }
+        try FileManager.default.createDirectory(at: outside.appendingPathComponent("receiver"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: outside.appendingPathComponent("manifest.json"), to: outside.appendingPathComponent("receiver/manifest.json"))
+        #expect(throws: MANTABundleValidationError.self) {
+            try MANTABundleValidator().validateProcessingIndex(directory: root)
+        }
+    }
+
     @Test func validatesMinimalFixture() throws {
         let fixture = try #require(Bundle.module.url(forResource: "Minimal128", withExtension: nil, subdirectory: "Fixtures"))
         let bundle = try MANTABundleValidator().validate(directory: fixture)

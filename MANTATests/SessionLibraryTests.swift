@@ -11,6 +11,7 @@ import MANTACore
 import Testing
 @testable import MANTA
 
+@MainActor
 struct SessionLibraryTests {
     private func makeStore() throws -> CaptureArtifactStore {
         let root = FileManager.default.temporaryDirectory
@@ -152,13 +153,12 @@ struct SessionLibraryTests {
         try store.writeDetectionDiagnostics(diagnostics, for: s)
 
         let exported = try store.exportSessionBundle(id: s.id)
-        let destination = exported.url.deletingLastPathComponent()
-            .appendingPathComponent("verified-\(UUID().uuidString)", isDirectory: true)
-        _ = try MANTAArchiveImporter().importBundle(at: exported.url, to: destination)
+        // Capture exports are directory packages; don't feed the directory to
+        // the legacy ZIP importer (large sessions intentionally avoid ZIP).
+        let verified = try MANTABundleValidator().validate(directory: exported.url)
 
         #expect(FileManager.default.fileExists(
-            atPath: destination.appendingPathComponent("runs/live-current/run.json").path))
-        try? FileManager.default.removeItem(at: destination)
+            atPath: verified.rootDirectory.appendingPathComponent("runs/live-current/run.json").path))
         try? FileManager.default.removeItem(at: exported.url.deletingLastPathComponent())
     }
 
@@ -191,5 +191,203 @@ struct SessionLibraryTests {
         #expect(s.createdAt == created)
         #expect(s.timestampName == stamp)
         #expect(s.displayName.hasSuffix(stamp))
+    }
+}
+
+@MainActor
+struct CaptureSessionLifecycleTests {
+    private func fixture() throws -> (CaptureArtifactStore, UserDefaults) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("session-lifecycle-\(UUID())")
+        return (try CaptureArtifactStore(rootDirectory: root),
+                UserDefaults(suiteName: "session-lifecycle-\(UUID())")!)
+    }
+
+    private var mesh: LiDARMeshSnapshot {
+        LiDARMeshSnapshot(vertices: [SIMD3(0, 0, 0), SIMD3(0.1, 0, 0), SIMD3(0, 0.1, 0)],
+                          triangleIndices: [0, 1, 2])
+    }
+
+    @Test func stopSavesMeshAndKeepsIdentityWithoutPausingTracking() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let snapshot = mesh
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults,
+                                         meshSnapshotProvider: { snapshot })
+        #expect(model.startNewSession(subjectLabel: "  Subject-A  "))
+        let original = model.session
+        model.scanViewModel.status.isRunning = true
+        #expect(model.stopAutoSampling())
+        let saved = try store.loadSession(id: original.id)
+        #expect(saved.subjectLabel == "Subject-A")
+        #expect(saved.createdAt == original.createdAt)
+        #expect(saved.lidarMeshFilename != nil)
+        #expect(store.loadLiDARMeshSnapshot(for: saved)?.triangleIndices == [0, 1, 2])
+        #expect(model.scanViewModel.status.isRunning)
+        // Opening the library's Current row must not invalidate a live capture.
+        #expect(model.openSession(id: original.id))
+        #expect(model.scanViewModel.status.isRunning)
+        model.pauseLiveScan()
+        #expect(model.session.id == original.id)
+        #expect(!model.scanViewModel.status.isRunning)
+    }
+
+    @Test func unlabeledSessionPersistsAndCanBeLabeledLater() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(model.startNewSession())
+        let original = model.session
+        #expect(original.subjectLabel == nil)
+        #expect(!model.needsSessionName)
+        #expect(try store.loadSession(id: original.id).subjectLabel == nil)
+        let restored = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(restored.session.id == original.id)
+        #expect(!restored.needsSessionName)
+        restored.renameSubject("  Later label  ")
+        let saved = try store.loadSession(id: original.id)
+        #expect(saved.subjectLabel == "Later label")
+        #expect(saved.createdAt == original.createdAt)
+        #expect(restored.startNewSession(subjectLabel: " \n "))
+        #expect(restored.session.subjectLabel == nil)
+        #expect(restored.session.id != original.id)
+    }
+
+    @Test func newSessionSavesOldMeshAndRelaunchRestoresNamedIdentity() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let snapshot = mesh
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults,
+                                         meshSnapshotProvider: { snapshot })
+        #expect(model.startNewSession(subjectLabel: "First"))
+        let firstID = model.session.id
+        #expect(model.startNewSession(subjectLabel: "Second"))
+        #expect(try store.loadSession(id: firstID).lidarMeshFilename != nil)
+        #expect(model.session.id != firstID)
+        #expect(model.session.captureObservations.isEmpty)
+        #expect(model.session.lidarMeshFilename == nil)
+        let restored = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(restored.session.id == model.session.id)
+        #expect(restored.session.subjectLabel == "Second")
+        #expect(!restored.needsSessionName)
+    }
+
+    @Test func layoutChangePreservesSessionAndDoesNotDiscardCapturedEvidence() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(model.startNewSession(subjectLabel: "Named"))
+        let original = model.session
+        let layout = try #require(model.availableLayouts.first(where: { $0.hasElectrodeNet }))
+        model.selectLayout(named: layout.name)
+        #expect(model.session.id == original.id)
+        #expect(model.session.name == original.name)
+        #expect(model.session.createdAt == original.createdAt)
+        #expect(model.session.layout == layout)
+        let observation = CaptureObservation(capturedAt: Date(), cameraTransform: [], cameraIntrinsics: [],
+            imageResolution: ImageResolution(width: 1, height: 1), hasSceneDepth: false,
+            meshAnchorCount: 0, trackingSummary: "Normal")
+        model.session.captureObservations = [observation]
+        model.selectLayout(named: ElectrodeLayout.headMeshOnly.name)
+        #expect(model.session.layout == layout)
+        #expect(model.session.captureObservations == [observation])
+    }
+
+    @Test func failedMeshSaveKeepsOldSessionForRetry() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let snapshot = mesh
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults,
+                                         meshSnapshotProvider: { snapshot })
+        #expect(model.startNewSession(subjectLabel: "Keep me"))
+        let id = model.session.id
+        // A file where a reconstruction directory should be forces a real I/O failure.
+        let blocked = store.rootDirectory.appendingPathComponent(id.uuidString).appendingPathComponent("reconstruction")
+        try Data([1]).write(to: blocked)
+        #expect(!model.startNewSession(subjectLabel: "Next"))
+        #expect(model.session.id == id)
+        #expect(model.captureSaveError != nil)
+        try FileManager.default.removeItem(at: blocked)
+        #expect(model.startNewSession(subjectLabel: "Next"))
+        #expect(try store.loadSession(id: id).lidarMeshFilename != nil)
+    }
+
+    @Test func endingSavesMeshLocksCaptureAndSurvivesRelaunch() async throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let snapshot = mesh
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults,
+                                         meshSnapshotProvider: { snapshot })
+        #expect(model.startNewSession(subjectLabel: "End this capture"))
+        let id = model.session.id
+        model.scanViewModel.status.isRunning = true
+        await model.endSession()
+        let saved = try store.loadSession(id: id)
+        #expect(saved.endedAt != nil)
+        #expect(saved.lidarMeshFilename != nil)
+        #expect(!model.scanViewModel.status.isRunning)
+        #expect(!model.isEndingSession)
+        #expect(!model.scanViewModel.canEditCaptureSettings)
+        // A mesh-only pass with no RGB samples is still saved and ended, with
+        // the validation finding surfaced rather than silently asserting success.
+        #expect(model.sessionEndSummary?.contains("no observations") == true)
+        #expect(model.releaseCheckMessages.contains("File validation: failed"))
+        #expect(store.listSessionSummaries().first?.endedAt == saved.endedAt)
+        model.startLiveScan()
+        model.startAutoSampling()
+        model.sampleCurrentARFrame()
+        await model.captureHighResolutionStill()
+        #expect(!model.scanViewModel.status.isRunning)
+        #expect(!model.isAutoSampling)
+        #expect(model.session.captureObservations.isEmpty)
+        await model.endSession()
+        #expect(model.session.endedAt == saved.endedAt)
+        let reopened = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(reopened.isSessionEnded)
+        #expect(!reopened.canEndSession)
+        #expect(!reopened.scanViewModel.canEditCaptureSettings)
+        #expect(reopened.startNewSession(subjectLabel: "Next"))
+        #expect(!reopened.isSessionEnded)
+        #expect(reopened.scanViewModel.canEditCaptureSettings)
+    }
+
+    @Test func failedReceiptWriteKeepsCapturePausedAndAllowsRetry() async throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(model.startNewSession(subjectLabel: "Retry"))
+        let receipt = store.rootDirectory.appendingPathComponent(model.session.id.uuidString)
+            .appendingPathComponent("capture-receipt.json")
+        try FileManager.default.createDirectory(at: receipt, withIntermediateDirectories: true)
+        await model.endSession()
+        #expect(!model.isSessionEnded)
+        #expect(!model.scanViewModel.status.isRunning)
+        #expect(model.captureSaveError != nil)
+        #expect(try store.loadSession(id: model.session.id).endedAt == nil)
+        try FileManager.default.removeItem(at: receipt)
+        await model.endSession()
+        #expect(model.isSessionEnded)
+        #expect(model.captureSaveError == nil)
+    }
+
+    @Test func legacySessionWithoutCompletionMarkerStillDecodes() throws {
+        let original = ScanSession.newSession()
+        let encoded = try JSONEncoder().encode(original)
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "endedAt")
+        let decoded = try JSONDecoder().decode(ScanSession.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(decoded.endedAt == nil)
+        #expect(decoded.id == original.id)
+    }
+
+    @Test func deleteCurrentDoesNotRecreateItsFolder() throws {
+        let (store, defaults) = try fixture()
+        defer { try? FileManager.default.removeItem(at: store.rootDirectory) }
+        let model = ScanSessionViewModel(artifactStore: store, sessionDefaults: defaults)
+        #expect(model.startNewSession(subjectLabel: "Delete me"))
+        let id = model.session.id
+        model.deleteSession(id: id)
+        #expect(model.needsSessionName)
+        #expect(!FileManager.default.fileExists(atPath: store.rootDirectory.appendingPathComponent(id.uuidString).path))
+        #expect(store.listSessionSummaries().isEmpty)
     }
 }

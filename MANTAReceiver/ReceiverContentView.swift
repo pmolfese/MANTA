@@ -49,8 +49,8 @@ struct ReceiverContentView: View {
                             "Head crop",
                             value: bundle.capture.reconstruction?.headCroppedLidarMeshPath == nil ? "None" : "Available")
                         LabeledContent(
-                            "Photogrammetry",
-                            value: bundle.capture.reconstruction?.objectCaptureModelPath == nil ? "None" : "Available")
+                            "Photo model",
+                            value: bundle.capture.reconstruction?.objectCaptureModelPath == nil ? "Not built" : "Available")
                         LabeledContent(
                             "RGB-D frames",
                             value: "\(bundle.capture.observations.filter { $0.depth != nil }.count)")
@@ -63,8 +63,7 @@ struct ReceiverContentView: View {
                         if bundle.capture.reconstruction?.objectCaptureModelPath != nil {
                             LabeledContent(
                                 "3D alignment",
-                                value: bundle.capture.reconstruction?.modelToWorld == nil
-                                    ? "Not declared" : "ARKit world")
+                                value: ReceiverAlignmentPolicy.assessment(for: bundle).message)
                         }
                     }
                 }
@@ -107,10 +106,11 @@ struct ReceiverContentView: View {
                     }
                 }
             }
+            .disabled(store.isImporting)
             .navigationTitle("MANTA Receiver")
         } detail: {
             if store.isImporting {
-                ProgressView("Copying and validating capture…")
+                ReceiverOpeningProgressView(store: store)
             } else if let bundle = store.bundle {
                 BundleInspector(store: store, display: display, bundle: bundle)
             } else {
@@ -197,6 +197,38 @@ struct ReceiverContentView: View {
     }
 }
 
+private struct ReceiverOpeningProgressView: View {
+    @ObservedObject var store: ReceiverStore
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Opening capture").font(.title2.weight(.semibold))
+            Text(store.importingName).font(.headline).textSelection(.enabled)
+            if let fraction = store.importProgress {
+                ProgressView(value: fraction)
+                Text("\(Int((fraction * 100).rounded()))% of this stage")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text(store.importStage)
+            if let detail = store.importDetail {
+                Text(detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .lineLimit(3).textSelection(.enabled)
+            }
+            if let started = store.importStartedAt {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text("\(max(0, Int(context.date.timeIntervalSince(started)))) seconds elapsed")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+            Text("Folders are opened in place. Original images, depth, and meshes stay where they are; Receiver results are stored under derivatives/.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(28)
+        .frame(maxWidth: 560)
+    }
+}
+
 private struct BundleInspector: View {
     @ObservedObject var store: ReceiverStore
     @ObservedObject var display: ReceiverDisplaySettings
@@ -257,7 +289,9 @@ private struct ReceiverReconstructionView: View {
     }
 
     var body: some View {
-        Form {
+        // The sidebar List owns scrolling. A grouped Form here creates a nested
+        // scroll view inside its disclosure row and traps wheel/trackpad input.
+        Group {
             Section("Offline Object Capture") {
                 Picker("Detail", selection: $detail) {
                     ForEach(ReceiverPhotogrammetryDetail.allCases) { option in
@@ -287,7 +321,7 @@ private struct ReceiverReconstructionView: View {
 
                 Text(outputMode == .preview
                      ? "Keeps the USDZ in temporary app storage for interactive inspection. PROCESSED is not changed."
-                     : "Creates a mutable PROCESSED package from RAW, then writes only files changed by later edits.")
+                     : "Saves models and edits under derivatives/receiver in the capture folder.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -374,7 +408,7 @@ private struct ReceiverReconstructionView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(!canStart)
 
-                    Text("Full is the recommended first pass. RAW is never modified; saved edits update individual files in one PROCESSED package.")
+                    Text("Full is the recommended first pass. Original capture files stay unchanged; models and edits are saved under derivatives/receiver.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -451,12 +485,9 @@ private struct ReceiverReconstructionView: View {
             if let archive = store.processedPackageURL {
                 Section("PROCESSED Package") {
                     Label(
-                        store.reconstructionAlignmentAccepted
-                            ? "Photogrammetry aligned to the ARKit head geometry"
-                            : "Model saved; automatic ARKit-world alignment was not accepted",
-                        systemImage: store.reconstructionAlignmentAccepted
-                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(store.reconstructionAlignmentAccepted ? .green : .orange)
+                        ReceiverAlignmentPolicy.assessment(for: bundle).message,
+                        systemImage: "info.circle")
+                        .foregroundStyle(.orange)
                     if let rms = store.reconstructionAlignmentRMSMeters {
                         LabeledContent(
                             "Alignment RMS",
@@ -473,7 +504,6 @@ private struct ReceiverReconstructionView: View {
                 }
             }
         }
-        .formStyle(.grouped)
     }
 
     private var canStart: Bool {
@@ -605,7 +635,7 @@ private struct MetadataSidebarSection: View {
                 }
             }
             if let archiveURL {
-                group("Stored Copy", count: 1) {
+                group("Capture Folder", count: 1) {
                     Text(archiveURL.path)
                         .font(.system(.caption2, design: .monospaced))
                         .textSelection(.enabled)

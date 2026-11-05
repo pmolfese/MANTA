@@ -336,6 +336,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
         detail: ReceiverPhotogrammetryDetail,
         inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) throws -> ReceiverReconstructionPreparation {
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality))
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReceiverReconstructionError.noImages }
         if let available = estimate.availableBytes, !estimate.hasEnoughSpace {
@@ -480,15 +481,14 @@ nonisolated enum ReceiverReconstructionWorkflow {
         // tiny model near the target centroid can be close to some target points
         // while explaining almost none of the target surface. Require both
         // directions to agree before declaring an automatic alignment usable.
-        let alignmentAccepted = symmetricRMS?.isFinite == true
-            && (symmetricRMS ?? .greatestFiniteMagnitude) <= 0.05
+        let alignmentAccepted = ReceiverAlignmentPolicy.acceptsAutomatic(symmetricRMS: symmetricRMS)
         if let symmetricRMS, symmetricRMS.isFinite {
             log?(
                 alignmentAccepted ? .success : .warning,
                 String(
                     format: "Automatic alignment symmetric RMS: %.1f mm%@.",
                     symmetricRMS * 1_000,
-                    alignmentAccepted ? " (accepted)" : " (not accepted)"))
+                    alignmentAccepted ? " (passes 10 mm screening limit; inspect alignment)" : " (overlay blocked; automatic limit 10 mm)"))
         } else {
             log?(.warning, "Automatic alignment did not produce a finite RMS value.")
         }

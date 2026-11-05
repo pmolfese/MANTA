@@ -13,8 +13,9 @@ import Testing
 import simd
 @testable import MANTA
 
+@MainActor
 struct ElectrodeCapOrientationTests {
-    static let channelCounts = [128, 256]
+    nonisolated static let channelCounts = [128, 256]
 
     private func loadLayout(channelCount: Int) throws -> ElectrodeLayout {
         let layouts = try HydroCelLayoutLoader().loadLayouts()

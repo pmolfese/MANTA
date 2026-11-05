@@ -293,6 +293,7 @@ enum ReconstructionWorkflow {
         detail: PhotogrammetryDetail,
         inputMode: PhotogrammetryInputMode = .imagesOnly
     ) throws -> ReconstructionPreparation {
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality))
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReconstructionError.noImages }
         if let available = estimate.availableBytes, !estimate.hasEnoughSpace {

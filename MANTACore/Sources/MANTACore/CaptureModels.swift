@@ -194,6 +194,11 @@ public struct CaptureQualityMetrics: Codable, Equatable, Hashable, Sendable {
     public var validDepthFraction: Double?
     public var highConfidenceDepthFraction: Double?
     public var warnings: [String]
+    public var motionCorrection: SegmentMotionCorrection?
+    public var motionAssessment: CaptureMotionAssessment?
+    public var captureSource: String?
+    public var guidedView: CaptureGuidedView?
+    public var recaptureTargetLabel: String?
 
     public init(
         arFrameTimestamp: Double, worldMappingStatus: String,

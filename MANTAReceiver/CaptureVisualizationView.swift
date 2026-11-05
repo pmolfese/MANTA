@@ -129,7 +129,7 @@ private struct StoredCameraFrameView: View {
         guard let path = observation.losslessImagePath ?? observation.imagePath else { return nil }
         return ReceiverOrientedFrameImage.load(
             from: root.appendingPathComponent(path),
-            orientation: ReceiverStoredImageOrientation(observation.imageOrientation))
+            orientation: ReceiverStoredImageOrientation.displayOrientation(for: observation))
     }
 
     private func drawAnnotations(

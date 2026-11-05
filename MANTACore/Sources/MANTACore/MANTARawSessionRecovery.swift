@@ -67,7 +67,7 @@ public struct MANTARawSessionRecovery {
             throw MANTARawSessionRecoveryError.missingSessionMetadata
         }
 
-        let session = try JSONDecoder().decode(ScanSession.self, from: Data(contentsOf: sessionURL))
+        let session = try MANTAWorkingSessionLoader.load(from: sessionDirectory, fileManager: fileManager)
         let parent = destinationDirectory.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         let staging = parent.appendingPathComponent(
@@ -157,6 +157,99 @@ public struct MANTARawSessionRecovery {
                 capture: validated.capture,
                 changeLog: validated.changeLog),
             packageURL: destinationDirectory)
+    }
+
+    /// Opens a finished working capture in place. Only a small acquisition index
+    /// is written under derivatives; image/depth/mesh bytes are never copied.
+    /// Its hashes establish a baseline at first Mac opening, not an independent
+    /// claim about acquisition accuracy or pre-transfer integrity.
+    public func openDirectoryInPlace(
+        _ directory: URL, producer: MANTAProducer, verifyExistingIntegrity: Bool = true,
+        progress: ((MANTACaptureReadProgress) -> Void)? = nil
+    ) throws -> MANTAValidatedBundle {
+        progress?(.init(stage: "Reading session and frame checkpoints"))
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let session = try MANTAWorkingSessionLoader.load(from: root, fileManager: fileManager)
+        let capture = makeCaptureDocument(session)
+        let prefix = "derivatives/acquisition/"
+        for path in ["derivatives", "derivatives/acquisition"] {
+            let url = root.appendingPathComponent(path)
+            if fileManager.fileExists(atPath: url.path) {
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard values.isDirectory == true, values.isSymbolicLink != true else {
+                    throw MANTARawSessionRecoveryError.invalidReferencedPath(path)
+                }
+            }
+        }
+        let manifestURL = root.appendingPathComponent(prefix + "manifest.json")
+        if fileManager.fileExists(atPath: manifestURL.path) {
+            let indexed = try MANTABundleValidator(fileManager: fileManager).validateWorkingIndex(directory: root, verifyIntegrity: verifyExistingIntegrity, progress: progress)
+            // ISO date serialization has millisecond precision; compare the
+            // persisted representation rather than submillisecond Date values.
+            guard try MANTAJSON.canonicalData(indexed.capture) == MANTAJSON.canonicalData(capture) else {
+                throw MANTABundleValidationError.invalidCapture("The working acquisition changed after its Receiver index was created. Keep the existing derivatives with their source; open the updated acquisition separately.")
+            }
+            return indexed
+        }
+        var sources = try bundleFileSources(session, in: root)
+        for path in ["session.json", "diagnostics.json"] where fileManager.fileExists(atPath: root.appendingPathComponent(path).path) {
+            sources.append(.init(path: path, sourceURL: root.appendingPathComponent(path), mediaType: "application/json", role: "original-working-metadata"))
+        }
+        let checkpoints = root.appendingPathComponent("acquisition/observations")
+        if fileManager.fileExists(atPath: checkpoints.path) {
+            for file in try fileManager.contentsOfDirectory(at: checkpoints, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
+                sources.append(.init(path: "acquisition/observations/" + file.lastPathComponent, sourceURL: file,
+                    mediaType: "application/json", role: "original-frame-checkpoint"))
+            }
+        }
+        // Validate all source references before writing even the small index.
+        for source in sources {
+            try validate(path: source.path)
+            guard source.sourceURL.resolvingSymlinksInPath().path.hasPrefix(root.path + "/"),
+                  (try? source.sourceURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]))?.isRegularFile == true,
+                  (try? source.sourceURL.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else {
+                throw MANTARawSessionRecoveryError.missingReferencedFile(source.path)
+            }
+        }
+        try fileManager.createDirectory(at: root.appendingPathComponent(prefix), withIntermediateDirectories: true)
+        let capturePath = prefix + "capture.json"
+        try MANTAJSON.canonicalData(capture).write(to: root.appendingPathComponent(capturePath), options: .atomic)
+        sources.append(.init(path: capturePath, sourceURL: root.appendingPathComponent(capturePath), mediaType: "application/json", role: "capture-metadata"))
+        let layoutPath = session.layout.hasElectrodeNet ? prefix + "layout.json" : nil
+        if let layoutPath {
+            try MANTAJSON.canonicalData(session.layout).write(to: root.appendingPathComponent(layoutPath), options: .atomic)
+            sources.append(.init(path: layoutPath, sourceURL: root.appendingPathComponent(layoutPath), mediaType: "application/json", role: "layout-definition"))
+        }
+        sources.sort { $0.path < $1.path }
+        let sizes = try sources.map { Int64(try $0.sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) }
+        let total = sizes.reduce(0.0) { $0 + max(1, Double($1)) }
+        var completed = 0.0
+        var lastUpdate = ProcessInfo.processInfo.systemUptime
+        var entries: [MANTAFileEntry] = []
+        for (index, source) in sources.enumerated() {
+            let detail = "\(index + 1)/\(sources.count) · \(source.path)"
+            progress?(.init(fraction: completed / max(1, total), stage: "Indexing original files in place", detail: detail))
+            var read = 0.0
+            let checksum = try sha256(of: source.sourceURL) { count in
+                read += Double(count)
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - lastUpdate >= 0.1 {
+                    lastUpdate = now
+                    progress?(.init(fraction: min(0.999, (completed + read) / max(1, total)), stage: "Indexing original files in place", detail: detail))
+                }
+            }
+            completed += max(1, Double(sizes[index]))
+            entries.append(.init(path: source.path, mediaType: source.mediaType, role: source.role, size: sizes[index], sha256: checksum))
+        }
+        let manifest = MANTABundleManifest(schema: MANTABundleFormat.manifestSchema,
+            bundleID: UUID(), sessionID: session.id, createdAt: session.createdAt, finalizedAt: Date(),
+            producer: producer, content: .init(capture: capturePath, layout: layoutPath), files: entries)
+        try MANTAJSON.canonicalData(manifest).write(to: manifestURL, options: .atomic)
+        // Files were streamed once above; don't perform a second hashing pass.
+        let result = try MANTABundleValidator(fileManager: fileManager).validate(directory: root,
+            verifyIntegrity: false, manifestPath: prefix + "manifest.json")
+        progress?(.init(fraction: 1, stage: "Capture ready"))
+        return result
     }
 
     private func makeCaptureDocument(_ session: ScanSession) -> MANTACaptureDocument {
@@ -257,6 +350,10 @@ public struct MANTARawSessionRecovery {
     ) throws -> [MANTABundleFileSource] {
         var items = [String: (mediaType: String, role: String)]()
         for observation in session.captureObservations {
+            let evidencePath = "acquisition/live-labels/\(observation.id.uuidString).json"
+            if fileManager.fileExists(atPath: directory.appendingPathComponent(evidencePath).path) {
+                items[evidencePath] = ("application/json", "live-label-evidence")
+            }
             if let path = observation.cameraSnapshotFilename {
                 items[path] = (imageMediaType(for: path), "camera-image")
             }
@@ -335,12 +432,13 @@ public struct MANTARawSessionRecovery {
         }
     }
 
-    private func sha256(of url: URL) throws -> String {
+    private func sha256(of url: URL, didRead: ((Int) -> Void)? = nil) throws -> String {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
         var hasher = SHA256()
         while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
             hasher.update(data: chunk)
+            didRead?(chunk.count)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }

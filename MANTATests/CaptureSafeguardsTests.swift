@@ -1,10 +1,19 @@
 import Foundation
 import MANTACore
 import Testing
+import UIKit
 @testable import MANTA
 
 @MainActor
 struct CaptureSafeguardsIntegrationTests {
+    @Test func interfaceOrientationUsesRearCameraSensorCoordinates() {
+        #expect(ARScanViewModel.imageOrientation(for: .landscapeRight) == "up")
+        #expect(ARScanViewModel.imageOrientation(for: .landscapeLeft) == "down")
+        #expect(ARScanViewModel.imageOrientation(for: .portrait) == "right")
+        #expect(ARScanViewModel.imageOrientation(for: .portraitUpsideDown) == "left")
+        #expect(ARScanViewModel.imageOrientation(for: nil) == "up")
+    }
+
     @Test func storageWarningPausesAtReserveAndNeverAutoResumes() {
         let scan = ARScanViewModel()
         var states: [String] = []
@@ -27,9 +36,16 @@ struct CaptureSafeguardsIntegrationTests {
         #expect(!scan.status.isRunning)
     }
 
-    @Test func presetChangesRequireANewSessionAfterEvidenceIsSaved() {
-        let model = ScanSessionViewModel()
+    @Test func presetChangesRequireANewSessionAfterEvidenceIsSaved() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("capture-presets-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = ScanSessionViewModel(
+            artifactStore: try CaptureArtifactStore(rootDirectory: root),
+            sessionDefaults: UserDefaults(suiteName: "capture-presets-\(UUID())")!)
+        #expect(model.scanViewModel.highResolutionStills)
+        #expect(!model.scanViewModel.automaticHighResolutionStills)
         model.applyCapturePreset(.validation)
+        #expect(model.scanViewModel.automaticHighResolutionStills)
         #expect(model.session.captureMode == .both)
         #expect(model.scanViewModel.highResolutionStills)
         #expect(model.scanViewModel.selectBestFrames)
@@ -46,6 +62,7 @@ struct CaptureSafeguardsIntegrationTests {
         model.scanViewModel.resetForNewCapture()
         model.applyCapturePreset(.baseline)
         #expect(!model.scanViewModel.highResolutionStills)
+        #expect(!model.scanViewModel.automaticHighResolutionStills)
         #expect(!model.scanViewModel.selectBestFrames)
         #expect(!model.scanViewModel.preserveComparisonFrames)
     }

@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import ImageIO
+import MANTACore
 
 struct ReceiverOrientedFrameImage {
     var image: NSImage
@@ -34,6 +35,25 @@ nonisolated enum ReceiverStoredImageOrientation: String, Sendable {
 
     init(_ manifestValue: String) {
         self = Self(rawValue: manifestValue.lowercased()) ?? .up
+    }
+
+    /// Repair legacy reversed landscape tags only when the saved gravity-aligned
+    /// camera pose provides clear contrary evidence. Keep raw pixels, intrinsics,
+    /// depth maps, and stored metadata unchanged. Near-overhead or non-ARKit views
+    /// retain the declared orientation rather than guessing from weak evidence.
+    static func displayOrientation(for observation: MANTACaptureObservation) -> Self {
+        let declared = Self(observation.imageOrientation)
+        guard declared == .up || declared == .down,
+              observation.worldCoordinateSystem == "arkit-world",
+              observation.imageOrigin == "top-left" else { return declared }
+        // Segment registration changes camera poses; original acquisition pose
+        // still describes how gravity projected into the original image pixels.
+        let pose = observation.quality?.motionCorrection?.originalCameraToWorld
+            ?? observation.cameraToWorld
+        guard pose.count == 16, pose.allSatisfy(\.isFinite),
+              let gravity = CameraGravity.inCameraSpace(cameraToWorld: pose),
+              abs(gravity.y) >= 0.5, abs(gravity.y) > abs(gravity.x) else { return declared }
+        return gravity.y < 0 ? .up : .down
     }
 
     var coreImageOrientation: CGImagePropertyOrientation {

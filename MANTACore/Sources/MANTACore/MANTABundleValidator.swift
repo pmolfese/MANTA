@@ -77,16 +77,38 @@ public struct MANTABundleValidator {
         self.fileManager = fileManager
     }
 
-    public func validate(directory rootDirectory: URL) throws -> MANTAValidatedBundle {
-        try validate(directory: rootDirectory, verifyIntegrity: true)
+    public func validate(directory rootDirectory: URL,
+                         progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: true, progress: progress)
+    }
+
+    /// A working-session index validates referenced acquisition files in their
+    /// original root; native checkpoints and diagnostics may also be present.
+    public func validateWorkingIndex(directory rootDirectory: URL, verifyIntegrity: Bool = true,
+                                    progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: verifyIntegrity,
+            manifestPath: "derivatives/acquisition/manifest.json", progress: progress)
+    }
+
+    public func validateProcessingIndex(directory rootDirectory: URL,
+        verifyIntegrity: Bool = true, progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: verifyIntegrity,
+            manifestPath: "derivatives/receiver/manifest.json", progress: progress)
     }
 
     // Finalization already streams every byte to compute hashes; avoid a second pass.
-    func validate(directory rootDirectory: URL, verifyIntegrity: Bool) throws -> MANTAValidatedBundle {
+    func validate(directory rootDirectory: URL, verifyIntegrity: Bool,
+                  manifestPath: String = MANTABundleFormat.manifestFilename,
+                  progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
         let root = rootDirectory.standardizedFileURL
-        let manifestURL = root.appendingPathComponent(MANTABundleFormat.manifestFilename)
+        progress?(.init(stage: "Reading capture metadata"))
+        let manifestURL = root.appendingPathComponent(manifestPath)
         guard fileManager.fileExists(atPath: manifestURL.path) else {
             throw MANTABundleValidationError.manifestMissing
+        }
+        guard manifestURL.resolvingSymlinksInPath().path.hasPrefix(root.resolvingSymlinksInPath().path + "/"),
+              try manifestURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+            throw MANTABundleValidationError.invalidPath(manifestPath)
         }
 
         let manifest: MANTABundleManifest = try decode(manifestURL, displayPath: MANTABundleFormat.manifestFilename)
@@ -97,7 +119,10 @@ public struct MANTABundleValidator {
 
         let declaredPaths = try validateFiles(manifest.files, in: root)
         try validateContentReferences(manifest.content, declaredPaths: declaredPaths)
-        try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
+        progress?(.init(stage: "Checking file references"))
+        if manifestPath == MANTABundleFormat.manifestFilename {
+            try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
+        }
 
         let captureURL = root.appendingPathComponent(manifest.content.capture)
         let capture: MANTACaptureDocument = try decode(captureURL, displayPath: manifest.content.capture)
@@ -115,7 +140,7 @@ public struct MANTABundleValidator {
             capture: capture,
             changeLog: changeLog,
             integrityWarnings: verifyIntegrity
-                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files) : []
+                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files, progress: progress) : []
         )
     }
 
@@ -156,6 +181,9 @@ public struct MANTABundleValidator {
             }
 
             let url = root.appendingPathComponent(entry.path)
+            guard url.resolvingSymlinksInPath().path.hasPrefix(root.resolvingSymlinksInPath().path + "/") else {
+                throw MANTABundleValidationError.invalidPath(entry.path)
+            }
             guard fileManager.fileExists(atPath: url.path) else {
                 throw MANTABundleValidationError.missingFile(entry.path)
             }
@@ -226,6 +254,18 @@ public struct MANTABundleValidator {
         }
 
         for observation in capture.observations {
+            if let correction = observation.quality?.motionCorrection {
+                guard correction.isValid,
+                      let transform = SegmentRegistration.matrix(correction.referenceFromSource),
+                      let original = SegmentRegistration.matrix(correction.originalCameraToWorld.map(Float.init)) else {
+                    throw MANTABundleValidationError.invalidCapture("Invalid segment correction provenance")
+                }
+                let expected = SegmentRegistration.flatten(SegmentRegistration.camera(original, referenceFromSource: transform))
+                guard observation.cameraToWorld.count == 16,
+                      zip(expected, observation.cameraToWorld).allSatisfy({ abs(Double($0) - $1) < 0.0001 }) else {
+                    throw MANTABundleValidationError.invalidCapture("Corrected camera does not match its original pose and segment transform")
+                }
+            }
             guard observation.imageDimensions.width > 0, observation.imageDimensions.height > 0 else {
                 throw MANTABundleValidationError.invalidCapture("image dimensions must be positive")
             }
@@ -341,6 +381,10 @@ public struct MANTABundleValidator {
             let relative = String(filePath.dropFirst(rootPath.count + 1))
             if values.isSymbolicLink == true {
                 throw MANTABundleValidationError.nonRegularFile(relative)
+            }
+            if relative == "derivatives", values.isRegularFile != true {
+                enumerator.skipDescendants()
+                continue
             }
             if values.isRegularFile == true, !allowed.contains(relative) {
                 throw MANTABundleValidationError.undeclaredFile(relative)

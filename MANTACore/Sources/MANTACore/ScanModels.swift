@@ -158,6 +158,7 @@ public struct FiducialPlacementEvidence: Identifiable, Codable, Equatable, Hasha
 /// technical capture can begin immediately and be annotated as details become
 /// available without inventing placeholder values.
 public struct AcquisitionContext: Codable, Equatable, Hashable, Sendable {
+    public var captureReview: CaptureReviewRecord?
     public var site: String?
     public var operatorID: String?
     public var netModel: String?
@@ -319,6 +320,9 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
     public var name: String
     public var createdAt: Date
     public var subjectLabel: String?
+    /// Explicit acquisition completion; nil for active and legacy sessions.
+    public var endedAt: Date?
+    public var captureRoute: CaptureRouteProgress?
     public var captureMode: CaptureMode
     public var layout: ElectrodeLayout
     public var fiducials: [FiducialAnnotation]
@@ -354,12 +358,14 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
         headBoundingBox: HeadBoundingBox? = nil,
         lastRawExportedBundleID: UUID? = nil,
         acquisitionContext: AcquisitionContext? = nil,
-        fiducialPlacementEvidence: [FiducialPlacementEvidence]? = nil
+        fiducialPlacementEvidence: [FiducialPlacementEvidence]? = nil,
+        endedAt: Date? = nil
     ) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
         self.subjectLabel = subjectLabel
+        self.endedAt = endedAt
         self.captureMode = captureMode
         self.layout = layout
         self.fiducials = fiducials
