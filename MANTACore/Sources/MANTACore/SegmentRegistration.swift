@@ -14,7 +14,8 @@ public struct SegmentRegistrationResult: Codable, Sendable {
 }
 
 /// Conservative, metric rigid alignment. No estimated scale, identity fallback,
-/// global unseeded search, or assumption that a small residual proves accuracy.
+/// assumption that a small residual proves accuracy. The automatic extension
+/// supplies a separate bounded multistart initialization.
 public enum SegmentRegistration {
     public static let correspondenceMeters: Float = 0.015
     public static let maximumRMSMeters: Float = 0.008
@@ -57,11 +58,11 @@ public enum SegmentRegistration {
         return result
     }
 
-    private static func evaluate(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>], _ landmarks: [SIMD3<Float>],
+    static func evaluate(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>], _ landmarks: [SIMD3<Float>],
                                  _ referenceLandmarks: [SIMD3<Float>], _ transform: simd_float4x4) -> SegmentRegistrationResult {
         let moved = a.map { point($0, transform) }
         let forward = metrics(moved, b), reverse = metrics(b, moved)
-        let landmarkRMS = sqrt(zip(landmarks, referenceLandmarks).map { simd_distance_squared(point($0.0, transform), $0.1) }.reduce(0, +) / Float(landmarks.count))
+        let landmarkRMS: Float? = landmarks.isEmpty ? nil : sqrt(zip(landmarks, referenceLandmarks).map { simd_distance_squared(point($0.0, transform), $0.1) }.reduce(0, +) / Float(landmarks.count))
         let accepted = forward.overlap >= minimumOverlap && reverse.overlap >= minimumOverlap
             && forward.rms <= maximumRMSMeters && reverse.rms <= maximumRMSMeters
         return .init(accepted: accepted, reason: accepted ? "Provisional geometric gates passed; independent accuracy validation remains required." : "Insufficient bidirectional overlap or excessive depth residual.",
@@ -102,19 +103,19 @@ public enum SegmentRegistration {
     private static func sample(_ points: [SIMD3<Float>]) -> [SIMD3<Float>] {
         stride(from: 0, to: points.count, by: max(1, (points.count + 511) / 512)).map { points[$0] }
     }
-    private static func noncollinear(_ p: [SIMD3<Float>]) -> Bool {
+    public static func noncollinear(_ p: [SIMD3<Float>]) -> Bool {
         guard p.count >= 3 else { return false }
         return (1..<p.count).contains { i in ((i+1)..<p.count).contains { j in
             simd_length(simd_cross(p[i] - p[0], p[j] - p[0])) > 0.001
         } }
     }
-    private static func spatiallyDistributed(_ p: [SIMD3<Float>]) -> Bool {
+    static func spatiallyDistributed(_ p: [SIMD3<Float>]) -> Bool {
         let center = p.reduce(SIMD3<Float>.zero, +) / Float(p.count)
         var covariance = simd_float3x3(0)
         for v in p { let d = v - center; for i in 0..<3 { for j in 0..<3 { covariance[i][j] += d[i] * d[j] / Float(p.count) } } }
         return simd_determinant(covariance) > 1e-12
     }
-    private static func metrics(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>]) -> (overlap: Float, rms: Float) {
+    static func metrics(_ a: [SIMD3<Float>], _ b: [SIMD3<Float>]) -> (overlap: Float, rms: Float) {
         let distances = a.map { p in b.reduce(Float.infinity) { min($0, simd_distance_squared(p, $1)) } }
         let inliers = distances.filter { $0 <= correspondenceMeters * correspondenceMeters }
         return (Float(inliers.count) / Float(max(1, a.count)),

@@ -33,6 +33,7 @@ struct ReconstructionSampleDescriptor: Sendable {
     var depthHeight: Int
     var depthCompression: String
     var cameraToWorld: [Double]
+    var includeGravity: Bool = true
 }
 
 enum PhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
@@ -82,6 +83,7 @@ struct ReconstructionPreparation: Sendable {
     var imageCount: Int
     var sourceImageBytes: Int64
     var inputMode: PhotogrammetryInputMode = .imagesOnly
+    var independentPasses: Bool = false
     var sampleDescriptors: [ReconstructionSampleDescriptor] = []
 }
 
@@ -172,7 +174,14 @@ final class PhotogrammetryRunner {
             throw ReconstructionError.unsupported
         }
         var configuration = PhotogrammetrySession.Configuration()
-        configuration.sampleOrdering = .sequential
+        configuration.sampleOrdering = preparation.inputMode.usesDepth && !preparation.independentPasses ? .sequential : .unordered
+        configuration.isObjectMaskingEnabled = !preparation.inputMode.usesDepth || preparation.independentPasses
+        if !preparation.inputMode.usesDepth {
+            log(.info, "Foreground-masked RGB solve: camera poses are estimated from images across all saved passes. AR poses and depth are not supplied.")
+        }
+        if preparation.inputMode.usesDepth && preparation.independentPasses {
+            log(.info, "Masked depth-guided solve across passes: per-frame depth assists scale; AR poses and gravity are omitted. Inspect geometry and alignment before metric use.")
+        }
         configuration.featureSensitivity = .high
         let active: PhotogrammetrySession
         if preparation.inputMode.usesDepth, !preparation.sampleDescriptors.isEmpty {
@@ -293,7 +302,9 @@ enum ReconstructionWorkflow {
         detail: PhotogrammetryDetail,
         inputMode: PhotogrammetryInputMode = .imagesOnly
     ) throws -> ReconstructionPreparation {
-        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality))
+        let independentPasses = CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality))
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality),
+            maskedIndependentSamples: !inputMode.usesDepth || independentPasses)
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReconstructionError.noImages }
         if let available = estimate.availableBytes, !estimate.hasEnoughSpace {
@@ -370,7 +381,8 @@ enum ReconstructionWorkflow {
                     depthWidth: depthWidth,
                     depthHeight: depthHeight,
                     depthCompression: depthCompression,
-                    cameraToWorld: item.observation.cameraToWorld))
+                    cameraToWorld: item.observation.cameraToWorld,
+                    includeGravity: !independentPasses))
             }
             let posesURL = workspace.appendingPathComponent("macos-poses.json")
             let encoder = MANTAJSON.makeEncoder()
@@ -392,6 +404,7 @@ enum ReconstructionWorkflow {
                 imageCount: poses.count,
                 sourceImageBytes: estimate.sourceImageBytes,
                 inputMode: resolvedMode,
+                independentPasses: independentPasses,
                 sampleDescriptors: resolvedMode.usesDepth ? sampleDescriptors : [])
         } catch {
             try? fileManager.removeItem(at: workspace)
@@ -507,6 +520,8 @@ enum ReconstructionWorkflow {
     private static func alignmentTarget(
         bundle: MANTAValidatedBundle, maxPoints: Int
     ) -> [SIMD3<Float>] {
+        // A multi-pass RGB model has no shared AR world until reviewed alignment.
+        guard !CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality)) else { return [] }
         guard let reconstruction = bundle.capture.reconstruction,
               let path = reconstruction.headCroppedLidarMeshPath
                 ?? reconstruction.lidarMeshPath else { return [] }

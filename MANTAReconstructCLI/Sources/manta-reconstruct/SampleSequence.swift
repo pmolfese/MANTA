@@ -12,7 +12,7 @@ import simd
 //
 /// A lazily evaluated sequence of `PhotogrammetrySample`s for depth-guided
 /// Object Capture. Each element carries the frame's RGB image, its LiDAR depth
-/// map (when available), and a gravity vector derived from the stored camera
+/// map (when available), and, for a stationary pass, gravity from the camera
 /// pose. Samples are built on demand so peak memory stays bounded to the frames
 /// Object Capture is actively reading rather than the whole capture at once.
 ///
@@ -46,8 +46,9 @@ struct PhotogrammetrySampleSequence: Sequence {
                     .loadDepthBuffer(descriptor)
                 // `PhotogrammetrySample.gravity` is a CMAcceleration (gravity
                 // direction, ~1 g magnitude); our unit world-down-in-camera maps
-                // to it directly.
-                if let gravity = CameraGravity.inCameraSpace(
+                // to it directly. Across moved-head passes it is intentionally omitted:
+                // camera gravity would constrain the head to an inconsistent orientation.
+                if descriptor.includeGravity, let gravity = CameraGravity.inCameraSpace(
                     cameraToWorld: descriptor.cameraToWorld) {
                     sample.gravity = CMAcceleration(
                         x: Double(gravity.x), y: Double(gravity.y), z: Double(gravity.z))

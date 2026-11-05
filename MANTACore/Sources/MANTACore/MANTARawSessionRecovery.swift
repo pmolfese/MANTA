@@ -342,13 +342,19 @@ public struct MANTARawSessionRecovery {
                     state: fiducial.state.rawValue)
             },
             electrodes: nil,
-            reconstruction: reconstruction)
+            reconstruction: reconstruction,
+            capturePasses: session.capturePasses)
     }
 
     private func bundleFileSources(
         _ session: ScanSession, in directory: URL
     ) throws -> [MANTABundleFileSource] {
         var items = [String: (mediaType: String, role: String)]()
+        for pass in session.capturePasses ?? [] {
+            for path in pass.artifactPaths {
+                items[path] = (path.hasSuffix(".json") ? "application/json" : "application/octet-stream", "capture-pass-evidence")
+            }
+        }
         for observation in session.captureObservations {
             let evidencePath = "acquisition/live-labels/\(observation.id.uuidString).json"
             if fileManager.fileExists(atPath: directory.appendingPathComponent(evidencePath).path) {

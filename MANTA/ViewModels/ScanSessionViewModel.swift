@@ -34,6 +34,7 @@ final class ScanSessionViewModel: ObservableObject {
     @Published private(set) var needsSessionName = true
     @Published var captureSaveError: String?
     @Published private(set) var isEndingSession = false
+    @Published private(set) var isStartingPass = false
     @Published var sessionEndSummary: String?
     var isSessionEnded: Bool { session.endedAt != nil }
     var canEndSession: Bool {
@@ -99,23 +100,58 @@ final class ScanSessionViewModel: ObservableObject {
         if !persistSession() { session.captureRoute = previous }
     }
     func startNewStationaryPass() async {
-        guard canNavigateCaptureRoute, scanViewModel.motionStopped else { return }
-        let previousID = session.id
-        let label = session.subjectLabel ?? session.displayName
-        let mode = session.captureMode
-        if !isSessionEnded { await endSession() }
-        guard session.id == previousID, isSessionEnded else { return }
-        guard startNewSession(subjectLabel: label) else { return }
-        session.captureMode = mode
-        var route = CaptureRouteProgress()
-        route.previousSessionID = previousID
-        route.select(.reference, acknowledgingCurrent: true)
-        session.captureRoute = route
+        guard canNavigateCaptureRoute, !isSessionEnded, scanViewModel.motionStopped,
+              let artifactStore else { return }
+        isStartingPass = true
+        defer { isStartingPass = false }
+        isEndingSession = true // Exclude switching while writes and pass metadata drain.
+        await finishCaptureWrites()
+        guard captureSaveError == nil, saveCaptureCheckpoint() else { isEndingSession = false; return }
+        let previous = session
+        let segmentID = scanViewModel.motionSegmentID
+        do {
+            _ = try artifactStore.writeCaptureReceipt(for: session)
+            let archive = try CapturePassArchive.save(session: session, segmentID: segmentID,
+                in: artifactStore.sessionDirectory(for: session))
+            var passes = session.capturePasses ?? []
+            passes.removeAll { $0.segmentID == segmentID }
+            passes.append(archive)
+            session.capturePasses = passes
+            // Keep every frame and the session identity; only the new world's
+            // geometry and landmarks must start fresh.
+            session.lidarMeshFilename = nil
+            session.headCroppedLidarMeshFilename = nil
+            session.headBoundingBox = nil
+            session.photogrammetryModelFilename = nil
+            session.worldAlignmentTransform = nil
+            session.fiducials = FiducialKind.cardinal.map { FiducialAnnotation(kind: $0, coordinate: nil, state: .needsReview) }
+            session.modelFiducials = session.fiducials
+            session.electrodes = []
+            session.acquisitionContext?.captureReview = nil
+            session.lastRawExportedBundleID = nil
+            session.lastExportedBundleID = nil
+            var route = CaptureRouteProgress()
+            route.select(.reference, acknowledgingCurrent: true)
+            session.captureRoute = route
+            guard persistSession() else { session = previous; isEndingSession = false; return }
+        } catch {
+            session = previous
+            captureSaveError = "Could not save the previous pass: \(error.localizedDescription)"
+            isEndingSession = false
+            return
+        }
+        scanViewModel.resetForNewCapture()
+        restoreCaptureView()
+        cachedMeshSnapshot = nil
+        resetLiveDetection()
+        resetLiveMetricDepthFusion()
+        routeInspectionStep = nil
         captureVisualMode = .split
         sessionEndSummary = nil
-        guard persistSession() else { return }
-        recordAcquisitionEvent(.init(kind: "capture-pass-started", message: "New stationary pass after movement; prior evidence retained.",
-            details: ["previousSessionID": previousID.uuidString]))
+        isEndingSession = false
+        refreshSessions()
+        recordAcquisitionEvent(.init(kind: "capture-pass-started", message: "New pass in the same session; previous frames and geometry retained.",
+            details: ["previousSegmentID": segmentID.uuidString, "segmentID": scanViewModel.motionSegmentID.uuidString]))
         startLiveScan()
     }
 
@@ -514,12 +550,13 @@ final class ScanSessionViewModel: ObservableObject {
         session.acquisitionContext?.captureReview = nil
         if let artifactStore {
             do {
-                let directory = artifactStore.acquisitionDirectory(for: session)
+                let directory = artifactStore.acquisitionDirectory(for: session).appendingPathComponent("motion-stops")
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try JSONEncoder().encode(Date()).write(to: directory.appendingPathComponent("motion-stop.json"), options: .atomic)
+                try JSONEncoder().encode(Date()).write(to: directory.appendingPathComponent("\(scanViewModel.motionSegmentID.uuidString).json"), options: .atomic)
             } catch { captureSaveError = "Could not persist movement flag: \(error.localizedDescription)" }
         }
-        for index in session.captureObservations.indices {
+        let stoppedSegmentID = scanViewModel.motionSegmentID
+        for index in session.captureObservations.indices where session.captureObservations[index].quality?.motionAssessment?.segmentID == stoppedSegmentID {
             session.captureObservations[index].quality?.motionAssessment?.state = .suspected
         }
         _ = persistSession()
@@ -537,7 +574,7 @@ final class ScanSessionViewModel: ObservableObject {
             await finishCaptureWrites()
             guard session.id == markedSessionID else { return }
             for index in session.captureObservations.indices {
-                if var motion = session.captureObservations[index].quality?.motionAssessment {
+                if var motion = session.captureObservations[index].quality?.motionAssessment, motion.segmentID == stoppedSegmentID {
                     motion.state = .suspected
                     session.captureObservations[index].quality?.motionAssessment = motion
                 }
@@ -1445,7 +1482,7 @@ final class ScanSessionViewModel: ObservableObject {
         if review.blurWarningCount > 0 { issues.append("blur warnings on \(review.blurWarningCount) frames") }
         if review.unknownSharpnessCount > 0 { issues.append("sharpness unknown on \(review.unknownSharpnessCount) frames") }
         if review.motionUnknownCount > 0 { issues.append("motion unknown/insufficient on \(review.motionUnknownCount) frames") }
-        if scanViewModel.motionStopped || review.motionSuspectCount > 0 { issues.append("movement flagged; preserve this pass and start a new session") }
+        if scanViewModel.motionStopped || review.motionSuspectCount > 0 { issues.append("movement flagged; save this pass and continue in the same session") }
         if session.layout.hasElectrodeNet, !session.fiducialsReady { issues.append("fiducials are incomplete") }
         issues.append(contentsOf: fiducialPlausibilityWarnings)
         return issues

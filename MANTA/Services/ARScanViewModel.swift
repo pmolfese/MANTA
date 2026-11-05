@@ -85,7 +85,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     @Published private(set) var motionMessage = "Motion check not armed. Set the head region and freeze a stable reference."
     @Published private(set) var motionStopped = false
-    private var motionSegmentID = UUID()
+    private(set) var motionSegmentID = UUID()
     private var motionReference: [SIMD3<Float>] = []
     private var motionBounds: HeadBoundingBox?
 
@@ -119,7 +119,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
         motionStopped = true
         worldInvalidated = true
         pause()
-        motionMessage = "Movement flagged. Evidence retained; start a new session/pass after the subject settles."
+        motionMessage = "Movement flagged. Evidence retained; continue with a new pass in this session after the subject settles."
         captureSafetyMessage = motionMessage
         eventHandler?(AcquisitionEvent(kind: "subject-movement", message: motionMessage,
             details: ["segmentID": motionSegmentID.uuidString]))

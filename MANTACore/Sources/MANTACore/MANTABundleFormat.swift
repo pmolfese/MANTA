@@ -242,6 +242,7 @@ public struct MANTAFileEntry: Codable, Equatable, Sendable {
 public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     public var schema: String
     public var schemaVersion: String
+    public var capturePasses: [CapturePassArchive]?
     public var sessionID: UUID
     public var captureMode: String
     public var layoutID: String
@@ -267,8 +268,10 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         observations: [MANTACaptureObservation],
         fiducials: [MANTAFiducialSolution]? = nil,
         electrodes: [MANTAElectrodeSolution]? = nil,
-        reconstruction: MANTAReconstructionReference? = nil
+        reconstruction: MANTAReconstructionReference? = nil,
+        capturePasses: [CapturePassArchive]? = nil
     ) {
+        self.capturePasses = capturePasses
         self.schema = schema
         self.schemaVersion = schemaVersion
         self.sessionID = sessionID
@@ -284,7 +287,7 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case schemaVersion, sessionID, captureMode, layoutID, coordinateSystems, observations
-        case fiducials, electrodes, reconstruction
+        case fiducials, electrodes, reconstruction, capturePasses
     }
 }
 

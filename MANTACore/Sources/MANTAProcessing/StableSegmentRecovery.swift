@@ -24,9 +24,11 @@ public struct StableSegmentRecoveryRequest: Codable, Sendable {
             self.reviewedStable = reviewedStable; self.headBounds = headBounds; self.landmarks = landmarks
         }
     }
+    public var automaticAlignment: Bool?
     public var acquisitionGroupID: String
     public var segments: [Segment]
-    public init(acquisitionGroupID: String, segments: [Segment]) {
+    public init(acquisitionGroupID: String, segments: [Segment], automaticAlignment: Bool = false) {
+        self.automaticAlignment = automaticAlignment ? true : nil
         self.acquisitionGroupID = acquisitionGroupID; self.segments = segments
     }
 }
@@ -41,6 +43,8 @@ public struct StableSegmentRecoveryReport: Codable, Sendable {
         public var registration: SegmentRegistrationResult
         public var rejectedFrameIDs: [UUID]
         public var integrityWarnings: [String]
+        public var previewPoints: [[Float]]?
+        public var selectedPayloadSHA256: String?
     }
     public var runID: UUID
     public var createdAt: Date
@@ -49,6 +53,7 @@ public struct StableSegmentRecoveryReport: Codable, Sendable {
     public var referenceSegmentID: UUID
     public var entries: [Entry]
     public var note: String
+    public var requestSHA256: String?
 }
 
 public enum StableSegmentRecovery {
@@ -60,13 +65,33 @@ public enum StableSegmentRecovery {
         var frames: [UUID: [SIMD3<Float>]]
         var landmarks: [SIMD3<Float>]
     }
+    private static func payloadHash(_ segment: Loaded) throws -> String {
+        var paths = Set<String>()
+        for observation in segment.observations {
+            for path in [observation.imagePath, observation.losslessImagePath, observation.compressedImagePath,
+                         observation.depth?.path, observation.depth?.confidencePath].compactMap({ $0 }) { paths.insert(path) }
+        }
+        var digest = SHA256()
+        for path in paths.sorted() {
+            digest.update(data: Data(path.utf8))
+            digest.update(data: Data(try hash(segment.bundle.rootDirectory.appendingPathComponent(path)).utf8))
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func manifestURL(for root: URL) -> URL {
+        let standard = root.appendingPathComponent("manifest.json")
+        return FileManager.default.fileExists(atPath: standard.path) ? standard
+            : root.appendingPathComponent("derivatives/acquisition/manifest.json")
+    }
+
     private static func failure(_ message: String) -> NSError {
         NSError(domain: "MANTA.SegmentRecovery", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     /// Reference segment is first. Inputs are directory packages; output must not
     /// exist and must be outside every original package. Report-only is the default.
-    public static func run(_ request: StableSegmentRecoveryRequest, output: URL, emitDerived: Bool = false) throws -> StableSegmentRecoveryReport {
+    public static func run(_ request: StableSegmentRecoveryRequest, output: URL, emitDerived: Bool = false, approvedPreview: StableSegmentRecoveryReport? = nil) throws -> StableSegmentRecoveryReport {
         guard (2...8).contains(request.segments.count), !request.acquisitionGroupID.isEmpty,
               Set(request.segments.map(\.segmentID)).count == request.segments.count else {
             throw failure("Provide 2–8 uniquely identified segments of the same person/net, with an acquisitionGroupID.")
@@ -79,8 +104,9 @@ public enum StableSegmentRecovery {
             }
         }
         guard !FileManager.default.fileExists(atPath: destination.path) else { throw failure("Output already exists; no files were overwritten.") }
-        let names = request.segments[0].landmarks.map(\.name)
-        guard names.count >= 3, names.count <= 32, Set(names).count == names.count, names.allSatisfy({ !$0.isEmpty }) else {
+        let automatic = request.automaticAlignment == true
+        let names = automatic ? [] : request.segments[0].landmarks.map(\.name)
+        guard automatic || (names.count >= 3 && names.count <= 32 && Set(names).count == names.count && names.allSatisfy({ !$0.isEmpty })) else {
             throw failure("Provide at least three uniquely named, matched, noncollinear head landmarks.")
         }
         let loaded = try request.segments.map { try load($0, landmarkNames: names) }
@@ -92,8 +118,21 @@ public enum StableSegmentRecovery {
         var entries: [StableSegmentRecoveryReport.Entry] = []
         var transforms: [simd_float4x4] = []
         for segment in loaded {
-            let registration = SegmentRegistration.solve(source: segment.points, reference: reference.points,
-                sourceLandmarks: segment.landmarks, referenceLandmarks: reference.landmarks)
+            let registration: SegmentRegistrationResult
+            if automatic {
+                // Every third depth frame is withheld from fitting. All frames, including
+                // the withheld ones, must pass the agreement checks below.
+                func fittingPoints(_ value: Loaded) -> [SIMD3<Float>] {
+                    value.observations.filter { value.frames[$0.id] != nil }.enumerated()
+                        .filter { $0.offset % 3 != 2 }.flatMap { value.frames[$0.element.id] ?? [] }
+                }
+                registration = segment.spec.segmentID == reference.spec.segmentID
+                    ? SegmentRegistration.referenceIdentity(points: reference.points)
+                    : SegmentRegistration.solveAutomatic(source: fittingPoints(segment), reference: fittingPoints(reference))
+            } else {
+                registration = SegmentRegistration.solve(source: segment.points, reference: reference.points,
+                    sourceLandmarks: segment.landmarks, referenceLandmarks: reference.landmarks)
+            }
             let transform = registration.referenceFromSource.flatMap(SegmentRegistration.matrix)
             let rejected = segment.frames.filter { frameID, points in
                 guard let transform else { return true }
@@ -105,14 +144,32 @@ public enum StableSegmentRecovery {
             transforms.append(transform ?? matrix_identity_float4x4) // Never used unless all gates pass.
             entries.append(.init(segmentID: segment.spec.segmentID, bundleID: segment.bundle.manifest.bundleID,
                 captureSHA256: try hash(segment.bundle.rootDirectory.appendingPathComponent(segment.bundle.manifest.content.capture)),
-                manifestSHA256: try hash(segment.bundle.rootDirectory.appendingPathComponent("manifest.json")),
+                manifestSHA256: try hash(manifestURL(for: segment.bundle.rootDirectory)),
                 observationIDs: segment.observations.map(\.id), registration: registration, rejectedFrameIDs: rejected,
-                integrityWarnings: segment.bundle.integrityWarnings.map(\.message)))
+                integrityWarnings: segment.bundle.integrityWarnings.map(\.message),
+                previewPoints: segment.points.map { [$0.x, $0.y, $0.z] },
+                selectedPayloadSHA256: try payloadHash(segment)))
         }
-        let report = StableSegmentRecoveryReport(runID: UUID(), createdAt: Date(), acquisitionGroupID: request.acquisitionGroupID,
+        var report = StableSegmentRecoveryReport(runID: UUID(), createdAt: Date(), acquisitionGroupID: request.acquisitionGroupID,
             accepted: entries.allSatisfy { $0.registration.accepted && $0.rejectedFrameIDs.isEmpty },
             referenceSegmentID: reference.spec.segmentID, entries: entries,
             note: "Experimental rigid recovery of explicitly reviewed stable intervals. Reference head coordinates equal the first segment's ARKit world in meters. Residuals share input depth and are not independent accuracy measurements. No scale fitting, deformation correction, or automatic interval selection.")
+        if automatic { report.note += " Automatic geometry-only multistart registration; every third depth frame withheld from fitting. Ambiguity checks are heuristic, not calibrated confidence." }
+        report.requestSHA256 = SHA256.hash(data: try MANTAJSON.canonicalData(request)).map { String(format: "%02x", $0) }.joined()
+        if let approvedPreview {
+            guard emitDerived, approvedPreview.accepted, report.accepted,
+                  approvedPreview.requestSHA256 == report.requestSHA256,
+                  approvedPreview.entries.count == report.entries.count,
+                  zip(approvedPreview.entries, report.entries).allSatisfy({ old, new in
+                      old.segmentID == new.segmentID && old.bundleID == new.bundleID
+                        && old.captureSHA256 == new.captureSHA256 && old.manifestSHA256 == new.manifestSHA256
+                        && old.selectedPayloadSHA256 == new.selectedPayloadSHA256
+                        && old.observationIDs == new.observationIDs && old.rejectedFrameIDs == new.rejectedFrameIDs
+                        && old.registration.referenceFromSource == new.registration.referenceFromSource
+                  }) else { throw failure("The source or correction changed since preview. Run and review a new preview before saving.") }
+            report.runID = approvedPreview.runID
+            report.createdAt = approvedPreview.createdAt
+        }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
         try MANTAJSON.canonicalData(request).write(to: destination.appendingPathComponent("request.json"), options: .withoutOverwriting)
         let reportURL = destination.appendingPathComponent("registration.json")
@@ -132,7 +189,11 @@ public enum StableSegmentRecovery {
               [spec.headBounds.center.x, spec.headBounds.center.y, spec.headBounds.center.z].allSatisfy({ $0.isFinite && abs($0) <= 1_000 }) else {
             throw failure("Invalid segment selection, bounds, or landmarks; reviewedStable must be explicitly true.")
         }
-        let bundle = try MANTABundleValidator().validate(directory: URL(fileURLWithPath: spec.bundlePath))
+        let directory = URL(fileURLWithPath: spec.bundlePath)
+        let validator = MANTABundleValidator()
+        let bundle = try FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path)
+            ? validator.validate(directory: directory)
+            : validator.validateWorkingIndex(directory: directory, verifyIntegrity: true)
         guard bundle.capture.coordinateSystems.contains(where: { $0.id == "arkit-world" && $0.units == .meters }) else {
             throw failure("Source ARKit coordinates must explicitly use meters.")
         }
@@ -221,7 +282,9 @@ public enum StableSegmentRecovery {
                 return mapped
             }
             _ = copy(segment.bundle.manifest.content.capture, role: "original-capture-metadata", media: "application/json")
-            _ = copy("manifest.json", role: "original-manifest", media: "application/json")
+            let originalManifest = FileManager.default.fileExists(atPath: segment.bundle.rootDirectory.appendingPathComponent("manifest.json").path)
+                ? "manifest.json" : "derivatives/acquisition/manifest.json"
+            _ = copy(originalManifest, role: "original-manifest", media: "application/json")
             for original in segment.observations {
                 var derived = original
                 derived.imagePath = copy(original.imagePath, role: "camera-image")

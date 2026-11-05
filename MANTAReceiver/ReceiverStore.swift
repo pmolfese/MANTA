@@ -7,6 +7,10 @@ final class ReceiverStore: ObservableObject {
     @Published private(set) var bundle: MANTAValidatedBundle?
     @Published private(set) var importIntegrityWarnings = [MANTABundleIntegrityWarning]()
     @Published private(set) var importedArchiveURL: URL?
+    @Published var isCorrectingMotion = false
+    @Published private(set) var motionOriginalURL: URL?
+    @Published private(set) var motionCorrectedURL: URL?
+    private var motionAccessURLs: [URL] = []
     @Published private(set) var isImporting = false
     @Published private(set) var importProgress: Double?
     @Published private(set) var importStage = ""
@@ -45,6 +49,7 @@ final class ReceiverStore: ObservableObject {
 
     deinit {
         packageAccessURL?.stopAccessingSecurityScopedResource()
+        for url in motionAccessURLs { url.stopAccessingSecurityScopedResource() }
         electrodeDetectionTask?.cancel()
         electrodeGuessTask?.cancel()
         if let ephemeralWorkspace {
@@ -52,12 +57,24 @@ final class ReceiverStore: ObservableObject {
         }
     }
 
+    func rememberMotionCorrection(original: URL, corrected: URL, outputAccess: URL) {
+        for url in motionAccessURLs { url.stopAccessingSecurityScopedResource() }
+        motionAccessURLs = [original, outputAccess].filter { $0.startAccessingSecurityScopedResource() }
+        motionOriginalURL = original
+        motionCorrectedURL = corrected
+    }
+
+    var hasMotionComparison: Bool {
+        guard let root = bundle?.rootDirectory.standardizedFileURL.resolvingSymlinksInPath() else { return false }
+        return [motionOriginalURL, motionCorrectedURL].compactMap { $0?.standardizedFileURL.resolvingSymlinksInPath() }.contains(root)
+    }
+
     var supportsPhotogrammetryReconstruction: Bool {
         reconstructionRunner.isSupported
     }
 
     func importArchive(from sourceURL: URL) async {
-        guard !isImporting, !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
+        guard !isCorrectingMotion, !isImporting, !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
               !isSavingElectrodes else { return }
         isImporting = true
         importProgress = nil
@@ -163,7 +180,7 @@ final class ReceiverStore: ObservableObject {
         outputMode: ReceiverReconstructionOutputMode,
         inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) {
-        guard !isImporting, !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
+        guard !isCorrectingMotion, !isImporting, !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
               let sourceBundle = bundle else { return }
         clearEphemeralReconstruction()
         reconstructionLog.removeAll(keepingCapacity: true)

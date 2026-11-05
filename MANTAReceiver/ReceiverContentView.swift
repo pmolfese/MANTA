@@ -41,6 +41,10 @@ struct ReceiverContentView: View {
                             .foregroundStyle(.orange)
                         }
                         LabeledContent("Observations", value: "\(bundle.capture.observations.count)")
+                        if CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality)) {
+                            Text("Multiple passes or movement recorded. Both reconstruction modes use foreground masking and estimate new camera poses. Depth-guided uses each frame’s depth without gravity constraints. Inspect and align the result; direct depth fusion still requires registration.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         LabeledContent("Files", value: "\(bundle.manifest.files.count)")
                         LabeledContent(
                             "LiDAR",
@@ -76,7 +80,12 @@ struct ReceiverContentView: View {
                     }
 
                     Section {
-                        ReceiverHeadBoundingBoxControls(store: store, display: display)
+                        if display.isViewingArchivedPass {
+                            Text("Viewing an archived LiDAR pass. Its saved bounds and surface are preserved; switch to the current capture to edit.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            ReceiverHeadBoundingBoxControls(store: store, display: display)
+                        }
                     } header: {
                         HStack(spacing: 4) {
                             Text("Head Bounding Box")
@@ -106,7 +115,7 @@ struct ReceiverContentView: View {
                     }
                 }
             }
-            .disabled(store.isImporting)
+            .disabled(store.isImporting || store.isCorrectingMotion)
             .navigationTitle("MANTA Receiver")
         } detail: {
             if store.isImporting {
@@ -245,6 +254,9 @@ private struct BundleInspector: View {
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .id(alignmentWorkspaceID)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
+            ReceiverMotionCorrectionWorkspace(store: store, bundle: bundle)
+                .id(bundle.manifest.bundleID)
+                .tabItem { Label("Motion Correction", systemImage: "arrow.triangle.2.circlepath") }
             ReceiverElectrodeWorkspace(store: store, display: display, bundle: bundle)
                 .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
             ReceiverComparisonView(bundle: bundle)
@@ -255,6 +267,7 @@ private struct BundleInspector: View {
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .tabItem { Label("Export", systemImage: "square.and.arrow.up") }
         }
+        .disabled(store.isCorrectingMotion)
         .navigationTitle("Capture Inspector")
     }
 

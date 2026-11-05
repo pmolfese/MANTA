@@ -39,6 +39,32 @@ struct CaptureMotionTests {
         }
     }
 
+    @Test func segmentStopDoesNotFlagLaterPasses() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stops = root.appendingPathComponent("acquisition/motion-stops")
+        try FileManager.default.createDirectory(at: stops, withIntermediateDirectories: true)
+        var session = ScanSession.newSession(layout: .headMeshOnly)
+        for segment in [id, UUID()] {
+            var quality = CaptureQualityMetrics(arFrameTimestamp: 1, worldMappingStatus: "mapped",
+                ambientIntensity: nil, ambientColorTemperature: nil, meanLuminance: 0.5,
+                darkPixelFraction: 0, brightPixelFraction: 0, sharpnessScore: 1,
+                translationFromPreviousSampleMeters: nil, rotationFromPreviousSampleDegrees: nil, coverageSector: "test")
+            quality.motionAssessment = .init(segmentID: segment, state: .consistent)
+            session.captureObservations.append(CaptureObservation(capturedAt: Date(), cameraTransform: [], cameraIntrinsics: [],
+                imageResolution: .init(width: 2, height: 2), hasSceneDepth: false, meshAnchorCount: 0,
+                trackingSummary: "Normal", quality: quality))
+        }
+        try JSONEncoder().encode(session).write(to: root.appendingPathComponent("session.json"))
+        try JSONEncoder().encode(Date()).write(to: stops.appendingPathComponent("\(id).json"))
+        let loaded = try MANTAWorkingSessionLoader.load(from: root)
+        #expect(loaded.captureObservations[0].quality?.motionAssessment?.state == .suspected)
+        #expect(loaded.captureObservations[1].quality?.motionAssessment?.state == .consistent)
+        #expect(CaptureMotionPolicy.needsIndependentImageSolve(loaded.captureObservations.map(\.quality)))
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(loaded.captureObservations.map(\.quality), maskedIndependentSamples: true)
+        #expect(throws: (any Error).self) { try CaptureMotionPolicy.requireObjectCaptureCompatible(loaded.captureObservations.map(\.quality)) }
+    }
+
     @Test func motionEvidenceRoundTripsAndBlocksUnsafeSolve() throws {
         var quality = CaptureQualityMetrics(arFrameTimestamp: 1, worldMappingStatus: "mapped",
             ambientIntensity: nil, ambientColorTemperature: nil, meanLuminance: 0.5,

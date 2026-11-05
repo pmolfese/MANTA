@@ -112,7 +112,7 @@ struct CombinedModelViewer: View {
         let modelIdentity = photogrammetryURLOverride?.standardizedFileURL.path
             ?? assets.photogrammetryURL?.standardizedFileURL.path ?? "none"
         self.displayContextKey = "\(bundle.manifest.bundleID.uuidString)|\(modelIdentity)"
-            + "|\(photogrammetryPlacementLabel ?? "")|\(annotationOnlyDefault)"
+            + "|\(photogrammetryPlacementLabel ?? "")|\(annotationOnlyDefault)|\(assets.fullLiDARURL?.path ?? "")|\(assets.headLiDARURL?.path ?? "")"
     }
 
     /// Pushes current defaults and capabilities into the shared settings.
@@ -273,15 +273,15 @@ struct CombinedModelViewer: View {
 
     @ViewBuilder private var statusOverlay: some View {
         VStack(alignment: .leading, spacing: 5) {
-            if assets.photogrammetryURL != nil, assets.alignmentAssessment.rejectsTransform {
-                Label(assets.alignmentAssessment.message, systemImage: "exclamationmark.triangle.fill")
+            if showPhotogrammetry, assets.photogrammetryURL != nil, assets.alignmentAssessment.rejectsTransform {
+                Label(bundle.capture.capturePasses?.isEmpty == false ? "Photo model is not aligned to a LiDAR pass" : assets.alignmentAssessment.message, systemImage: "info.circle")
                     .foregroundStyle(.orange)
                 Text("Inspect the photo model separately. Use Align to review its placement.")
                     .foregroundStyle(.secondary)
             } else if showPhotogrammetry, assets.modelToWorld != nil {
                 Label(assets.alignmentAssessment.message, systemImage: "info.circle")
                     .foregroundStyle(.orange)
-            } else if assets.photogrammetryURL != nil, assets.modelToWorld == nil {
+            } else if showPhotogrammetry, assets.photogrammetryURL != nil, assets.modelToWorld == nil {
                 Label("No model-to-world alignment", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                 Text("Photo and depth surfaces are inspected separately until aligned.")
@@ -342,7 +342,7 @@ struct CombinedModelViewer: View {
 
     private var hasAnnotations: Bool {
         !displayedElectrodes.isEmpty
-            || !displayedFiducials.isEmpty
+            || displayedFiducials.contains { $0.coordinate?.count == 3 }
     }
 
     private var hasWorldPlacementSurface: Bool {
@@ -555,7 +555,14 @@ private struct ReceiverSceneAssets {
             guard let point = fiducial.coordinate, point.count == 3 else { return nil }
             return SIMD3(Float(point[0]), Float(point[1]), Float(point[2]))
         }
-        if depthObservations.isEmpty {
+        let canFuse: Bool
+        do {
+            try CaptureMotionPolicy.requireStationary(depthObservations.map(\.quality))
+            canFuse = true
+        } catch { canFuse = false }
+        // Saved meshes remain usable even when a combined RGB-D solve is invalid.
+        // Do not automatically launch a known-ineligible fusion and cover the viewer with its error.
+        if depthObservations.isEmpty || !canFuse {
             fusionInput = nil
         } else {
             fusionInput = ReceiverDepthFusionInput(

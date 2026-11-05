@@ -35,9 +35,21 @@ public enum MANTAWorkingSessionLoader {
             if session.acquisitionContext?.captureReview?.motionFlagged == false {
                 session.acquisitionContext?.captureReview = nil
             }
-            _ = try JSONDecoder().decode(Date.self, from: Data(contentsOf: motionStop))
-            for index in session.captureObservations.indices {
+            let stoppedAt = try JSONDecoder().decode(Date.self, from: Data(contentsOf: motionStop))
+            for index in session.captureObservations.indices where session.captureObservations[index].capturedAt <= stoppedAt {
                 session.captureObservations[index].quality?.motionAssessment?.state = .suspected
+            }
+        }
+        let stops = directory.appendingPathComponent("acquisition/motion-stops")
+        if fileManager.fileExists(atPath: stops.path) {
+            let files = try fileManager.contentsOfDirectory(at: stops, includingPropertiesForKeys: nil)
+            for file in files where file.pathExtension == "json" {
+                guard let id = UUID(uuidString: file.deletingPathExtension().lastPathComponent) else { continue }
+                _ = try JSONDecoder().decode(Date.self, from: Data(contentsOf: file))
+                for index in session.captureObservations.indices where session.captureObservations[index].quality?.motionAssessment?.segmentID == id {
+                    session.captureObservations[index].quality?.motionAssessment?.state = .suspected
+                }
+                session.acquisitionContext?.captureReview = nil
             }
         }
         session.captureObservations.sort {

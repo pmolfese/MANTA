@@ -253,6 +253,11 @@ public struct MANTABundleValidator {
             throw MANTABundleValidationError.invalidCapture("observation IDs must be unique")
         }
 
+        for pass in capture.capturePasses ?? [] {
+            guard pass.artifactPaths.allSatisfy({ declaredPaths.contains($0) }) else {
+                throw MANTABundleValidationError.invalidCapture("Capture pass references an undeclared artifact")
+            }
+        }
         for observation in capture.observations {
             if let correction = observation.quality?.motionCorrection {
                 guard correction.isValid,

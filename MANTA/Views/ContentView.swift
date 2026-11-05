@@ -50,7 +50,7 @@ struct ContentView: View {
             if viewModel.isEndingSession {
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("Saving and ending session…").font(.headline)
+                    Text(viewModel.isStartingPass ? "Saving capture pass…" : "Saving and ending session…").font(.headline)
                     Text("Checking saved capture files.").foregroundStyle(.secondary)
                 }
                 .padding(28)

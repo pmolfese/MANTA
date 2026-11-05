@@ -18,6 +18,7 @@ let package = Package(
         .package(path: "../MANTACore")
     ],
     targets: [
+        .executableTarget(name: "manta-consolidate", dependencies: [.product(name: "MANTACore", package: "MANTACore")]),
         .executableTarget(name: "manta-recover-segments", dependencies: [.product(name: "MANTAProcessing", package: "MANTACore"), .product(name: "MANTACore", package: "MANTACore")]),
         .executableTarget(name: "manta-benchmark", dependencies: [.product(name: "MANTACore", package: "MANTACore")]),
         .executableTarget(

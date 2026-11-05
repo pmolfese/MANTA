@@ -4,6 +4,7 @@
 Usage: python3 MANTAReceiverTests/run_regression.py /tmp/manta-open-build
 Uses a generated triangle fixture. An optional second capture-folder argument
 adds a read-only audit of an existing processed capture.
+Use --lidar-pass-audit CAPTURE_FOLDER for the three-pass consolidated fixture.
 """
 from pathlib import Path
 import platform

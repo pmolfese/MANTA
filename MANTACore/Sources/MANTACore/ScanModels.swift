@@ -323,6 +323,7 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
     /// Explicit acquisition completion; nil for active and legacy sessions.
     public var endedAt: Date?
     public var captureRoute: CaptureRouteProgress?
+    public var capturePasses: [CapturePassArchive]?
     public var captureMode: CaptureMode
     public var layout: ElectrodeLayout
     public var fiducials: [FiducialAnnotation]

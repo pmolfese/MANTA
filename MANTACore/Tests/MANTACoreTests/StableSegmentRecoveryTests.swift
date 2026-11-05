@@ -7,6 +7,84 @@ import simd
 import MANTAProcessing
 
 struct StableSegmentRecoveryTests {
+    @Test func reviewedPreviewCanBeCommittedButChangedSelectionOrPayloadCannot() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try fixture(in: root, offset: 0)
+        let second = try fixture(in: root, offset: 0.09)
+        let request = StableSegmentRecoveryRequest(acquisitionGroupID: "reviewed", segments: [first, second])
+        let preview = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("preview"))
+        #expect(preview.accepted)
+        #expect(preview.entries.allSatisfy { !($0.previewPoints ?? []).isEmpty && $0.selectedPayloadSHA256?.count == 64 })
+        let saved = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("saved"), emitDerived: true, approvedPreview: preview)
+        #expect(saved.runID == preview.runID)
+        var changed = request
+        changed.segments[0].headBounds.widthMeters += 0.01
+        #expect(throws: (any Error).self) {
+            try StableSegmentRecovery.run(changed, output: root.appendingPathComponent("changed-selection"), emitDerived: true, approvedPreview: preview)
+        }
+        let source = try MANTABundleValidator().validate(directory: URL(fileURLWithPath: first.bundlePath))
+        let image = URL(fileURLWithPath: first.bundlePath).appendingPathComponent(source.capture.observations[0].imagePath!)
+        var bytes = try Data(contentsOf: image); bytes.append(0)
+        try bytes.write(to: image)
+        #expect(throws: (any Error).self) {
+            try StableSegmentRecovery.run(request, output: root.appendingPathComponent("changed-payload"), emitDerived: true, approvedPreview: preview)
+        }
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("changed-payload").path))
+    }
+
+    @Test func registersTwoPassesInsideOneConsolidatedPackage() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var first = try fixture(in: root, offset: 0)
+        var second = try fixture(in: root, offset: 0.09)
+        let source = try MANTABundleValidator().validate(directory: URL(fileURLWithPath: first.bundlePath))
+        let other = try MANTABundleValidator().validate(directory: URL(fileURLWithPath: second.bundlePath))
+        var capture = source.capture
+        capture.observations += other.capture.observations
+        // Both fixtures use identical camera-local payloads; only world poses differ.
+        let package = try MANTABundleFinalizer().finalize(.init(capture: capture,
+            producer: .init(application: "test", version: "1", build: "1", platform: "test", operatingSystemVersion: "test", deviceModel: "test"),
+            createdAt: Date(), finalizedAt: Date(), files: [
+                .init(path: "image.png", sourceURL: source.rootDirectory.appendingPathComponent("image.png"), mediaType: "image/png", role: "camera-image"),
+                .init(path: "depth.zlib", sourceURL: source.rootDirectory.appendingPathComponent("depth.zlib"), mediaType: "application/octet-stream", role: "metric-depth"),
+                .init(path: "confidence.zlib", sourceURL: source.rootDirectory.appendingPathComponent("confidence.zlib"), mediaType: "application/octet-stream", role: "depth-confidence")
+            ]), in: root, preferDirectoryPackage: true)
+        first.bundlePath = package.archiveURL.path
+        second.bundlePath = package.archiveURL.path
+        let request = StableSegmentRecoveryRequest(acquisitionGroupID: "consolidated", segments: [first, second])
+        let preview = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("preview"))
+        #expect(preview.accepted)
+        let result = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("saved"), emitDerived: true, approvedPreview: preview)
+        #expect(result.accepted)
+    }
+
+    @Test func automaticPreviewAndSavePreserveReviewAndFrameGates() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var first = try fixture(in: root, offset: 0)
+        var second = try fixture(in: root, offset: 0.09)
+        first.landmarks = []; second.landmarks = []
+        let request = StableSegmentRecoveryRequest(acquisitionGroupID: "automatic", segments: [first, second], automaticAlignment: true)
+        let preview = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("auto-preview"))
+        #expect(preview.accepted, "\(preview.entries.map { $0.registration.reason })")
+        #expect(preview.entries[1].registration.method == "geometry-multistart-rigid-icp-v1")
+        #expect(preview.entries[1].registration.landmarkRMSMeters == nil)
+        let saved = try StableSegmentRecovery.run(request, output: root.appendingPathComponent("auto-save"), emitDerived: true, approvedPreview: preview)
+        #expect(saved.accepted && saved.runID == preview.runID)
+        var unreviewed = request
+        unreviewed.segments[0].reviewedStable = false
+        #expect(throws: (any Error).self) {
+            try StableSegmentRecovery.run(unreviewed, output: root.appendingPathComponent("unreviewed"))
+        }
+        var moved = try fixture(in: root, offset: 0.09, movedFrame: true)
+        moved.landmarks = []
+        let rejected = try StableSegmentRecovery.run(.init(acquisitionGroupID: "moving", segments: [first, moved], automaticAlignment: true), output: root.appendingPathComponent("moving"), emitDerived: true)
+        #expect(!rejected.accepted)
+        #expect(!rejected.entries[1].rejectedFrameIDs.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("moving").path).allSatisfy { !$0.hasSuffix(".manta") })
+    }
+
     @Test func derivesUsablePackageWithoutChangingSources() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

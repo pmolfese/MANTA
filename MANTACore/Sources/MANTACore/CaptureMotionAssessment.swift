@@ -35,9 +35,18 @@ public enum CaptureMotionCheck {
 }
 
 public enum CaptureMotionPolicy {
-    /// Corrected cameras do not resolve a moving foreground against a stationary
-    /// background in unmasked Object Capture.
-    public static func requireObjectCaptureCompatible(_ qualities: [CaptureQualityMetrics?]) throws {
+    public static func needsIndependentImageSolve(_ qualities: [CaptureQualityMetrics?]) -> Bool {
+        let motion = qualities.compactMap { $0?.motionAssessment }
+        return motion.contains { $0.state == .suspected }
+            || Set(motion.map(\.segmentID)).count > 1
+            || qualities.contains { $0?.motionCorrection != nil }
+    }
+
+    /// Masked independent reconstruction estimates its own cameras without AR
+    /// pose or gravity constraints. Camera-local depth may assist scale, but
+    /// does not establish registration to any original coordinate world.
+    public static func requireObjectCaptureCompatible(_ qualities: [CaptureQualityMetrics?], maskedIndependentSamples: Bool = false) throws {
+        if maskedIndependentSamples { return }
         try requireStationary(qualities)
         if qualities.contains(where: { $0?.motionCorrection != nil }) {
             throw MotionError.requiresMaskedReconstruction
@@ -71,9 +80,9 @@ public enum CaptureMotionPolicy {
         var errorDescription: String? {
             switch self {
             case .requiresReview:
-                "This capture contains suspected movement or separate head segments. Preserve the RAW evidence and use a separate stationary pass or the reviewed stable-segment recovery workflow. Uncorrected segments cannot be combined."
+                "Metric processing requires stationary or registered passes. Use masked Images only for a visual reconstruction across passes, or the reviewed stable-segment recovery workflow for depth and calibrated rays."
             case .requiresMaskedReconstruction:
-                "Recovered segments support depth fusion and calibrated image rays. Object Capture across moved-head passes requires validated foreground masking and pose handling, which are not implemented yet."
+                "Recovered segments support depth fusion and calibrated image rays. Use masked Images only for a fresh Object Capture reconstruction; depth-guided Object Capture cannot reuse the corrected camera poses."
             }
         }
     }

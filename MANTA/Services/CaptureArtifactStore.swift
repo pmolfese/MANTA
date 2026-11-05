@@ -450,13 +450,19 @@ struct CaptureArtifactStore: @unchecked Sendable {
             observations: observations,
             fiducials: fiducials.isEmpty ? nil : fiducials,
             electrodes: electrodes.isEmpty ? nil : electrodes,
-            reconstruction: reconstruction)
+            reconstruction: reconstruction,
+            capturePasses: session.capturePasses)
     }
 
     private func bundleFileSources(
         _ session: ScanSession, in directory: URL, variant: MANTAExportVariant
     ) -> [MANTABundleFileSource] {
         var items = [String: (mediaType: String, role: String)]()
+        for pass in session.capturePasses ?? [] {
+            for path in pass.artifactPaths {
+                items[path] = (path.hasSuffix(".json") ? "application/json" : "application/octet-stream", "capture-pass-evidence")
+            }
+        }
         for observation in session.captureObservations {
             let evidencePath = "acquisition/live-labels/\(observation.id.uuidString).json"
             if fileManager.fileExists(atPath: directory.appendingPathComponent(evidencePath).path) {

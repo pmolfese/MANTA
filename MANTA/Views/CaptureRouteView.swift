@@ -200,11 +200,11 @@ struct CaptureRouteGuidance: View {
             VStack(alignment: .leading, spacing: 5) {
                 Label("Movement flagged · this pass is paused", systemImage: "exclamationmark.triangle.fill")
                     .font(.headline).foregroundStyle(.orange)
-                Text("Ask the participant to settle. Save this pass, then start a linked pass and freeze a new reference. Earlier images and depth are retained; automatic correction is not available yet.")
+                Text("Ask the participant to settle. Continue with a new pass and freeze a new reference. All passes stay in one saved session. Receiver can reconstruct the images together with foreground masking; depth remains separated by pass.")
                     .font(.callout)
                 Text(scan.motionMessage).font(.caption).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
-            Button("Save and start new pass") { Task { await viewModel.startNewStationaryPass() } }
+            Button("Continue in this session") { Task { await viewModel.startNewStationaryPass() } }
                 .buttonStyle(.borderedProminent).disabled(!viewModel.canNavigateCaptureRoute)
                 .accessibilityIdentifier("captureRouteNewPass")
         }

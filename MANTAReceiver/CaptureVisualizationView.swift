@@ -9,6 +9,19 @@ struct CaptureVisualizationView: View {
     @State private var mode = CaptureViewMode.model
     @State private var observationIndex = 0
     @State private var cameraZoom: CGFloat = 1
+    @State private var lidarPasses: [ReceiverArchivedLiDARPass] = []
+    @State private var geometrySelection = "capture"
+    @State private var passLoadError: String?
+
+    private var selectedPass: ReceiverArchivedLiDARPass? {
+        lidarPasses.first { $0.id.uuidString == geometrySelection }
+    }
+
+    private var visibleObservations: [MANTACaptureObservation] {
+        guard let selectedPass else { return bundle.capture.observations }
+        return bundle.capture.observations.filter { $0.quality?.motionAssessment?.segmentID == selectedPass.id }
+    }
+    private var visibleIndex: Int { min(observationIndex, max(0, visibleObservations.count - 1)) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,6 +32,28 @@ struct CaptureVisualizationView: View {
             .frame(maxWidth: 430)
             .padding(10)
 
+            if !lidarPasses.isEmpty {
+                HStack {
+                    Picker("3D surface", selection: $geometrySelection) {
+                        Text("Current capture / photo model").tag("capture")
+                        ForEach(Array(lidarPasses.enumerated()), id: \.element.id) { index, pass in
+                            Text("LiDAR pass \(index + 1) · \(pass.frameCount) frames").tag(pass.id.uuidString)
+                        }
+                    }
+                    .frame(maxWidth: 430)
+                    Text(selectedPass == nil
+                         ? "Saved LiDAR is available by pass. Overlay and combined depth fusion require registration."
+                         : "Saved pass surface · original coordinates · read-only")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.padding(.horizontal, 10).padding(.bottom, 8)
+            }
+            if let passLoadError { Text(passLoadError).font(.caption).foregroundStyle(.orange) }
+            if store.hasMotionComparison {
+                HStack {
+                    Button("Original passes") { if let url = store.motionOriginalURL { Task { await store.importArchive(from: url) } } }
+                    Button("Corrected capture") { if let url = store.motionCorrectedURL { Task { await store.importArchive(from: url) } } }
+                }.padding(.bottom, 8)
+            }
             Divider()
 
             switch mode {
@@ -33,54 +68,71 @@ struct CaptureVisualizationView: View {
                 }
             }
         }
+        .task(id: bundle.manifest.bundleID) {
+            do {
+                lidarPasses = try ReceiverArchivedLiDARPass.load(from: bundle)
+                passLoadError = nil
+                if selectedPass == nil { geometrySelection = "capture" }
+            } catch { lidarPasses = []; geometrySelection = "capture"; passLoadError = error.localizedDescription }
+            display.isViewingArchivedPass = selectedPass != nil
+        }
+        .onChange(of: geometrySelection) { _, _ in
+            observationIndex = 0
+            display.isViewingArchivedPass = selectedPass != nil
+            display.requestFrame()
+        }
+        .onAppear { display.isViewingArchivedPass = selectedPass != nil }
+        .onDisappear { display.isViewingArchivedPass = false }
     }
 
     private var modelViewer: some View {
         CombinedModelViewer(
-            bundle: bundle,
+            bundle: selectedPass?.viewerBundle(from: bundle) ?? bundle,
             display: display,
-            modelToWorldOverride: store.ephemeralReconstruction?.modelToWorld,
-            photogrammetryURLOverride: store.ephemeralReconstruction?.modelURL,
-            fiducialSaveInProgress: store.isApplyingAlignment
-        ) { fiducials in
-            Task { await store.applyFiducialCorrections(fiducials) }
-        }
+            modelToWorldOverride: selectedPass == nil ? store.ephemeralReconstruction?.modelToWorld : nil,
+            photogrammetryURLOverride: selectedPass == nil ? store.ephemeralReconstruction?.modelURL : nil,
+            fiducialSaveInProgress: store.isApplyingAlignment,
+            onFiducialsSaved: selectedPass == nil ? { fiducials in
+                Task { await store.applyFiducialCorrections(fiducials) }
+            } : nil
+        )
+        .id(geometrySelection)
     }
 
     @ViewBuilder private var camera: some View {
-        if bundle.capture.observations.isEmpty {
+        if visibleObservations.isEmpty {
             ContentUnavailableView("No saved camera frames", systemImage: "camera")
         } else {
             VStack(spacing: 0) {
                 ReceiverZoomableImageArea(zoom: $cameraZoom) {
                     StoredCameraFrameView(
                         root: bundle.rootDirectory,
-                        observation: bundle.capture.observations[observationIndex],
-                        electrodes: bundle.capture.electrodes ?? [],
-                        fiducials: bundle.capture.fiducials ?? [])
+                        observation: visibleObservations[visibleIndex],
+                        electrodes: selectedPass == nil ? bundle.capture.electrodes ?? [] : [],
+                        fiducials: selectedPass?.fiducials ?? bundle.capture.fiducials ?? [])
                 }
                 Divider()
                 HStack {
                     Button("Previous", systemImage: "chevron.left") {
                         observationIndex = max(0, observationIndex - 1)
                     }.disabled(observationIndex == 0)
-                    if bundle.capture.observations.count > 1 {
+                    if visibleObservations.count > 1 {
                         Slider(
                             value: Binding(
-                                get: { Double(observationIndex) },
+                                get: { Double(visibleIndex) },
                                 set: { observationIndex = Int($0.rounded()) }),
-                            in: 0...Double(bundle.capture.observations.count - 1), step: 1)
+                            in: 0...Double(visibleObservations.count - 1), step: 1)
                     } else {
                         Capsule()
                             .fill(.quaternary)
                             .frame(height: 4)
                             .accessibilityHidden(true)
                     }
-                    Text("Frame \(observationIndex + 1) of \(bundle.capture.observations.count)")
+                    Text("Frame \(visibleIndex + 1) of \(visibleObservations.count)")
                         .monospacedDigit()
                     Button("Next", systemImage: "chevron.right") {
-                        observationIndex = min(bundle.capture.observations.count - 1, observationIndex + 1)
-                    }.disabled(observationIndex == bundle.capture.observations.count - 1)
+                        observationIndex = min(visibleObservations.count - 1, observationIndex + 1)
+                    }.disabled(observationIndex == visibleObservations.count - 1)
                 }
                 .padding(10)
             }
@@ -229,5 +281,68 @@ private struct MarkerStyle {
         } else {
             color = .orange; filled = false
         }
+    }
+}
+
+/// A read-only view of one archived coordinate world. The parent capture remains
+/// the input to reconstruction/export; choosing a mesh never rewrites that capture.
+struct ReceiverArchivedLiDARPass: Identifiable {
+    let id: UUID
+    let frameCount: Int
+    let reconstruction: MANTAReconstructionReference
+    let fiducials: [MANTAFiducialSolution]
+
+    static func load(from bundle: MANTAValidatedBundle) throws -> [Self] {
+        let root = bundle.rootDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let declared = Set(bundle.manifest.files.map(\.path))
+        func checkedURL(_ path: String) throws -> URL {
+            let url = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
+            guard declared.contains(path), !path.hasPrefix("/"),
+                  !path.split(separator: "/").contains(".."), url.path.hasPrefix(root.path + "/") else {
+                throw MANTABundleValidationError.invalidCapture("Unsafe or undeclared archived pass artifact: \(path)")
+            }
+            return url
+        }
+        return try (bundle.capture.capturePasses ?? []).compactMap { pass in
+            guard let metadata = pass.artifactPaths.filter({ $0.hasSuffix("/session.json") })
+                .min(by: { $0.count < $1.count }) else { return nil }
+            let snapshot = try JSONDecoder().decode(ScanSession.self, from: Data(contentsOf: checkedURL(metadata)))
+            let prefix = String(metadata.dropLast("session.json".count))
+            func resolve(_ path: String?) throws -> String? {
+                guard let path else { return nil }
+                // Native archives already use root-relative paths. Consolidated
+                // legacy snapshots preserve their original relative filenames.
+                let candidate = pass.artifactPaths.contains(path) ? path : prefix + path
+                guard pass.artifactPaths.contains(candidate) else {
+                    throw MANTABundleValidationError.invalidCapture("Missing archived LiDAR artifact: \(candidate)")
+                }
+                let url = try checkedURL(candidate)
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    throw MANTARawSessionRecoveryError.missingReferencedFile(candidate)
+                }
+                return candidate
+            }
+            let full = try resolve(snapshot.lidarMeshFilename)
+            let head = try resolve(snapshot.headCroppedLidarMeshFilename)
+            guard full != nil || head != nil else { return nil }
+            return Self(id: pass.segmentID, frameCount: snapshot.captureObservations.count,
+                reconstruction: MANTAReconstructionReference(lidarMeshPath: full, headCroppedLidarMeshPath: head,
+                    headBoundingBox: snapshot.headBoundingBox, worldCoordinateSystem: "arkit-world"),
+                fiducials: snapshot.fiducials.map {
+                    MANTAFiducialSolution(kind: $0.kind.rawValue, coordinateSystem: "arkit-world",
+                        coordinate: $0.coordinate.map { [$0.x, $0.y, $0.z] }, state: $0.state.rawValue)
+                })
+        }
+    }
+
+    func viewerBundle(from source: MANTAValidatedBundle) -> MANTAValidatedBundle {
+        var capture = source.capture
+        capture.observations = [] // This view shows the saved mesh, not a new fusion.
+        capture.reconstruction = reconstruction
+        capture.fiducials = fiducials
+        capture.electrodes = nil
+        capture.capturePasses = nil
+        return MANTAValidatedBundle(rootDirectory: source.rootDirectory, manifest: source.manifest,
+            capture: capture, changeLog: nil, integrityWarnings: source.integrityWarnings)
     }
 }

@@ -26,9 +26,9 @@ enum ReceiverPhotogrammetryInputMode: String, CaseIterable, Identifiable, Sendab
     var explanation: String {
         switch self {
         case .imagesOnly:
-            return "Object Capture solves geometry from the RGB images alone. The model comes out in an arbitrary scale and pose that the Align step must recover."
+            return "Object Capture masks the foreground and solves all saved images, including start/stop passes, without AR poses or depth. Inspect the result and use Align to recover scale and placement."
         case .depthGuided:
-            return "Feeds each frame's LiDAR depth and a gravity vector to Object Capture, so the model comes out metric and gravity-oriented. Needs frames with saved depth."
+            return "Uses each frame’s LiDAR depth to help recover scale. Across separate or moved-head passes, masking is enabled and gravity constraints are omitted. Inspect dimensions and alignment after reconstruction."
         }
     }
 }
@@ -45,6 +45,7 @@ struct ReceiverReconstructionSampleDescriptor: Sendable {
     var depthHeight: Int
     var depthCompression: String
     var cameraToWorld: [Double]
+    var includeGravity: Bool = true
 }
 
 enum ReceiverReconstructionLogLevel: String, Codable, Sendable {
@@ -117,6 +118,7 @@ struct ReceiverReconstructionPreparation: Sendable {
     var sourceImageBytes: Int64
     var inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     /// Populated only for `depthGuided`; empty otherwise.
+    var independentPasses: Bool = false
     var sampleDescriptors: [ReceiverReconstructionSampleDescriptor] = []
 }
 
@@ -220,7 +222,14 @@ final class ReceiverPhotogrammetryRunner {
             throw ReceiverReconstructionError.unsupported
         }
         var configuration = PhotogrammetrySession.Configuration()
-        configuration.sampleOrdering = .sequential
+        configuration.sampleOrdering = preparation.inputMode.usesDepth && !preparation.independentPasses ? .sequential : .unordered
+        configuration.isObjectMaskingEnabled = !preparation.inputMode.usesDepth || preparation.independentPasses
+        if !preparation.inputMode.usesDepth {
+            log(.info, "Foreground-masked RGB solve: camera poses are estimated from images across all saved passes. AR poses and depth are not supplied.")
+        }
+        if preparation.inputMode.usesDepth && preparation.independentPasses {
+            log(.info, "Masked depth-guided solve across passes: per-frame depth assists scale; AR poses and gravity are omitted. Inspect geometry and alignment before metric use.")
+        }
         configuration.featureSensitivity = .high
         let active: PhotogrammetrySession
         if preparation.inputMode.usesDepth, !preparation.sampleDescriptors.isEmpty {
@@ -336,7 +345,9 @@ nonisolated enum ReceiverReconstructionWorkflow {
         detail: ReceiverPhotogrammetryDetail,
         inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) throws -> ReceiverReconstructionPreparation {
-        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality))
+        let independentPasses = CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality))
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality),
+            maskedIndependentSamples: !inputMode.usesDepth || independentPasses)
         let estimate = estimate(bundle: bundle, detail: detail)
         guard estimate.imageCount > 0 else { throw ReceiverReconstructionError.noImages }
         if let available = estimate.availableBytes, !estimate.hasEnoughSpace {
@@ -413,7 +424,8 @@ nonisolated enum ReceiverReconstructionWorkflow {
                     depthWidth: depthWidth,
                     depthHeight: depthHeight,
                     depthCompression: depthCompression,
-                    cameraToWorld: item.observation.cameraToWorld))
+                    cameraToWorld: item.observation.cameraToWorld,
+                    includeGravity: !independentPasses))
             }
             let posesURL = workspace.appendingPathComponent("macos-poses.json")
             let encoder = MANTAJSON.makeEncoder()
@@ -435,6 +447,7 @@ nonisolated enum ReceiverReconstructionWorkflow {
                 imageCount: poses.count,
                 sourceImageBytes: estimate.sourceImageBytes,
                 inputMode: resolvedMode,
+                independentPasses: independentPasses,
                 sampleDescriptors: resolvedMode.usesDepth ? sampleDescriptors : [])
         } catch {
             try? fileManager.removeItem(at: workspace)
@@ -550,6 +563,8 @@ nonisolated enum ReceiverReconstructionWorkflow {
     private static func alignmentTarget(
         bundle: MANTAValidatedBundle, maxPoints: Int
     ) -> [SIMD3<Float>] {
+        // A multi-pass RGB model has no shared AR world until reviewed alignment.
+        guard !CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality)) else { return [] }
         guard let reconstruction = bundle.capture.reconstruction,
               let path = reconstruction.headCroppedLidarMeshPath
                 ?? reconstruction.lidarMeshPath else { return [] }

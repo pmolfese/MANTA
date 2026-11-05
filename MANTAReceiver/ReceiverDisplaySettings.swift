@@ -7,6 +7,7 @@ import SwiftUI
 /// workspace (Viewer or Align) is on screen, instead of a per-view control bar.
 @MainActor
 final class ReceiverDisplaySettings: ObservableObject {
+    @Published var isViewingArchivedPass = false
     @Published var showLiDAR = false
     @Published var showPhotogrammetry = false
     @Published var showFusedDepth = false
@@ -81,6 +82,7 @@ final class ReceiverDisplaySettings: ObservableObject {
                 Float(declared.widthMeters / 2), Float(declared.heightMeters / 2),
                 Float(declared.depthMeters / 2))
         } else {
+            headBoundingBoxCenter = .zero
             headBoundingBoxHalfExtent = SIMD3(0.15, 0.19, 0.15)
         }
     }

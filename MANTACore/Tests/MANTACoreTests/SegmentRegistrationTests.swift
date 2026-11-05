@@ -17,6 +17,43 @@ struct SegmentRegistrationTests {
         var t = simd_float4x4(simd_quatf(angle: 0.3, axis: simd_normalize(SIMD3<Float>(1,2,3))))
         t.columns.3 = SIMD4(0.03, -0.02, 0.04, 1); return t
     }
+    @Test func automaticRecoversLargeRotationWithoutLandmarks() throws {
+        // Deterministic asymmetric 3D shape with sufficient metric extent.
+        let points: [SIMD3<Float>] = (0..<240).map { i in
+            let t = Float(i) * 2.399963
+            let z = Float(i) / 239 * 2 - 1
+            let r = sqrt(max(0, 1 - z * z))
+            return SIMD3(0.09 * r * cos(t) + 0.025 * z * z,
+                         0.13 * z, 0.07 * r * sin(t) * (1 + 0.3 * z))
+        }
+        var transform = simd_float4x4(simd_quatf(angle: 1.8, axis: simd_normalize(SIMD3<Float>(1,2,3))))
+        transform.columns.3 = SIMD4(0.2, -0.15, 0.08, 1)
+        let target = points.map { SegmentRegistration.point($0, transform) }
+        let result = SegmentRegistration.solveAutomatic(source: points, reference: target)
+        #expect(result.accepted, "\(result.reason)")
+        #expect(result.landmarkRMSMeters == nil)
+        let solved = try #require(result.referenceFromSource.flatMap(SegmentRegistration.matrix))
+        #expect(points.allSatisfy { simd_distance(SegmentRegistration.point($0, solved), SegmentRegistration.point($0, transform)) < 0.002 })
+        let repeated = SegmentRegistration.solveAutomatic(source: points.reversed(), reference: target.reversed())
+        #expect(repeated.referenceFromSource == result.referenceFromSource)
+    }
+
+    @Test func automaticRejectsSymmetricAndInvalidGeometry() {
+        let sphere: [SIMD3<Float>] = (1..<12).flatMap { row in
+            (0..<24).map { column in
+                let a = Float(row) * .pi / 12, b = Float(column) * .pi / 12
+                return SIMD3<Float>(0.1 * sin(a) * cos(b), 0.1 * cos(a), 0.1 * sin(a) * sin(b))
+            }
+        }
+        let ambiguous = SegmentRegistration.solveAutomatic(source: sphere, reference: sphere)
+        #expect(!ambiguous.accepted)
+        #expect(ambiguous.referenceFromSource == nil)
+        #expect(ambiguous.reason.contains("ambiguous"))
+        let line = (0..<80).map { SIMD3<Float>(Float($0) / 100, 0, 0) }
+        #expect(!SegmentRegistration.solveAutomatic(source: line, reference: line).accepted)
+        #expect(!SegmentRegistration.solveAutomatic(source: sphere, reference: sphere.map { $0 * 3 }).accepted)
+    }
+
     @Test func recoversRigidMotionAndPreservesMetricScale() throws {
         let result = SegmentRegistration.solve(source: cloud, reference: cloud.map { SegmentRegistration.point($0, truth) },
             sourceLandmarks: landmarks, referenceLandmarks: landmarks.map { SegmentRegistration.point($0, truth) })
