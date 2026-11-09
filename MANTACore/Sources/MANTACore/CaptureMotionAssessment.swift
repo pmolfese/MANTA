@@ -34,12 +34,89 @@ public enum CaptureMotionCheck {
     }
 }
 
+/// Capture admission is separate from metric admission. A held frame is still saved.
+/// Sustained disagreement latches until a new capture (or a future validated alignment).
+public struct CaptureMotionGate: Sendable {
+    public private(set) var isHolding = false
+    public private(set) var requiresAlignment = false
+    private var disagreements = 0
+    private var agreements = 0
+    private var lastTimestamp: Double?
+
+    public init() {}
+
+    public mutating func holdForAlignment() {
+        isHolding = true
+        requiresAlignment = true
+        agreements = 0
+    }
+
+    /// Called only after the recovery controller validates withheld frames.
+    public mutating func resumeAfterAlignment(at timestamp: Double? = nil) {
+        if let timestamp, !timestamp.isFinite || lastTimestamp.map({ timestamp <= $0 }) == true { return }
+        isHolding = false
+        requiresAlignment = false
+        disagreements = 0
+        agreements = 0
+    }
+
+    public mutating func assess(_ assessment: CaptureMotionAssessment, timestamp: Double) -> CaptureMotionAssessment {
+        var result = assessment
+        guard timestamp.isFinite, lastTimestamp.map({ timestamp > $0 }) ?? true else {
+            result.state = requiresAlignment ? .suspected : .insufficientEvidence
+            return result
+        }
+        lastTimestamp = timestamp
+        if requiresAlignment { result.state = .suspected; return result }
+        switch assessment.state {
+        case .suspected:
+            isHolding = true
+            agreements = 0
+            disagreements += 1
+            if disagreements >= 3 { requiresAlignment = true }
+        case .insufficientEvidence:
+            isHolding = true
+            agreements = 0
+            disagreements = 0
+        case .consistent:
+            disagreements = 0
+            if isHolding {
+                agreements += 1
+                if agreements >= 3 { isHolding = false; agreements = 0 }
+            }
+        case .unassessed:
+            disagreements = 0
+            agreements = 0
+        }
+        if isHolding { result.state = requiresAlignment ? .suspected : .insufficientEvidence }
+        return result
+    }
+}
+
 public enum CaptureMotionPolicy {
+    /// Only a capture with validated live recovery can omit held frames from a
+    /// metric solve. Other segments and malformed corrections still reach the
+    /// normal rejection policy. Raw capture and export keep every frame.
+    public static func metricFrames<Frame>(_ frames: [Frame], quality: (Frame) -> CaptureQualityMetrics?) -> [Frame] {
+        let references = Set(frames.compactMap { frame -> UUID? in
+            guard let q = quality(frame), q.motionAssessment?.state == .consistent,
+                  let live = q.liveMotionCorrection, live.supportsFrame(timestamp: q.arFrameTimestamp),
+                  q.motionAssessment?.segmentID == live.referenceSegmentID else { return nil }
+            return live.referenceSegmentID
+        })
+        guard references.count == 1, let reference = references.first else { return frames }
+        return frames.filter { frame in
+            guard let q = quality(frame), q.liveMotionCorrection == nil, q.motionCorrection == nil,
+                  q.motionAssessment?.segmentID == reference else { return true }
+            return q.motionAssessment?.state != .suspected && q.motionAssessment?.state != .insufficientEvidence
+        }
+    }
+
     public static func needsIndependentImageSolve(_ qualities: [CaptureQualityMetrics?]) -> Bool {
         let motion = qualities.compactMap { $0?.motionAssessment }
-        return motion.contains { $0.state == .suspected }
+        return motion.contains { $0.state == .suspected || $0.state == .insufficientEvidence }
             || Set(motion.map(\.segmentID)).count > 1
-            || qualities.contains { $0?.motionCorrection != nil }
+            || qualities.contains { $0?.motionCorrection != nil || $0?.liveMotionCorrection != nil }
     }
 
     /// Masked independent reconstruction estimates its own cameras without AR
@@ -48,12 +125,21 @@ public enum CaptureMotionPolicy {
     public static func requireObjectCaptureCompatible(_ qualities: [CaptureQualityMetrics?], maskedIndependentSamples: Bool = false) throws {
         if maskedIndependentSamples { return }
         try requireStationary(qualities)
-        if qualities.contains(where: { $0?.motionCorrection != nil }) {
+        if qualities.contains(where: { $0?.motionCorrection != nil || $0?.liveMotionCorrection != nil }) {
             throw MotionError.requiresMaskedReconstruction
         }
     }
 
     public static func requireStationary(_ qualities: [CaptureQualityMetrics?]) throws {
+        for quality in qualities {
+            if let live = quality?.liveMotionCorrection {
+                guard let quality, live.supportsFrame(timestamp: quality.arFrameTimestamp), quality.motionCorrection == nil,
+                      quality.motionAssessment?.state == .consistent,
+                      quality.motionAssessment?.segmentID == live.referenceSegmentID else {
+                    throw MotionError.requiresReview
+                }
+            }
+        }
         let corrections = qualities.compactMap { $0?.motionCorrection }
         if !corrections.isEmpty {
             guard corrections.count == qualities.count, corrections.allSatisfy(\.isValid),
@@ -70,7 +156,7 @@ public enum CaptureMotionPolicy {
             return
         }
         let motion = qualities.compactMap { $0?.motionAssessment }
-        if motion.contains(where: { $0.state == .suspected }) || Set(motion.map(\.segmentID)).count > 1 {
+        if motion.contains(where: { $0.state == .suspected || $0.state == .insufficientEvidence }) || Set(motion.map(\.segmentID)).count > 1 {
             throw MotionError.requiresReview
         }
     }

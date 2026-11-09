@@ -1174,3 +1174,127 @@ confirms the iPad-only orientation override and unchanged iPhone orientations.
 Full-screen simulator screenshots were visually checked in both landscape directions;
 the route, guidance, both panes, and control rail fit without overlap. A reference
 image is saved in `Docs/Design/capture-guidance-2026-11-05/implemented-landscape.png`.
+
+## Continuous capture during movement (stage 1)
+
+Automatic motion assessments no longer stop acquisition or mark an entire pass
+suspect. Each saved frame retains its own admission assessment. A mismatch or
+insufficient overlap holds that frame out of live depth fusion and electrode
+localization. Three distinct, chronological consistent observations clear a
+transient hold; three consecutive mismatches latch a hold pending alignment.
+Duplicate or older frames cannot advance either counter. These counts are
+provisional behavior settings, not validated movement accuracy thresholds.
+
+Recording and raw export continue while held. Previously accepted points and
+labels remain available. Held stills do not satisfy guided-photo checkpoints,
+and uncorrected held frames cannot enter stationary reconstruction. The ARKit
+accumulated mesh remains frozen at its last pre-hold snapshot for the rest of
+that capture, even if per-frame depth fusion resumes: ARKit cannot remove the
+uncertain samples already integrated internally. Live camera fiducial placement
+is disabled against that frozen surface. Explicit **Subject Moved** and actual
+tracking, storage, and write failures retain their existing stop behavior.
+
+Device checks on a LiDAR-equipped iPhone/iPad:
+
+1. Freeze a reference and collect trusted depth/labels. Orbit without subject
+   movement; verify sampling continues if overlap briefly becomes insufficient.
+2. Briefly obscure the head, then return to the reference view. Confirm held
+   frames are saved, prior preview points remain, and only three new consistent
+   observations resume per-frame model updates.
+3. Move the head enough to produce sustained mismatches. Verify recording and
+   sample counts continue, new frames remain excluded, and prior observations
+   retain their original assessments after export/reload.
+4. Capture a guided photo during the hold; verify it is saved without marking
+   the view complete. Confirm stationary reconstruction rejects held frames.
+5. Check explicit stopping and storage/write-failure handling still work.
+
+The stage 1 gate itself does not estimate a pose; the stage 2 recovery below
+can release it after validating a rigid alignment.
+
+## Automatic on-device recovery (stage 2)
+
+Recovery runs on the capturing iPad/iPhone, off the main actor. While recording
+continues, it attempts the existing ambiguity-rejecting rigid multistart solver
+against up to six trusted depth reference views (or the frozen reference mesh
+when no views are available). One solve runs at a time, with a minimum three
+seconds between attempt timestamps. A candidate must agree with three later,
+distinct, spatially supported depth observations before model updates resume.
+Every subsequent corrected frame must also pass the tighter registration gate.
+A further movement starts another recovery against the original reference frame;
+transforms are not compounded from one recovery to the next.
+
+The search is bounded to the last known head region plus 10 cm per side while
+held. This is geometry-based recovery, not an electrode-identity/net detector.
+Insufficient overlap, ambiguous rounded shapes, continued movement, or a head
+outside that search region can leave fusion held while recording continues.
+Accuracy, false acceptance rate, and iPad latency require real-device validation.
+
+Accepted frames store a corrected camera pose and `quality.liveMotionCorrection`
+containing the original pose, rigid transform, reference segment, validation
+count, and method. Depth/RGB pixels are unchanged. Raw exports retain held frames;
+metric processing can omit held frames from that same recovered segment while
+using trusted and corrected frames. Other segments and malformed corrections
+still block processing. Image-only reconstruction requires the independent masked
+workflow; it cannot reuse these corrected poses as Object Capture constraints.
+The accumulated ARKit mesh remains frozen; corrected per-frame depth builds the
+live and Receiver fused point clouds.
+
+Additional device acceptance checks:
+
+1. Translate/rotate a rigid asymmetric head phantom, then settle. Verify capture
+   never stops, a candidate requires three subsequent frames, and the fused cloud
+   rejoins the original without doubled surfaces. Compare independent landmarks.
+2. Repeat with a second movement; check both corrections target the original
+   reference, with no repeated application of the first transform.
+3. Move during candidate verification, obscure depth, or use a symmetric shape.
+   Verify rejected recovery leaves frames held and does not erase prior data.
+4. Change the crop, reset the capture, or explicitly stop while a solve is running.
+   Verify an obsolete completion cannot modify the new capture/reference.
+5. Export/reopen on the Mac. Verify corrected poses, original poses, image
+   orientation, and held-frame exclusion agree with the iPad result.
+
+## Continuous net-relative tracking (phase 3)
+
+With an electrode layout and live label detection enabled, the iPad uses two
+complementary signals. Saved-frame OCR supplies label identities; bounded local
+rigid depth registration updates the pose between label reads. Reference labels
+require three distinct admitted observations agreeing within 8 mm, OCR confidence
+at least 0.9, and high-confidence depth. At least four noncollinear matching labels
+must support a rigid pose (RMS at most 5 mm; every match within 8 mm). Confirmed
+reference labels never follow later samples. Held-frame labels can reacquire the
+pose, but cannot establish new reference labels or become electrode measurements.
+
+The tracker targets one background solve every 150 ms, with only one job in flight.
+Depth is restricted to the neighborhood within 7 cm of confirmed net labels.
+Local refinement uses at most 192 source points, 768 reference points, and ten
+iterations. It requires 80% source overlap, RMS at most 8 mm, and a pose change
+within 25 mm RMS point displacement and 12 degrees of its seed. Three consecutive
+pose updates establish tracking. Label support expires after three seconds; delayed
+OCR may refresh newer poses only when it agrees with the corresponding historical
+pose. These are provisional gates, not independently calibrated accuracy claims.
+
+Every saved frame is checked at its own timestamp and receives its own correction.
+The depth search region follows the net pose; fresh, admitted views can extend the
+reference coverage around the cap. The original head region remains in reference
+coordinates for fusion. Missing identity support or failed depth tracking returns
+to stage 2 recovery. Conflicting label geometry keeps fusion held until matching
+labels agree again, rather than allowing a geometry-only recovery to override it.
+Disabling tracking or changing the region cannot silently revert corrected capture
+to uncorrected room coordinates. Reset/cancel guards discard obsolete async results.
+
+Device acceptance additions:
+
+- Orbit a stationary net: camera motion alone should not move the net reference.
+- Keep capturing during slow continuous translation and rotation; verify correction
+  matrices vary per saved frame and fused electrode locations stay fixed.
+- Move around the cap to acquire additional labels and depth reference views.
+- Cover labels for more than three seconds, then reveal them; recording must
+  continue through loss and reacquisition without adding untrusted points.
+- Introduce a duplicate/misread label, a rapid pose jump, and cap deformation;
+  verify holds, preserved reference anchors, and recovery only with adequate support.
+- Measure latency, thermal behavior, false acceptance, and electrode error on the
+  actual iPad. The simulator/synthetic tests do not establish these outcomes.
+
+This tracks a rigid net relative to its initial observed frame. It does not prove
+that the net has not slipped relative to the scalp; that requires independent
+anatomical evidence. Initial region/reference setup remains required.

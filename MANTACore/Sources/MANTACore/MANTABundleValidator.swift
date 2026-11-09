@@ -259,6 +259,14 @@ public struct MANTABundleValidator {
             }
         }
         for observation in capture.observations {
+            if let live = observation.quality?.liveMotionCorrection {
+                guard live.matches(camera: observation.cameraToWorld.map(Float.init)),
+                      live.supportsFrame(timestamp: observation.quality?.arFrameTimestamp ?? .nan),
+                      observation.quality?.motionCorrection == nil,
+                      observation.quality?.motionAssessment?.segmentID == live.referenceSegmentID else {
+                    throw MANTABundleValidationError.invalidCapture("Invalid live motion correction provenance")
+                }
+            }
             if let correction = observation.quality?.motionCorrection {
                 guard correction.isValid,
                       let transform = SegmentRegistration.matrix(correction.referenceFromSource),

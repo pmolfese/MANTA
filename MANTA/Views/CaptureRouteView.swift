@@ -65,6 +65,13 @@ struct CaptureRouteGuidance: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if scan.continuousNetTrackingEnabled {
+                Text(scan.netTrackingMessage).font(.caption).foregroundStyle(.secondary)
+            }
+            if scan.motionFusionHeld && !scan.motionStopped {
+                Label(scan.motionMessage, systemImage: "viewfinder")
+                    .font(.callout).foregroundStyle(.orange)
+            }
             if scan.motionStopped {
                 movementRecovery
             } else {

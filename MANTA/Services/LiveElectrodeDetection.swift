@@ -1,5 +1,6 @@
 import Foundation
 import MANTACore
+import simd
 
 struct DetectionRunDiagnostics: Codable, Sendable {
     enum Mode: String, Codable, Sendable { case live, finalized }
@@ -30,6 +31,7 @@ nonisolated struct LiveDetectionEvidence: Codable, Sendable {
 nonisolated struct LiveDetectionResult: Sendable {
     let sightings: [LiveLabelSighting]
     let detections: [LabeledDetection]
+    var trackingLandmarks: [LabeledDetection] = []
 }
 
 enum LiveElectrodeDetectionWorker {
@@ -48,6 +50,11 @@ enum LiveElectrodeDetectionWorker {
             imageSize: SIMD2(Float(observation.imageResolution.width), Float(observation.imageResolution.height)))
         var sightings: [LiveLabelSighting] = []
         var detections: [LabeledDetection] = []
+        var trackingLandmarks: [LabeledDetection] = []
+        let originalPose = observation.quality?.liveMotionCorrection?.originalCameraToWorld ?? observation.cameraTransform
+        let rawCamera = PinholeCamera(intrinsics: observation.cameraIntrinsics, transform: originalPose)
+        var trackingDepth = frame.depthSampler as? DepthGridSampler
+        trackingDepth?.minimumConfidence = 2
         for item in items {
             let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty, text.allSatisfy({ $0.isASCII && $0.isNumber }),
@@ -59,6 +66,11 @@ enum LiveElectrodeDetectionWorker {
         for index in sightings.indices {
             sightings[index].ambiguous = duplicates.contains(sightings[index].label)
             let sighting = sightings[index]
+            if !sighting.ambiguous, sighting.confidence >= 0.9, trackingDepth?.confidence != nil, let rawCamera,
+               let depth = trackingDepth?.depth(atImagePixel: SIMD2(sighting.imageX, sighting.imageY)) {
+                trackingLandmarks.append(.init(label: sighting.label,
+                    world: rawCamera.unproject(pixel: SIMD2(sighting.imageX, sighting.imageY), depth: depth), quality: sighting.confidence))
+            }
             guard !sighting.ambiguous,
                   observation.quality?.motionAssessment?.state != .insufficientEvidence,
                   observation.quality?.motionAssessment?.state != .suspected,
@@ -70,6 +82,6 @@ enum LiveElectrodeDetectionWorker {
         try FileManager().createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(LiveDetectionEvidence(observationID: observation.id, sightings: sightings))
             .write(to: directory.appendingPathComponent(observation.id.uuidString + ".json"), options: .atomic)
-        return LiveDetectionResult(sightings: sightings, detections: detections)
+        return LiveDetectionResult(sightings: sightings, detections: detections, trackingLandmarks: trackingLandmarks)
     }
 }

@@ -50,6 +50,7 @@ import MANTACore
         try await testMotionSave(root: root)
         try testAlignmentPolicy(bundle: second)
         try testImageOrientation(root: root)
+        try testLiveRecoveryFusion(root: root)
         try testMultiPassInputs(bundle: raw, root: root)
         // The processed marker must agree with the effective manifest.
         let marker = root.appendingPathComponent("derivatives/receiver/processed.json")
@@ -161,6 +162,34 @@ import MANTACore
         precondition(FileManager.default.fileExists(atPath: autoOutput.appendingPathComponent("corrected-depth.ply").path))
         for (i, source) in sources.enumerated() { precondition(tryData(source.appendingPathComponent("capture.json")) == before[i]) }
         print("PASS: manual and automatic corrections saved atomically, reopened, fused corrected depth, preserved originals")
+    }
+
+    @MainActor static func testLiveRecoveryFusion(root: URL) throws {
+        let spec = try fixture(in: root, offset: 0)
+        let directory = URL(fileURLWithPath: spec.bundlePath)
+        let bundle = try MANTABundleValidator().validate(directory: directory)
+        var frames = Array(bundle.capture.observations.prefix(3))
+        frames[0].quality?.motionAssessment?.state = .consistent
+        var correctionTransform = matrix_identity_float4x4
+        correctionTransform.columns.3.x = 0.04
+        let segment = frames[0].quality!.motionAssessment!.segmentID
+        let correction = LiveMotionCorrection(referenceSegmentID: segment, transform: correctionTransform,
+            originalCameraToWorld: SegmentRegistration.flatten(correctionTransform.inverse), validatedFrameCount: 3)
+        frames[2].quality?.motionAssessment?.state = .consistent
+        frames[2].quality?.liveMotionCorrection = correction
+        frames[2].cameraToWorld = correction.correctedCameraToWorld!.map(Double.init)
+        let cloud = try ReceiverDepthFusion.fuse(.init(rootDirectory: directory, observations: frames,
+            declaredBounds: spec.headBounds, headMeshURL: nil, fiducialCoordinates: []))
+        precondition(cloud.contributingFrames == 2 && !cloud.points.isEmpty)
+        frames[2].quality?.liveMotionCorrection?.method = "net-anchored-continuous-rigid-v1"
+        frames[2].quality?.liveMotionCorrection?.trackedLabelCount = 5
+        let landmarkTimestamp = frames[2].quality?.arFrameTimestamp
+        frames[2].quality?.liveMotionCorrection?.landmarkTimestamp = landmarkTimestamp
+        let trackedCloud = try ReceiverDepthFusion.fuse(.init(rootDirectory: directory, observations: frames,
+            declaredBounds: spec.headBounds, headMeshURL: nil, fiducialCoordinates: []))
+        precondition(trackedCloud.contributingFrames == 2 && trackedCloud.points.count == cloud.points.count)
+        precondition(frames.count == 3 && frames[1].quality?.motionAssessment?.state == .suspected)
+        print("PASS: recovered and continuously tracked depth fused, held frame excluded, raw observations preserved")
     }
 
     private static func fixture(in root: URL, offset: Double, movedFrame: Bool = false, distantStill: Bool = false) throws -> StableSegmentRecoveryRequest.Segment {
@@ -347,6 +376,11 @@ import MANTACore
             sharpnessScore: 1, translationFromPreviousSampleMeters: nil, rotationFromPreviousSampleDegrees: nil,
             coverageSector: "test")
         quality.motionCorrection = .init(runID: UUID(), sourceBundleID: UUID(), sourceSegmentID: UUID(), referenceSegmentID: UUID(), transform: matrix_identity_float4x4, originalCameraToWorld: identity)
+        observation.quality = quality
+        precondition(ReceiverStoredImageOrientation.displayOrientation(for: observation) == .up)
+        quality.motionCorrection = nil
+        quality.liveMotionCorrection = .init(referenceSegmentID: UUID(), transform: matrix_identity_float4x4,
+            originalCameraToWorld: identity.map(Float.init), validatedFrameCount: 3)
         observation.quality = quality
         precondition(ReceiverStoredImageOrientation.displayOrientation(for: observation) == .up)
 

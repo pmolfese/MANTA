@@ -74,6 +74,9 @@ struct CaptureMotionTests {
         let decoded = try JSONDecoder().decode(CaptureQualityMetrics.self, from: JSONEncoder().encode(quality))
         #expect(decoded == quality)
         #expect(throws: (any Error).self) { try CaptureMotionPolicy.requireStationary([decoded]) }
+        quality.motionAssessment?.state = .insufficientEvidence
+        #expect(throws: (any Error).self) { try CaptureMotionPolicy.requireStationary([quality]) }
+        #expect(CaptureMotionPolicy.needsIndependentImageSolve([quality]))
         quality.motionAssessment = nil
         try CaptureMotionPolicy.requireStationary([nil, quality])
         quality.motionAssessment = .init(segmentID: id, state: .consistent)

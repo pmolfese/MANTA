@@ -122,6 +122,8 @@ enum ReceiverDepthFusion {
         voxelSize: Float = 0.004,
         minimumConfidence: UInt8 = 2
     ) throws -> ReceiverFusedDepthCloud {
+        var input = input
+        input.observations = CaptureMotionPolicy.metricFrames(input.observations, quality: \.quality)
         try CaptureMotionPolicy.requireStationary(input.observations.map(\.quality))
         let resolved = try resolveBounds(input)
         var voxels = [VoxelKey: Accumulator]()

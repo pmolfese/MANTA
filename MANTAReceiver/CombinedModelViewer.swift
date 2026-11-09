@@ -550,7 +550,7 @@ private struct ReceiverSceneAssets {
                 SIMD4(Float(values[8]), Float(values[9]), Float(values[10]), Float(values[11])),
                 SIMD4(Float(values[12]), Float(values[13]), Float(values[14]), Float(values[15])))
         }
-        let depthObservations = bundle.capture.observations.filter { $0.depth != nil }
+        let depthObservations = CaptureMotionPolicy.metricFrames(bundle.capture.observations, quality: \.quality).filter { $0.depth != nil }
         let coordinates = fiducials.compactMap { fiducial -> SIMD3<Float>? in
             guard let point = fiducial.coordinate, point.count == 3 else { return nil }
             return SIMD3(Float(point[0]), Float(point[1]), Float(point[2]))

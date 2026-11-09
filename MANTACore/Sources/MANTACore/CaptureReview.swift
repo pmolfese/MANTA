@@ -32,7 +32,8 @@ public enum CaptureReviewPolicy {
             guard observation.cameraSnapshotFilename != nil,
                   observation.quality?.captureSource == "high-resolution-still",
                   (observation.quality?.sharpnessScore ?? 0) >= 0.025,
-                  observation.quality?.motionAssessment?.state != .suspected else { return nil }
+                  observation.quality?.motionAssessment?.state != .suspected,
+                  observation.quality?.motionAssessment?.state != .insufficientEvidence else { return nil }
             return observation.quality?.guidedView
         })
     }

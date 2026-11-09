@@ -88,12 +88,50 @@ final class ARScanViewModel: NSObject, ObservableObject {
     private(set) var motionSegmentID = UUID()
     private var motionReference: [SIMD3<Float>] = []
     private var motionBounds: HeadBoundingBox?
+    private var motionGate = CaptureMotionGate()
+    private var motionRecovery = LiveMotionRecovery()
+    @Published var continuousNetTrackingEnabled = false {
+        didSet {
+            guard oldValue != continuousNetTrackingEnabled, !continuousNetTrackingEnabled else { return }
+            if netTrackingWasActive {
+                motionGate.holdForAlignment()
+                motionFusionHeld = true
+                netTrackingWasActive = false
+            }
+            netTrackingTask?.cancel()
+            netTrackingTask = nil
+            netTrackingJobID = UUID()
+            netLandmarkRevision = UUID()
+            captureNetPose = nil
+        }
+    }
+    private var netTracker = ContinuousNetTracker()
+    private var netTrackingTask: Task<Void, Never>?
+    private var netLandmarkRevision = UUID()
+    private var netTrackingJobID = UUID()
+    private var lastNetTrackingTimestamp = -Double.infinity
+    private var captureNetPose: NetPoseSample?
+    private var lastNetTransform: simd_float4x4?
+    private var netTrackingWasActive = false
+    @Published private(set) var netTrackingMessage = "Net tracking is waiting for repeated electrode labels."
+    private var motionRecoveryTask: Task<Void, Never>?
+    private var motionRecoveryEpoch = UUID()
+    private var motionRecoveryAttempt = 0
+    private var lastRecoveryAttemptTimestamp = -Double.infinity
+    private var lastReferenceViewTimestamp = -Double.infinity
+    private var motionReferenceViews: [[SIMD3<Float>]] = []
+    @Published private(set) var motionFusionHeld = false
+    private var trustedMeshSnapshot: LiDARMeshSnapshot?
+    // ARKit's accumulated mesh cannot undo samples integrated during uncertainty.
+    private var accumulatedMeshFrozen = false
 
     func hasMotionReference(for bounds: HeadBoundingBox?) -> Bool {
         !motionStopped && !motionReference.isEmpty && bounds != nil && bounds == motionBounds
     }
 
     func invalidateMotionReferenceForRegionChange() {
+        if motionRecovery.transform != nil || lastNetTransform != nil { motionGate.holdForAlignment(); motionFusionHeld = true }
+        invalidateMotionRecovery()
         motionReference = []
         motionBounds = nil
         guard !motionStopped else { return }
@@ -101,12 +139,14 @@ final class ARScanViewModel: NSObject, ObservableObject {
     }
 
     func freezeMotionReference(bounds: HeadBoundingBox?) {
-        guard status.isRunning, !motionStopped, let bounds else {
+        guard status.isRunning, !motionStopped, !accumulatedMeshFrozen, let bounds else {
             motionMessage = "Set the head region first. After movement, start a new pass."
             return
         }
+        invalidateMotionRecovery()
         let points = fullMeshSnapshot().cropped(to: bounds).vertices
         guard points.count >= 50 else { motionMessage = "Scan more of the stationary head before freezing a reference."; return }
+        trustedMeshSnapshot = fullMeshSnapshot()
         motionReference = stride(from: 0, to: points.count, by: max(1, points.count / 2048)).prefix(2048).map { points[$0] }
         motionBounds = bounds
         motionMessage = "Reference frozen. Depth consistency is advisory, not proof of a stationary head."
@@ -116,6 +156,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
 
     func markSubjectMoved() {
         guard !motionStopped else { return }
+        invalidateMotionRecovery()
         motionStopped = true
         worldInvalidated = true
         pause()
@@ -125,39 +166,254 @@ final class ARScanViewModel: NSObject, ObservableObject {
             details: ["segmentID": motionSegmentID.uuidString]))
     }
 
+    /// Never pauses capture or invalidates previously saved observations.
+    func assessCaptureMotion(_ rawMotion: CaptureMotionAssessment, timestamp: Double) -> CaptureMotionAssessment {
+        let wasHolding = motionFusionHeld
+        let motion = motionGate.assess(rawMotion, timestamp: timestamp)
+        motionFusionHeld = motionGate.isHolding
+        if motionFusionHeld { accumulatedMeshFrozen = true }
+        if !accumulatedMeshFrozen { trustedMeshSnapshot = fullMeshSnapshot() }
+        if wasHolding != motionFusionHeld {
+            eventHandler?(AcquisitionEvent(kind: motionFusionHeld ? "motion-fusion-held" : "motion-fusion-resumed",
+                message: motionFusionHeld ? "Recording continues; uncertain frames excluded from model updates." : "Reference consistency restored; model updates resumed."))
+        }
+        return motion
+    }
+
+    private func invalidateMotionRecovery() {
+        motionRecoveryEpoch = UUID()
+        motionRecoveryTask?.cancel()
+        motionRecoveryTask = nil
+        motionRecovery = LiveMotionRecovery()
+        netTracker = ContinuousNetTracker()
+        netLandmarkRevision = UUID()
+        netTrackingJobID = UUID()
+        netTrackingTask?.cancel()
+        netTrackingTask = nil
+        lastNetTrackingTimestamp = -.infinity
+        captureNetPose = nil
+        lastNetTransform = nil
+        netTrackingWasActive = false
+        netTrackingMessage = "Net tracking is waiting for repeated electrode labels."
+        motionReferenceViews = []
+        motionRecoveryAttempt = 0
+        lastRecoveryAttemptTimestamp = -.infinity
+        lastReferenceViewTimestamp = -.infinity
+    }
+
+    /// Used by the background solver; acquisition remains independent of its lifetime.
+    @discardableResult
+    func acceptMotionAlignment(_ result: SegmentRegistrationResult, reference: [SIMD3<Float>], timestamp: Double) -> Bool {
+        guard motionFusionHeld, !motionStopped else { return false }
+        return motionRecovery.propose(result, reference: reference, timestamp: timestamp)
+    }
+
+    private func scheduleMotionRecovery(points: [SIMD3<Float>], timestamp: Double) {
+        guard motionFusionHeld, !motionStopped, motionRecoveryTask == nil,
+              !motionRecovery.hasCandidate, points.count >= 50,
+              timestamp - lastRecoveryAttemptTimestamp >= 3 else { return }
+        let views = motionReferenceViews.isEmpty ? [motionReference] : motionReferenceViews
+        let reference = views[motionRecoveryAttempt % views.count]
+        guard reference.count >= 50 else { return }
+        motionRecoveryAttempt += 1
+        lastRecoveryAttemptTimestamp = timestamp
+        let epoch = motionRecoveryEpoch
+        // Arrays contain owned values only; no ARFrame or pixel buffers cross actors.
+        motionRecoveryTask = Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                SegmentRegistration.solveAutomatic(source: points, reference: reference)
+            }.value
+            guard let self, self.motionRecoveryEpoch == epoch else { return }
+            self.motionRecoveryTask = nil
+            guard !Task.isCancelled, self.status.isRunning else { return }
+            let accepted = self.acceptMotionAlignment(result, reference: reference, timestamp: timestamp)
+            self.eventHandler?(AcquisitionEvent(kind: accepted ? "motion-alignment-candidate" : "motion-alignment-rejected",
+                message: result.reason))
+        }
+    }
+
+    /// OCR results keep original AR coordinates even when their frame was held.
+    func observeNetLandmarks(_ landmarks: [LabeledDetection], observation: CaptureObservation) {
+        guard continuousNetTrackingEnabled, !motionStopped,
+              observation.quality?.motionAssessment?.segmentID == motionSegmentID,
+              let timestamp = observation.quality?.arFrameTimestamp else { return }
+        let trusted: simd_float4x4? = observation.quality?.motionAssessment?.state == .consistent
+            ? observation.quality?.liveMotionCorrection.flatMap { SegmentRegistration.matrix($0.referenceFromWorld) } ?? matrix_identity_float4x4 : nil
+        let bounded = landmarks.filter { landmark in
+            guard let trusted, let bounds = motionBounds else { return true }
+            let point = SegmentRegistration.point(landmark.world, trusted)
+            return abs(Double(point.x) - bounds.center.x) <= bounds.widthMeters / 2
+                && abs(Double(point.y) - bounds.center.y) <= bounds.heightMeters / 2
+                && abs(Double(point.z) - bounds.center.z) <= bounds.depthMeters / 2
+        }
+        netTracker.observe(bounded, timestamp: timestamp, trustedReferenceFromWorld: trusted)
+        netLandmarkRevision = UUID()
+        netTrackingMessage = netTracker.hasLandmarkConflict
+            ? "Electrode pattern changed; recording continues while the net is reacquired."
+            : "Net reference: \(netTracker.anchors.count) confirmed labels."
+    }
+
+    private var trackingReferencePoints: [SIMD3<Float>] {
+        motionReference + motionReferenceViews.flatMap { $0 } + motionRecovery.alignedReference
+    }
+
+    /// At most one bounded depth-tracking solve runs off the main actor, targeting
+    /// roughly 6 Hz. Saving a frame still checks that exact frame independently.
+    private func updateContinuousNetTracking(_ frame: ARFrame) {
+        guard continuousNetTrackingEnabled, status.isRunning, !motionStopped, !worldInvalidated,
+              netTrackingTask == nil, frame.timestamp - lastNetTrackingTimestamp >= 0.15,
+              let bounds = motionBounds, netTracker.seed(at: frame.timestamp) != nil,
+              let points = motionPoints(frame, bounds: bounds),
+              let request = netTracker.request(points: points, reference: trackingReferencePoints, timestamp: frame.timestamp) else { return }
+        lastNetTrackingTimestamp = frame.timestamp
+        let epoch = motionRecoveryEpoch, revision = netLandmarkRevision, jobID = UUID()
+        netTrackingJobID = jobID
+        netTrackingTask = Task { [weak self] in
+            let pose = await Task.detached(priority: .utility) { request.solve() }.value
+            guard let self, self.motionRecoveryEpoch == epoch, self.netTrackingJobID == jobID else { return }
+            self.netTrackingTask = nil
+            guard !Task.isCancelled, self.netLandmarkRevision == revision,
+                  self.status.isRunning, !self.motionStopped else { return }
+            if let pose {
+                _ = self.netTracker.record(pose)
+                if self.netTracker.isTracking {
+                    self.lastNetTransform = pose.transform
+                    self.netTrackingMessage = "Tracking net · \(pose.labelCount) matched labels · depth pose updates active."
+                }
+            } else { self.netTracker.miss(at: request.timestamp) }
+        }
+    }
+
+    func assessMotionPoints(_ points: [SIMD3<Float>], timestamp: Double) -> CaptureMotionAssessment {
+        captureNetPose = nil
+        if continuousNetTrackingEnabled,
+           let request = netTracker.request(points: points, reference: trackingReferencePoints, timestamp: timestamp),
+           let pose = request.solve() {
+            _ = netTracker.record(pose)
+            if netTracker.isTracking {
+                captureNetPose = pose
+                lastNetTransform = pose.transform
+                if !netTrackingWasActive {
+                    eventHandler?(AcquisitionEvent(kind: "continuous-net-tracking-started", message: "Net-relative pose updates are active.",
+                        details: ["matchedLabels": String(pose.labelCount)]))
+                }
+                netTrackingWasActive = true
+                accumulatedMeshFrozen = true
+                motionGate.resumeAfterAlignment(at: timestamp)
+                // A verified new view extends coverage in the original net frame.
+                if timestamp - lastReferenceViewTimestamp >= 3, timestamp - pose.landmarkTimestamp <= 0.5 {
+                    let aligned = points.map { SegmentRegistration.point($0, pose.transform) }
+                    let step = max(1, (aligned.count + 511) / 512)
+                    motionReferenceViews.append(stride(from: 0, to: aligned.count, by: step).map { aligned[$0] })
+                    if motionReferenceViews.count > 12 { motionReferenceViews.removeFirst() }
+                    lastReferenceViewTimestamp = timestamp
+                }
+                return assessCaptureMotion(.init(segmentID: motionSegmentID, state: .consistent,
+                    residualMeters: pose.residualMeters), timestamp: timestamp)
+            }
+        } else if continuousNetTrackingEnabled { netTracker.miss(at: timestamp) }
+        if netTrackingWasActive {
+            motionGate.holdForAlignment()
+            netTrackingWasActive = false
+        }
+        if continuousNetTrackingEnabled, netTracker.hasLandmarkConflict {
+            motionGate.holdForAlignment()
+            return assessCaptureMotion(.init(segmentID: motionSegmentID, state: .suspected), timestamp: timestamp)
+        }
+        if motionFusionHeld, motionRecovery.validate(points: points, timestamp: timestamp) {
+            motionGate.resumeAfterAlignment(at: timestamp)
+            lastNetTransform = nil
+            eventHandler?(AcquisitionEvent(kind: "motion-alignment-validated",
+                message: "Alignment agreed across three later frames; model updates resume."))
+        }
+        let transform = motionRecovery.transform ?? matrix_identity_float4x4
+        let reference = motionReference + motionReferenceViews.flatMap { $0 } + motionRecovery.alignedReference
+        let aligned = points.map { SegmentRegistration.point($0, transform) }
+        var raw = CaptureMotionCheck.assess(points: aligned, reference: reference, segmentID: motionSegmentID)
+        // Recovered poses must meet the stricter registration gate on every admitted frame.
+        if motionRecovery.transform != nil, raw.state == .consistent,
+           !SegmentRegistration.frameAgrees(points: points, reference: reference, transform: transform) {
+            raw.state = .suspected
+        }
+        let motion = assessCaptureMotion(raw, timestamp: timestamp)
+        if motion.state == .consistent, motionRecovery.transform == nil, points.count >= 50,
+           timestamp - lastReferenceViewTimestamp >= 3 {
+            let step = max(1, (points.count + 511) / 512)
+            motionReferenceViews.append(stride(from: 0, to: points.count, by: step).map { points[$0] })
+            if motionReferenceViews.count > 6 { motionReferenceViews.removeFirst() }
+            lastReferenceViewTimestamp = timestamp
+        }
+        if motionFusionHeld { scheduleMotionRecovery(points: points, timestamp: timestamp) }
+        else if motionRecovery.hasCandidate { motionRecovery.discardCandidate() }
+        return motion
+    }
+
+    func applyMotionCorrection(to observation: inout CaptureObservation) {
+        guard observation.quality?.liveMotionCorrection == nil else { return }
+        let netPose = captureNetPose.flatMap { $0.timestamp == observation.quality?.arFrameTimestamp ? $0 : nil }
+        if observation.quality?.motionAssessment?.state == .consistent, let transform = netPose?.transform ?? motionRecovery.transform {
+            var correction = LiveMotionCorrection(referenceSegmentID: motionSegmentID, transform: transform,
+                originalCameraToWorld: observation.cameraTransform, validatedFrameCount: 3)
+            if let netPose {
+                correction.method = "net-anchored-continuous-rigid-v1"
+                correction.trackedLabelCount = netPose.labelCount
+                correction.landmarkTimestamp = netPose.landmarkTimestamp
+            }
+            if let corrected = correction.correctedCameraToWorld {
+                observation.cameraTransform = corrected
+                observation.quality?.liveMotionCorrection = correction
+                observation.quality?.headCenteredCoverageSector = nil
+            } else {
+                observation.quality?.motionAssessment?.state = .insufficientEvidence
+                observation.quality?.warnings.append("invalid-live-correction-pose")
+            }
+        }
+    }
+
     private func assessMotion(_ frame: ARFrame, bounds: HeadBoundingBox?) -> CaptureMotionAssessment {
-        guard !motionStopped else { return .init(segmentID: motionSegmentID, state: .suspected) }
-        guard !motionReference.isEmpty else { return .init(segmentID: motionSegmentID, state: .unassessed) }
-        guard bounds == motionBounds, let bounds, case .normal = frame.camera.trackingState,
+        guard !motionStopped else { return assessCaptureMotion(.init(segmentID: motionSegmentID, state: .suspected), timestamp: frame.timestamp) }
+        guard !motionReference.isEmpty else { return assessCaptureMotion(.init(segmentID: motionSegmentID, state: .unassessed), timestamp: frame.timestamp) }
+        guard bounds == motionBounds, let bounds, let points = motionPoints(frame, bounds: bounds) else {
+            return assessCaptureMotion(.init(segmentID: motionSegmentID, state: .insufficientEvidence), timestamp: frame.timestamp)
+        }
+        return assessMotionPoints(points, timestamp: frame.timestamp)
+    }
+
+    private func motionPoints(_ frame: ARFrame, bounds: HeadBoundingBox) -> [SIMD3<Float>]? {
+        guard case .normal = frame.camera.trackingState,
               let depth = frame.sceneDepth, let confidence = depth.confidenceMap else {
-            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+            return nil
         }
         let map = depth.depthMap
         CVPixelBufferLockBaseAddress(map, .readOnly); CVPixelBufferLockBaseAddress(confidence, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly); CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
         guard let raw = CVPixelBufferGetBaseAddress(map), let conf = CVPixelBufferGetBaseAddress(confidence) else {
-            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+            return nil
         }
         let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
         guard CVPixelBufferGetWidth(confidence) == width, CVPixelBufferGetHeight(confidence) == height else {
-            return .init(segmentID: motionSegmentID, state: .insufficientEvidence)
+            return nil
         }
         let camera = PinholeCamera(fx: frame.camera.intrinsics[0][0], fy: frame.camera.intrinsics[1][1],
             cx: frame.camera.intrinsics[2][0], cy: frame.camera.intrinsics[2][1], cameraToWorld: frame.camera.transform)
         var points: [SIMD3<Float>] = []
-        for y in stride(from: 0, to: height, by: max(1, height / 16)) {
-            for x in stride(from: 0, to: width, by: max(1, width / 16)) {
+        let referenceFromWorld = netTracker.seed(at: frame.timestamp)?.transform ?? motionRecovery.transform ?? lastNetTransform ?? matrix_identity_float4x4
+        // Bounded search around the last known head pose; larger departures stay held.
+        let margin: Double = motionFusionHeld ? 0.10 : (continuousNetTrackingEnabled ? 0.03 : 0)
+        for y in stride(from: 0, to: height, by: max(1, height / 48)) {
+            for x in stride(from: 0, to: width, by: max(1, width / 48)) {
                 guard conf.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(confidence) + x, as: UInt8.self) >= 2 else { continue }
                 let z = raw.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(map) + x * 4, as: Float.self)
                 guard z.isFinite, z > 0.2, z < 2 else { continue }
                 let point = camera.unproject(pixel: SIMD2(Float(x) * Float(frame.camera.imageResolution.width) / Float(width),
                     Float(y) * Float(frame.camera.imageResolution.height) / Float(height)), depth: z)
-                if abs(Double(point.x) - bounds.center.x) <= bounds.widthMeters / 2,
-                   abs(Double(point.y) - bounds.center.y) <= bounds.heightMeters / 2,
-                   abs(Double(point.z) - bounds.center.z) <= bounds.depthMeters / 2 { points.append(point) }
+                let inReference = SegmentRegistration.point(point, referenceFromWorld)
+                if abs(Double(inReference.x) - bounds.center.x) <= bounds.widthMeters / 2 + margin,
+                   abs(Double(inReference.y) - bounds.center.y) <= bounds.heightMeters / 2 + margin,
+                   abs(Double(inReference.z) - bounds.center.z) <= bounds.depthMeters / 2 + margin { points.append(point) }
             }
         }
-        return CaptureMotionCheck.assess(points: points, reference: motionReference, segmentID: motionSegmentID)
+        return points
     }
 
     private var worldInvalidated = false
@@ -357,6 +613,11 @@ final class ARScanViewModel: NSObject, ObservableObject {
         pause()
         hasStartedTracking = false
         motionStopped = false
+        motionGate = CaptureMotionGate()
+        invalidateMotionRecovery()
+        motionFusionHeld = false
+        trustedMeshSnapshot = nil
+        accumulatedMeshFrozen = false
         savedStillSectors = []
         sampledSectors = []
         lastAutomaticSampleTimestamp = nil
@@ -483,12 +744,13 @@ final class ARScanViewModel: NSObject, ObservableObject {
         observation.quality?.recaptureTargetLabel = recaptureTargetLabel
         let motion = assessMotion(frame, bounds: session.headBoundingBox)
         observation.quality?.motionAssessment = motion
+        applyMotionCorrection(to: &observation)
         observation.imageOrientation = orientation
         motionMessage = switch motion.state {
         case .unassessed: "Motion check not armed. Freeze a stable head reference."
-        case .insufficientEvidence: "Insufficient head overlap/depth for a motion check. Revisit the reference view; use Subject Moved if uncertain."
-        case .consistent: "Depth consistent with frozen reference (advisory only)."
-        case .suspected: "Possible subject movement; preserving this frame and stopping capture."
+        case .insufficientEvidence: "Rechecking reference… Recording continues; model updates are held."
+        case .consistent: captureNetPose != nil ? "Tracking net. Recording and model updates continue." : (motionRecovery.transform == nil ? "Depth consistent with frozen reference (advisory only)." : "Realigned to reference. Recording and model updates continue.")
+        case .suspected: "Reacquiring head/net… Recording continues while alignment is checked."
         }
         observation.capturedAt = Date(timeIntervalSinceNow: frame.timestamp - ProcessInfo.processInfo.systemUptime)
         let copyStarted = ProcessInfo.processInfo.systemUptime
@@ -512,6 +774,8 @@ final class ARScanViewModel: NSObject, ObservableObject {
             switch result {
             case .success(let written):
                 if source == "high-resolution-still", (initial.quality?.sharpnessScore ?? 0) >= 0.025,
+                   initial.quality?.motionAssessment?.state != .suspected,
+                   initial.quality?.motionAssessment?.state != .insufficientEvidence,
                    let sector = initial.quality?.coverageSector { self.savedStillSectors.insert(sector) }
                 self.observations.append(written.observation)
                 self.observations.sort { $0.capturedAt < $1.capturedAt }
@@ -544,7 +808,6 @@ final class ARScanViewModel: NSObject, ObservableObject {
         eventHandler?(AcquisitionEvent(kind: "capture-frame-queued", message: source,
             details: ["observationID": observation.id.uuidString, "pendingWrites": String(frameWriter.pendingCount),
                       "capacity": String(frameWriter.capacity), "bufferCopyDurationMs": String(copyMs)]))
-        if motion.state == .suspected { markSubjectMoved() }
         return observation
     }
 
@@ -656,7 +919,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
     /// If no mesh has been built yet, it falls back to an estimated-plane raycast
     /// so early taps still land somewhere sensible.
     func raycastToWorld(viewPoint: CGPoint) -> FiducialRaycastResult? {
-        guard let arView else { return nil }
+        guard !motionFusionHeld, !accumulatedMeshFrozen, let arView else { return nil }
 
         if let (origin, direction) = arView.ray(through: viewPoint) {
             let mesh = fullMeshSnapshot()
@@ -693,13 +956,15 @@ final class ARScanViewModel: NSObject, ObservableObject {
     /// camera so the head rotates to match the operator's physical viewpoint.
     /// Nil when no frame is available (session not running yet).
     func currentCameraTransform() -> simd_float4x4? {
-        arView?.session.currentFrame?.camera.transform
+        guard let pose = arView?.session.currentFrame?.camera.transform else { return nil }
+        return (lastNetTransform ?? motionRecovery.transform ?? matrix_identity_float4x4) * pose
     }
 
     /// World-space point cloud of the accumulated LiDAR reconstruction mesh.
     /// Vertices are transformed by each anchor's pose and roughly capped to `maxPoints`
     /// by subsampling so downstream ICP stays tractable.
     func meshWorldPoints(maxPoints: Int = 6000) -> [SIMD3<Float>] {
+        if accumulatedMeshFrozen { return Array((trustedMeshSnapshot?.vertices ?? []).prefix(max(0, maxPoints))) }
         let anchors = Array(meshAnchors.values)
         guard !anchors.isEmpty else { return [] }
 
@@ -736,6 +1001,7 @@ final class ARScanViewModel: NSObject, ObservableObject {
     /// Vertices are transformed into ARKit world coordinates and face indices
     /// are rebased into the combined vertex array.
     func fullMeshSnapshot() -> LiDARMeshSnapshot {
+        if accumulatedMeshFrozen { return trustedMeshSnapshot ?? LiDARMeshSnapshot(vertices: [], triangleIndices: []) }
         var vertices = [SIMD3<Float>]()
         var triangles = [UInt32]()
         for anchor in meshAnchors.values {
@@ -1015,6 +1281,7 @@ extension ARScanViewModel: ARSessionDelegate {
         Task { @MainActor in
             self.updateStatus(from: frame)
             self.considerFrame(frame)
+            self.updateContinuousNetTracking(frame)
         }
     }
 

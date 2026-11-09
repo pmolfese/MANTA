@@ -48,7 +48,8 @@ nonisolated enum ReceiverStoredImageOrientation: String, Sendable {
               observation.imageOrigin == "top-left" else { return declared }
         // Segment registration changes camera poses; original acquisition pose
         // still describes how gravity projected into the original image pixels.
-        let pose = observation.quality?.motionCorrection?.originalCameraToWorld
+        let pose = observation.quality?.liveMotionCorrection?.originalCameraToWorld.map(Double.init)
+            ?? observation.quality?.motionCorrection?.originalCameraToWorld
             ?? observation.cameraToWorld
         guard pose.count == 16, pose.allSatisfy(\.isFinite),
               let gravity = CameraGravity.inCameraSpace(cameraToWorld: pose),

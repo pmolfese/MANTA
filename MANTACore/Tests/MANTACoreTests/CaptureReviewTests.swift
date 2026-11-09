@@ -23,7 +23,8 @@ struct CaptureReviewTests {
         var regular = saved; regular.quality?.captureSource = "current-frame"
         var untagged = saved; untagged.quality?.guidedView = nil
         var moved = saved; moved.quality?.motionAssessment = .init(segmentID: UUID(), state: .suspected)
-        #expect(CaptureReviewPolicy.savedViews([queued, blurred, regular, untagged, moved]).isEmpty)
+        var held = saved; held.quality?.motionAssessment = .init(segmentID: UUID(), state: .insufficientEvidence)
+        #expect(CaptureReviewPolicy.savedViews([queued, blurred, regular, untagged, moved, held]).isEmpty)
     }
     @Test func newerCheckpointInvalidatesPriorReview() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

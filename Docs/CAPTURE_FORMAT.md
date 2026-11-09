@@ -623,3 +623,38 @@ compatibility, with its definition in the coordinate-system description. Origina
 metadata and selected raw assets are copied under `sources/`; source meshes,
 fiducials, electrode solutions, and coverage are not implicitly transformed/reused.
 See [recovery workflow and limitations](SEGMENT_RECOVERY.md).
+
+### Optional live motion correction
+
+`quality.liveMotionCorrection` records `referenceSegmentID`,
+`referenceFromWorld`, `originalCameraToWorld`, `validatedFrameCount`, and `method`
+(`automatic-rigid-withheld-frames-v1`). Matrices are column-major 4×4, in meters.
+The observation camera pose is already corrected:
+
+```
+cameraToWorld = referenceFromWorld * originalCameraToWorld
+```
+
+Consumers must not apply the transform a second time. RGB and depth remain in
+original camera-local coordinates; image orientation uses the original pose.
+Bundle validation checks rigid matrices, at least three validation frames, matching
+segment identity, and consistency between the stored pose and correction.
+Live and reviewed-segment correction records cannot coexist on one observation.
+
+Accepted live frames have `motionAssessment.state = consistent`. A later explicit
+movement flag can withdraw trust without deleting the correction provenance.
+Held frames remain in raw capture with their original poses and are not relabeled
+retroactively. Metric processing may omit held frames from a segment containing
+valid live recovery; unrelated segments still require their own registration.
+Live corrections require independent masked image reconstruction for Object
+Capture. Older captures without this optional field retain existing behavior.
+
+The live correction method `net-anchored-continuous-rigid-v1` additionally records
+`trackedLabelCount` (at least four) and `landmarkTimestamp` (AR monotonic seconds).
+The landmark timestamp must be no later than `quality.arFrameTimestamp` and at most
+three seconds earlier. Three pose observations establish continuous tracking;
+subsequent frames have individually checked rigid corrections, so transforms may
+vary within a segment. The original pose remains in `originalCameraToWorld` and
+pixels remain unchanged. Validators and metric processing reject expired or
+malformed identity support. Acquisition events mark entry into continuous tracking;
+existing saved live-label sightings provide the underlying OCR identity evidence.

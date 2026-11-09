@@ -203,7 +203,7 @@ public enum StableSegmentRecovery {
         var fusion = MetricDepthPointCloudAccumulator(configuration: .init(voxelSizeMeters: 0.006, minimumConfidence: 2))
         var frames: [UUID: [SIMD3<Float>]] = [:]
         for (index, observation) in observations.enumerated() {
-            guard observation.imageOrigin == "top-left", observation.worldCoordinateSystem == "arkit-world", observation.quality?.motionCorrection == nil,
+            guard observation.imageOrigin == "top-left", observation.worldCoordinateSystem == "arkit-world", observation.quality?.motionCorrection == nil, observation.quality?.liveMotionCorrection == nil,
                   observation.quality?.motionAssessment == nil || observation.quality?.motionAssessment?.segmentID == spec.segmentID,
                   let pose = SegmentRegistration.matrix(observation.cameraToWorld.map(Float.init)), SegmentRegistration.rigid(pose) else {
                 throw failure("Coordinate world, source segment identity, or camera pose is invalid; already corrected inputs are not supported.")

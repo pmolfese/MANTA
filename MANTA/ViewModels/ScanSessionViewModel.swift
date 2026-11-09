@@ -897,23 +897,24 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     func finalizeElectrodeDetection() async {
-        do { try CaptureMotionPolicy.requireStationary(session.captureObservations.map(\.quality)) }
-        catch { statusMessage = error.localizedDescription; return }
         guard !scanViewModel.motionStopped else { statusMessage = scanViewModel.motionMessage; return }
 
         await finishCaptureWrites()
         guard captureSaveError == nil else { return }
+        let admitted = CaptureMotionPolicy.metricFrames(session.captureObservations, quality: \.quality)
+        do { try CaptureMotionPolicy.requireStationary(admitted.map(\.quality)) }
+        catch { statusMessage = error.localizedDescription; return }
         guard session.layout.hasElectrodeNet else {
             statusMessage = "Select an electrode net before running electrode detection."
             return
         }
         isDetecting = true
-        statusMessage = "Finalizing electrode detection across all captured frames..."
+        statusMessage = "Finalizing electrode detection across trusted and realigned frames..."
         let startedAt = Date()
 
         let context = DetectionContext(
             layout: session.layout,
-            observations: session.captureObservations,
+            observations: admitted,
             frameProvider: makeFrameProvider()
         )
 
@@ -926,7 +927,7 @@ final class ScanSessionViewModel: ObservableObject {
             } else {
                 statusMessage = "Finalized \(session.detectedElectrodeCount) electrodes. Review labels and landmarks next."
             }
-            writeFinalDetectionDiagnostics(startedAt: startedAt)
+            writeFinalDetectionDiagnostics(startedAt: startedAt, processedFrameIDs: admitted.map(\.id))
         } catch {
             statusMessage = "Detection failed: \(error.localizedDescription)"
         }
@@ -939,6 +940,7 @@ final class ScanSessionViewModel: ObservableObject {
 
     func setLiveDetectionEnabled(_ enabled: Bool) {
         liveDetectionEnabled = enabled && session.layout.hasElectrodeNet
+        scanViewModel.continuousNetTrackingEnabled = liveDetectionEnabled
         if liveDetectionEnabled {
             liveDetectionStatus = "Waiting for the next saved frame."
         } else {
@@ -1010,6 +1012,7 @@ final class ScanSessionViewModel: ObservableObject {
         captureWriteFailure = nil
         captureSaveError = nil
         guard ensureCaptureMetadata() else { return }
+        scanViewModel.continuousNetTrackingEnabled = session.layout.hasElectrodeNet && liveDetectionEnabled
         scanViewModel.start(captureMode: session.captureMode)
         guard scanViewModel.status.isRunning else {
             statusMessage = scanViewModel.status.message
@@ -1049,12 +1052,12 @@ final class ScanSessionViewModel: ObservableObject {
     }
 
     func runReconstruction() async {
-        do { try CaptureMotionPolicy.requireStationary(session.captureObservations.map(\.quality)) }
-        catch { statusMessage = error.localizedDescription; return }
         guard !scanViewModel.motionStopped else { statusMessage = scanViewModel.motionMessage; return }
 
         await finishCaptureWrites()
         guard captureSaveError == nil else { return }
+        do { try CaptureMotionPolicy.requireObjectCaptureCompatible(session.captureObservations.map(\.quality)) }
+        catch { statusMessage = error.localizedDescription; return }
         guard session.captureMode.usesPhotogrammetry else {
             statusMessage = "Switch to Photogrammetry or Both to reconstruct a model."
             return
@@ -1844,6 +1847,7 @@ final class ScanSessionViewModel: ObservableObject {
     ) {
         guard !scanViewModel.motionStopped,
               observation.quality?.motionAssessment?.state != .insufficientEvidence,
+              observation.quality?.motionAssessment?.state != .suspected,
               session.captureMode.usesLiDAR,
               observation.rawDepthFilename != nil,
               let bounds = session.headBoundingBox,
@@ -1884,7 +1888,7 @@ final class ScanSessionViewModel: ObservableObject {
         }
         liveOCRCandidateCount += 1
         let isStill = observation.quality?.captureSource == "high-resolution-still"
-        guard isStill || observation.quality?.recaptureTargetLabel != nil || liveOCRCandidateCount % 3 == 1 else { return }
+        guard scanViewModel.continuousNetTrackingEnabled || isStill || observation.quality?.recaptureTargetLabel != nil || liveOCRCandidateCount % 3 == 1 else { return }
         if liveDetectionTask != nil {
             if pendingLiveObservation?.quality?.captureSource == "high-resolution-still" && !isStill { return }
             // Coalesce under load: raw capture keeps every sample, while live OCR
@@ -1924,6 +1928,7 @@ final class ScanSessionViewModel: ObservableObject {
             if let error = outcome.1 {
                 self.liveDetectionStatus = "Live OCR skipped a frame: \(error)"
             } else {
+                self.scanViewModel.observeNetLandmarks(outcome.0.trackingLandmarks, observation: observation)
                 self.liveRawDetections.append(contentsOf: outcome.0.detections)
                 self.liveLabelCoverage.ingest(outcome.0.sightings, observationID: observation.id, pose: observation.cameraTransform)
                 self.liveProcessedFrameIDs.append(observation.id)
@@ -1996,7 +2001,7 @@ final class ScanSessionViewModel: ObservableObject {
         _ = try? artifactStore.writeDetectionDiagnostics(diagnostics, for: session)
     }
 
-    private func writeFinalDetectionDiagnostics(startedAt: Date) {
+    private func writeFinalDetectionDiagnostics(startedAt: Date, processedFrameIDs: [UUID]) {
         guard let artifactStore else { return }
         let direct = session.electrodes.filter { $0.confidence > 0 }
         let positions = Dictionary(uniqueKeysWithValues: direct.map {
@@ -2009,7 +2014,7 @@ final class ScanSessionViewModel: ObservableObject {
         let diagnostics = DetectionRunDiagnostics(
             id: UUID(), mode: .finalized, startedAt: startedAt, completedAt: Date(),
             engine: "manta-vision-ocr-depth-full-session", engineVersion: "1",
-            processedFrameIDs: session.captureObservations.map(\.id),
+            processedFrameIDs: processedFrameIDs,
             rawDetectionCount: nil,
             directlyLocalizedElectrodeCount: direct.count,
             templatePredictedElectrodeCount: session.electrodes.filter { $0.confidence == 0 }.count,

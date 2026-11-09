@@ -139,8 +139,9 @@ nonisolated enum ReceiverElectrodeDetector {
         modelMesh: ReceiverTriangleMesh?,
         progress: Progress? = nil
     ) throws -> ReceiverElectrodeDetectionResult {
-        try CaptureMotionPolicy.requireStationary(bundle.capture.observations.map(\.quality))
-        let frames = bundle.capture.observations.filter {
+        let admitted = CaptureMotionPolicy.metricFrames(bundle.capture.observations, quality: \.quality)
+        try CaptureMotionPolicy.requireStationary(admitted.map(\.quality))
+        let frames = admitted.filter {
             imagePath(for: $0) != nil
                 && $0.intrinsics.count == 9 && $0.cameraToWorld.count == 16
         }
