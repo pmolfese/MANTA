@@ -220,11 +220,29 @@ public struct MANTAFileEntry: Codable, Equatable, Sendable {
         self.size = size
         self.sha256 = sha256
     }
+
+    private enum CodingKeys: String, CodingKey { case path, mediaType, role, size, sha256 }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        path = try values.decode(String.self, forKey: .path)
+        mediaType = try values.decode(String.self, forKey: .mediaType)
+        role = try values.decode(String.self, forKey: .role)
+        size = try values.decode(Int64.self, forKey: .size)
+        // Legacy/working packages may omit checksums. A malformed checksum is
+        // advisory too; it must not make otherwise readable metadata undecodable.
+        if !values.contains(.sha256) || (try? values.decodeNil(forKey: .sha256)) == true {
+            sha256 = ""
+        } else {
+            sha256 = (try? values.decode(String.self, forKey: .sha256)) ?? "<invalid checksum encoding>"
+        }
+    }
 }
 
 public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     public var schema: String
     public var schemaVersion: String
+    public var capturePasses: [CapturePassArchive]?
     public var sessionID: UUID
     public var captureMode: String
     public var layoutID: String
@@ -250,8 +268,10 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
         observations: [MANTACaptureObservation],
         fiducials: [MANTAFiducialSolution]? = nil,
         electrodes: [MANTAElectrodeSolution]? = nil,
-        reconstruction: MANTAReconstructionReference? = nil
+        reconstruction: MANTAReconstructionReference? = nil,
+        capturePasses: [CapturePassArchive]? = nil
     ) {
+        self.capturePasses = capturePasses
         self.schema = schema
         self.schemaVersion = schemaVersion
         self.sessionID = sessionID
@@ -267,7 +287,7 @@ public struct MANTACaptureDocument: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case schemaVersion, sessionID, captureMode, layoutID, coordinateSystems, observations
-        case fiducials, electrodes, reconstruction
+        case fiducials, electrodes, reconstruction, capturePasses
     }
 }
 
@@ -324,10 +344,11 @@ public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
     public var coordinate: [Double]
     public var confidence: Double
     public var state: String
+    public var provenance: CoordinateProvenance?
 
     public init(
         label: String, role: String, coordinateSystem: String,
-        coordinate: [Double], confidence: Double, state: String
+        coordinate: [Double], confidence: Double, state: String, provenance: CoordinateProvenance? = nil
     ) {
         self.label = label
         self.role = role
@@ -335,6 +356,7 @@ public struct MANTAElectrodeSolution: Codable, Equatable, Sendable {
         self.coordinate = coordinate
         self.confidence = confidence
         self.state = state
+        self.provenance = provenance
     }
 }
 

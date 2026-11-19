@@ -12,6 +12,7 @@ import Testing
 import simd
 @testable import MANTA
 
+@MainActor
 struct LiDARMeshSnapshotIOTests {
     private func makeStore() throws -> CaptureArtifactStore {
         let root = FileManager.default.temporaryDirectory

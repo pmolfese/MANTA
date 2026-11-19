@@ -18,7 +18,9 @@ struct SessionLibraryView: View {
     @ObservedObject var viewModel: ScanSessionViewModel
     @Environment(\.dismiss) private var dismiss
 
-    @State private var newSubject = ""
+    var allowsNewSession = true
+    var onSessionOpened: (() -> Void)?
+    var onDone: (() -> Void)?
     @State private var renameTarget: SessionSummary?
     @State private var renameText = ""
 
@@ -32,17 +34,14 @@ struct SessionLibraryView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("New session") {
-                    HStack {
-                        TextField("Subject / MRN (optional)", text: $newSubject)
-                            .textInputAutocapitalization(.characters)
-                        Button("Start") {
-                            let label = newSubject.trimmingCharacters(in: .whitespacesAndNewlines)
-                            viewModel.startNewSession(subjectLabel: label.isEmpty ? nil : label)
-                            newSubject = ""
-                            dismiss()
+                if allowsNewSession {
+                    Section("New session") {
+                        Button("Start New Session") {
+                            if viewModel.startNewSession() { finishOpening() }
                         }
-                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("libraryStartNewSession")
+                        Text("You can add a label later using Rename on a saved session.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
 
@@ -51,17 +50,17 @@ struct SessionLibraryView: View {
                         ContentUnavailableView(
                             "No saved sessions",
                             systemImage: "person.crop.rectangle.stack",
-                            description: Text("Start a new session, then sample frames to save it here.")
+                            description: Text("New sessions appear here as soon as you start them.")
                         )
                     } else {
                         ForEach(viewModel.sessionSummaries) { summary in
                             Button {
-                                viewModel.openSession(id: summary.id)
-                                dismiss()
+                                if viewModel.openSession(id: summary.id) { finishOpening() }
                             } label: {
                                 SessionRow(summary: summary, isCurrent: summary.id == viewModel.session.id)
                             }
                             .buttonStyle(.plain)
+                            .accessibilityIdentifier(summary.id == viewModel.session.id ? "openCurrentSession" : "openSession-\(summary.id)")
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 Button(role: .destructive) {
                                     viewModel.deleteSession(id: summary.id)
@@ -114,11 +113,16 @@ struct SessionLibraryView: View {
                         }
                     }
                 }
+                if let error = viewModel.captureSaveError {
+                    Section("Save needs attention") { Text(error).foregroundStyle(.red) }
+                }
             }
             .navigationTitle("Subjects")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button(onDone == nil ? "Done" : "Back") {
+                        if let onDone { onDone() } else { dismiss() }
+                    }
                 }
             }
             .onAppear { viewModel.refreshSessions() }
@@ -141,6 +145,10 @@ struct SessionLibraryView: View {
                 }
             }
         }
+    }
+
+    private func finishOpening() {
+        if let onSessionOpened { onSessionOpened() } else { dismiss() }
     }
 
     private var renameIsPresented: Binding<Bool> {
@@ -171,6 +179,9 @@ private struct SessionRow: View {
                 HStack(spacing: 10) {
                     Label("\(summary.observationCount)", systemImage: "camera")
                     Label("\(summary.detectedElectrodeCount)", systemImage: "dot.circle")
+                    if summary.endedAt != nil {
+                        Label("Ended", systemImage: "checkmark.circle")
+                    }
                     if summary.hasReconstructedModel {
                         Label("Model", systemImage: "cube.transparent")
                     }
@@ -215,3 +226,41 @@ struct ShareSheet: View {
     var body: some View { EmptyView() }
 }
 #endif
+
+/// Shown on launch and again if the active session is deleted.
+struct SessionStartupView: View {
+    @ObservedObject var viewModel: ScanSessionViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showExisting = false
+
+    var body: some View {
+        if showExisting {
+            SessionLibraryView(viewModel: viewModel, allowsNewSession: false,
+                               onSessionOpened: { dismiss() },
+                               onDone: { showExisting = false })
+        } else {
+            NavigationStack {
+                VStack(spacing: 20) {
+                    Text("Start a session now. Add a label whenever you’re ready.")
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("Start New Session") {
+                        if viewModel.startNewSession() { dismiss() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("startNewSession")
+                    Button("Open Existing") { showExisting = true }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("openExistingSession")
+                    if let error = viewModel.captureSaveError {
+                        Text(error).foregroundStyle(.red)
+                    }
+                }
+                .controlSize(.large)
+                .padding(32)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("MANTA Session")
+            }
+        }
+    }
+}

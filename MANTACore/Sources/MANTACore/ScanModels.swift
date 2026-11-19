@@ -42,6 +42,18 @@ public enum AnnotationState: String, CaseIterable, Codable, Identifiable, Sendab
     public var id: String { rawValue }
 }
 
+/// Acquisition origin is independent of review state. Nil in older records means unknown.
+public enum CoordinateProvenance: String, Codable, Sendable {
+    case imageDepthObserved
+    case imageMeshObserved
+    case visualLayoutAssigned
+    case templateInferred
+    case manualPlacement
+    case synthetic
+
+    public var isDirectMeasurement: Bool { self == .imageDepthObserved || self == .imageMeshObserved }
+}
+
 public struct ElectrodeAnnotation: Identifiable, Codable, Equatable, Hashable, Sendable {
     public var id: UUID
     public var label: String
@@ -49,9 +61,10 @@ public struct ElectrodeAnnotation: Identifiable, Codable, Equatable, Hashable, S
     public var coordinate: Coordinate3D
     public var confidence: Double
     public var state: AnnotationState
+    public var provenance: CoordinateProvenance?
     public init(
         id: UUID = UUID(), label: String, role: ElectrodeRole, coordinate: Coordinate3D,
-        confidence: Double, state: AnnotationState
+        confidence: Double, state: AnnotationState, provenance: CoordinateProvenance? = nil
     ) {
         self.id = id
         self.label = label
@@ -59,6 +72,7 @@ public struct ElectrodeAnnotation: Identifiable, Codable, Equatable, Hashable, S
         self.coordinate = coordinate
         self.confidence = confidence
         self.state = state
+        self.provenance = provenance
     }
 }
 
@@ -144,6 +158,7 @@ public struct FiducialPlacementEvidence: Identifiable, Codable, Equatable, Hasha
 /// technical capture can begin immediately and be annotated as details become
 /// available without inventing placeholder values.
 public struct AcquisitionContext: Codable, Equatable, Hashable, Sendable {
+    public var captureReview: CaptureReviewRecord?
     public var site: String?
     public var operatorID: String?
     public var netModel: String?
@@ -155,13 +170,22 @@ public struct AcquisitionContext: Codable, Equatable, Hashable, Sendable {
     public var capCondition: String?
     public var participantFactors: String?
     public var notes: String?
+    public var pairedReferenceSessionID: String?
+    public var acquisitionOrder: String?
+    public var netMovementNotes: String?
+    public var coordinateTarget: String?
+    public var referenceExportConfirmed: Bool?
+    public var repeatCaptureConfirmed: Bool?
 
     public init(
         site: String? = nil, operatorID: String? = nil, netModel: String? = nil,
         netIdentifier: String? = nil, capSize: String? = nil,
         acquisitionEquipment: String? = nil, deviceSetup: String? = nil,
         lighting: String? = nil, capCondition: String? = nil,
-        participantFactors: String? = nil, notes: String? = nil
+        participantFactors: String? = nil, notes: String? = nil,
+        pairedReferenceSessionID: String? = nil, acquisitionOrder: String? = nil,
+        netMovementNotes: String? = nil, coordinateTarget: String? = nil,
+        referenceExportConfirmed: Bool? = nil, repeatCaptureConfirmed: Bool? = nil
     ) {
         self.site = site
         self.operatorID = operatorID
@@ -174,6 +198,12 @@ public struct AcquisitionContext: Codable, Equatable, Hashable, Sendable {
         self.capCondition = capCondition
         self.participantFactors = participantFactors
         self.notes = notes
+        self.pairedReferenceSessionID = pairedReferenceSessionID
+        self.acquisitionOrder = acquisitionOrder
+        self.netMovementNotes = netMovementNotes
+        self.coordinateTarget = coordinateTarget
+        self.referenceExportConfirmed = referenceExportConfirmed
+        self.repeatCaptureConfirmed = repeatCaptureConfirmed
     }
 }
 
@@ -290,6 +320,10 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
     public var name: String
     public var createdAt: Date
     public var subjectLabel: String?
+    /// Explicit acquisition completion; nil for active and legacy sessions.
+    public var endedAt: Date?
+    public var captureRoute: CaptureRouteProgress?
+    public var capturePasses: [CapturePassArchive]?
     public var captureMode: CaptureMode
     public var layout: ElectrodeLayout
     public var fiducials: [FiducialAnnotation]
@@ -325,12 +359,14 @@ public struct ScanSession: Identifiable, Codable, Equatable, Sendable {
         headBoundingBox: HeadBoundingBox? = nil,
         lastRawExportedBundleID: UUID? = nil,
         acquisitionContext: AcquisitionContext? = nil,
-        fiducialPlacementEvidence: [FiducialPlacementEvidence]? = nil
+        fiducialPlacementEvidence: [FiducialPlacementEvidence]? = nil,
+        endedAt: Date? = nil
     ) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
         self.subjectLabel = subjectLabel
+        self.endedAt = endedAt
         self.captureMode = captureMode
         self.layout = layout
         self.fiducials = fiducials

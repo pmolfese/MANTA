@@ -72,7 +72,7 @@ struct MANTAArchiveImporterTests {
         }
     }
 
-    @Test func rejectsCRCFailure() throws {
+    @Test func importsCRCFailureWithWarnings() throws {
         let asset = temporaryURL()
         try Data("camera-bytes".utf8).write(to: asset)
         let archive = try makeArchive(files: [
@@ -87,9 +87,10 @@ struct MANTAArchiveImporterTests {
         data[range.lowerBound] ^= 0xff
         try data.write(to: archive)
 
-        #expect(throws: MANTAArchiveImportError.checksumMismatch("assets/camera.jpg")) {
-            try MANTAArchiveImporter().importBundle(at: archive, to: temporaryURL())
-        }
+        let bundle = try MANTAArchiveImporter().importBundle(at: archive, to: temporaryURL())
+        #expect(bundle.integrityWarnings.contains { $0.kind == .archiveChecksumMismatch && $0.path == "assets/camera.jpg" })
+        #expect(bundle.integrityWarnings.contains { $0.kind == .checksumMismatch && $0.path == "assets/camera.jpg" })
+        #expect(FileManager.default.fileExists(atPath: bundle.rootDirectory.appendingPathComponent("assets/camera.jpg").path))
     }
 
     @Test func enforcesConfiguredExtractionLimit() throws {

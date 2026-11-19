@@ -3,6 +3,8 @@ import Foundation
 public enum ElectrodeExportFormat: String, CaseIterable, Identifiable, Sendable {
     case csv = "CSV"
     case sfp = "SFP"
+    case sfpCentimeters = "SFP (centimeters)"
+    case geoScanTXT = "GeoScan-style TXT (centimeters)"
     case elp = "ELP"
     case bidsElectrodesTSV = "BIDS electrodes.tsv"
     case egiCoordinatesXML = "EGI coordinates.xml"
@@ -15,6 +17,8 @@ public struct ElectrodeExporters {
         switch format {
         case .csv: csv(session)
         case .sfp: sfp(session)
+        case .sfpCentimeters: sfp(session, outputUnit: .centimeters)
+        case .geoScanTXT: geoScanTXT(session)
         case .elp: elp(session)
         case .bidsElectrodesTSV: bidsElectrodesTSV(session)
         case .egiCoordinatesXML: egiCoordinatesXML(session)
@@ -23,7 +27,7 @@ public struct ElectrodeExporters {
 
     public static func csv(_ session: ScanSession) -> String {
         let unit = session.coordinateSpace.unit.rawValue
-        let header = "label,x,y,z,unit,coordinate_frame,role,state,confidence"
+        let header = "label,x,y,z,unit,coordinate_frame,role,state,confidence,provenance"
         let rows = session.electrodes.map { electrode in
             [
                 electrode.label,
@@ -34,26 +38,45 @@ public struct ElectrodeExporters {
                 session.coordinateSpace.frame.rawValue,
                 electrode.role.rawValue,
                 electrode.state.rawValue,
-                String(format: "%.3f", electrode.confidence)
+                String(format: "%.3f", electrode.confidence),
+                electrode.provenance?.rawValue ?? "unknown"
             ].joined(separator: ",")
         }
         return ([header] + rows).joined(separator: "\n")
     }
 
-    /// MNE-oriented SFP. SFP cannot declare units, so MANTA always writes meters.
-    public static func sfp(_ session: ScanSession) -> String {
+    /// SFP cannot declare units. Existing callers default to meters; select cm explicitly.
+    public static func sfp(_ session: ScanSession, outputUnit: DistanceUnit = .meters) -> String {
         let fiducials = session.fiducials.compactMap { fiducial -> String? in
             guard fiducial.kind.isCardinal, let coordinate = fiducial.coordinate else { return nil }
             return sfpRow(
                 label: sfpFiducialLabel(fiducial.kind), coordinate: coordinate,
-                sourceUnit: session.coordinateSpace.unit)
+                sourceUnit: session.coordinateSpace.unit, outputUnit: outputUnit)
         }
         let electrodes = session.electrodes.map {
             sfpRow(
                 label: $0.label, coordinate: $0.coordinate,
-                sourceUnit: session.coordinateSpace.unit)
+                sourceUnit: session.coordinateSpace.unit, outputUnit: outputUnit)
         }
         return (fiducials + electrodes).joined(separator: "\n")
+    }
+
+    /// GeoScan-style syntax, in cm and the session's declared frame. Review state
+    /// does not prove direct measurement; only explicit image/depth or image/mesh provenance
+    /// produces Estimated=0. Older records remain unverified.
+    public static func geoScanTXT(_ session: ScanSession) -> String {
+        let fiducials = session.fiducials.compactMap { fiducial -> GeoScanTextPoint? in
+            guard fiducial.kind.isCardinal, let point = fiducial.coordinate else { return nil }
+            return GeoScanTextPoint(label: sfpFiducialLabel(fiducial.kind), coordinate: point)
+        }
+        let electrodes = session.electrodes.filter { $0.state != .missing }.map {
+            GeoScanTextPoint(label: $0.label, coordinate: $0.coordinate,
+                             isEstimated: $0.provenance?.isDirectMeasurement != true)
+        }
+        return GeoScanTextExporter.export(
+            fiducials + electrodes, sourceUnit: session.coordinateSpace.unit,
+            coordinateFrame: session.coordinateSpace.frame.rawValue,
+            labellingTemplate: "hydrocel_\(session.layout.channelCount).xml")
     }
 
     /// BESA channel spherical-coordinate ELP: `EEG <label> <theta> <phi>`.
@@ -142,9 +165,9 @@ public struct ElectrodeExporters {
     }
 
     private static func sfpRow(
-        label: String, coordinate: Coordinate3D, sourceUnit: DistanceUnit
+        label: String, coordinate: Coordinate3D, sourceUnit: DistanceUnit, outputUnit: DistanceUnit
     ) -> String {
-        let meters = coordinate.converted(from: sourceUnit, to: .meters)
+        let meters = coordinate.converted(from: sourceUnit, to: outputUnit)
         return [
             label, sfpCoordinateString(meters.x), sfpCoordinateString(meters.y),
             sfpCoordinateString(meters.z)

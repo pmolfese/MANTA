@@ -60,8 +60,12 @@ Archive readers must reject:
 
 Extraction is streamed through bounded buffers into a private partial
 directory. The partial directory is deleted on any error and is moved to its
-requested destination only after manifest, size, SHA-256, lineage, and capture
-validation succeeds. Default reader limits are 10,000 entries, 16 GiB archive
+requested destination after structural manifest, lineage, and capture validation
+succeeds. SHA-256, ZIP CRC, and manifest byte-count discrepancies are advisory:
+import succeeds and retains warnings for the user. Missing or malformed SHA-256
+values also warn instead of rejecting readable data. Invalid paths, unsupported
+archive structures, truncated payloads, and undecodable required metadata still
+fail because the data cannot be safely or meaningfully loaded. Default reader limits are 10,000 entries, 16 GiB archive
 and expanded totals, 8 GiB per entry, and a 200:1 expansion ratio; applications
 may impose tighter limits.
 
@@ -97,13 +101,26 @@ may impose tighter limits.
    └─ <review-uuid>.json
 ```
 
-MANTA exposes two package roles. **RAW** is the immutable acquisition ZIP and is
-never modified. **PROCESSED** is one editable directory package for that session.
-The first saved reconstruction, review, or solve promotes the Receiver's existing
-extracted RAW workspace into PROCESSED, gives it a stable `bundleID`, and records
-RAW as `parentBundleID`. Later macOS edits atomically replace only the assets or
-JSON they changed and append to `log_manta.json`. PROCESSED is intentionally not
-re-zipped, fully re-hashed, or RAW-validated after each edit.
+MANTA preserves original acquisition files and stores Receiver results in
+`derivatives/receiver/` inside the same capture folder. The effective processed
+`capture.json`, `manifest.json`, `processed.json`, `log_manta.json`, reconstructed
+models, regenerated head crops, alignment diagnostics, and electrode evidence all
+live there. Their asset paths are relative to the original capture root, so images,
+depth, and original meshes are reused without copying. The first saved edit gets a
+new stable bundle ID with the source bundle as its parent. Subsequent edits retain
+that identity and append changes. Per-file replacement is atomic; a multi-file edit
+is not a transaction. Legacy root-level PROCESSED packages remain readable, but new
+edits migrate to the derivative paths without rewriting their original files.
+
+Native iPad working folders (`session.json` plus observation checkpoints) open in
+place. Receiver creates a small canonical index in `derivatives/acquisition/` and
+hashes referenced source files once. These hashes establish a first-Mac-read
+baseline; they do not independently verify acquisition quality or pre-transfer
+integrity. Reopening verifies that baseline and rejects acquisition metadata that
+changed since indexing. The index retains a stable source bundle ID. Root RAW
+validation permits the reserved `derivatives/` directory without adding its outputs
+to the protected manifest; undeclared files elsewhere still fail validation.
+Legacy ZIP captures still require extraction to a selected destination.
 
 The iPhone/iPad UI uses **Export**, not Save As. Export finalizes the current
 working session as a new immutable `.manta`, including any newly applied model
@@ -168,7 +185,9 @@ Rules:
 - UUIDs use lowercase canonical hyphenated strings on write; readers may accept
   uppercase.
 - Dates use RFC 3339 UTC with fractional seconds.
-- SHA-256 is computed over each file's exact uncompressed bytes.
+- SHA-256 is computed over each file's exact uncompressed bytes. Readers report
+  mismatches or unavailable checksums without blocking import; writers continue
+  to record checksums for finalized RAW payloads.
 - `manifest.json` is not listed in `files`, avoiding a recursive self-hash.
 - A transport may hash/sign the complete archive separately.
 - Paths are relative, normalized, case-sensitive, and unique.
@@ -193,7 +212,8 @@ PROCESSED bundle includes both; they must agree with the IDs inside
 
 RAW manifests list and hash every protected file. PROCESSED still lists its
 working files for discovery, but modified entries do not carry an integrity
-promise and are not fed back through the RAW validator. A lightweight load checks
+promise. Processing-index validation checks referenced files and structure while
+allowing native acquisition sidecars. A lightweight load checks
 that the package, manifest, capture, and change-log IDs agree. Each update retains
 prior change records and appends the new operation before replacing only the
 changed files.
@@ -415,8 +435,21 @@ lineage and a change-log entry describing the migration.
 
 ## Integrity versus authenticity
 
-Per-file SHA-256 detects corruption and incomplete transfer but does not prove
-who created the bundle. A later security profile should add a detached digital
+Per-file SHA-256 can reveal changed bytes or incomplete transfer but does not prove
+who created the bundle. Import-time scans use 64 KiB reads and warnings rather than
+rejection. Receiver lists import warnings; the reconstruction CLI prints them.
+Mutable PROCESSED packages may intentionally have unrecorded checksums; these are
+reported as unverified, not as proven corruption. Ordinary edits do not rescan the
+whole package, and finalization/recovery avoid rehashing freshly hashed payloads.
+Directory packages remain directories; the integrity scan does not zip, rewrite,
+or duplicate their payloads. A sparse file exceeding 2 GiB is covered by regression
+tests, including a known nonzero tail beyond the 2 GiB boundary.
+
+Checksums do not repair corrupted data or guarantee a downstream image/mesh decoder
+can use it. Unsupported ZIP64/compression variants remain outside the legacy ZIP
+reader's capabilities; these changes do not introduce a new archive format.
+
+A checksum does not prove who created the bundle. A later security profile should add a detached digital
 signature over a canonical manifest representation or an archive digest. Do not
 describe an unsigned hash list as tamper-proof.
 
@@ -465,3 +498,163 @@ Before schema 1.0.0 is frozen, add:
   scaling.
 - Whether downstream EGI tools impose additional requirements beyond the
   captured `coordinates_mff` dialect and fixture.
+
+### Coordinate origin and paired validation metadata
+
+Electrode annotations and solved electrode records may include optional
+`provenance`, independent of `state`: `imageDepthObserved`,
+`visualLayoutAssigned`, `templateInferred`, `manualPlacement`, or `synthetic`.
+Absent provenance means unknown; decoding an older Reviewed/Detected record
+never invents an observation origin. Review-only changes retain provenance;
+manual replacement of a coordinate changes it to `manualPlacement`.
+
+GeoScan-style export writes Estimated=0 only for `imageDepthObserved`. All other
+origins, including unknown, use 1. This flag describes acquisition origin, not
+accuracy, label correctness, or confidence. Manually placed fiducials retain
+existing placement evidence and remain conservatively flagged in TXT. CSV also
+includes a provenance column. Coordinate-frame conversion preserves provenance.
+
+The optional acquisition context fields `pairedReferenceSessionID`,
+`acquisitionOrder`, `netMovementNotes`, and `coordinateTarget` are saved with the
+existing acquisition/context.json artifact. The iPad validation form uses
+`mantaThenGeoScan` or `geoScanThenManta` for acquisition order and
+`visibleDiscCupCenter` for the target. Empty fields remain absent. These are
+operator-entered study metadata, not evidence that a paired scan took place.
+
+The video-format-selected acquisition event additionally records device hardware
+identifier, OS/build, app version/build, and coordinate target alongside requested
+camera size/FPS and depth settings. Existing per-frame pose, calibration,
+orientation, tracking, and image-quality records remain the acquisition evidence.
+
+### Receiver evidence version 4: RGB-only localization
+
+Electrode provenance additionally supports `imageMeshObserved` for an image
+observation localized on an aligned reconstruction. Like image/depth observations,
+it is a directly observed image feature, not a template-filled position; this
+origin does not establish absolute measurement accuracy.
+
+Receiver electrode evidence version 4 adds optional `depthSource` to localized
+OCR and unlabeled cup evidence (`alignedMesh` or `sceneDepth`). The existing
+`depthMeters` is optical-axis depth and `depthPoint` is world position for either
+source. Mesh points use 0 in the legacy depth-confidence field, with source-aware
+weighting; no LiDAR confidence is fabricated. Older missing source fields retain
+legacy depth interpretation.
+
+`unlocalizedObservations` retains observation IDs, native-image points, calibrated
+ray origins/directions, OCR text/candidate labels/confidences and bounding boxes
+where present, and a reason localization failed. These records have no world
+coordinate and never enter scientific coordinate exports. All original images
+remain available for offline re-detection. Evidence-only runs keep pre-existing
+coordinates and require Save Sensors to persist, like other Receiver drafts.
+
+### Optional acquisition motion evidence (A3)
+
+`quality.motionAssessment` optionally records `segmentID` (UUID), `state`
+(`unassessed`, `insufficientEvidence`, `consistent`, or `suspected`), and optional
+`residualMeters` / `overlapFraction`. Missing fields in older captures remain unknown.
+These are advisory consistency measurements, not head transforms or corrected poses.
+A3 uses one segment per pass and requires a new session following suspected movement.
+Known suspect or multiple-segment inputs are rejected by automatic processing pending
+review/registration; RAW evidence remains readable and exportable.
+
+Working folders may contain `acquisition/motion-stop.json` (a JSONEncoder Date).
+The shared loader applies this durable marker to recovered observations with motion
+metadata, including checkpoints newer than `session.json`. The export carries the
+resulting state in observation quality; the marker is a working-folder recovery aid.
+
+### Optional A4 capture and live-label evidence
+
+`quality.captureSource` records the frame source (for example `high-resolution-still`,
+`current-frame`, `best-window-frame`, or `cadence-comparison`). Older records omit it.
+Advisory JSON files under `acquisition/live-labels/<UUID>.json` have `observationID`
+and `sightings` containing `label`, `confidence`, `imageX`, `imageY`, and `ambiguous`.
+Coordinates are native image pixels. These are OCR sightings, not 3D measurements
+or final electrode identities. The optional manifest role is `live-label-evidence`.
+
+### Optional A5 review and recapture metadata
+
+`quality.guidedView` is an operator-assigned `front`, `left`, `right`, `back`, or `top`
+view; left/right refer to the participant. `quality.recaptureTargetLabel` records the
+operator's intended electrode target and must never be treated as an OCR result.
+General/automatic photos omit these fields. Tags do not change pose or calibration.
+
+Acquisition context may contain `captureReview`: review time, saved-observation and
+processed-live-frame counts, missing view tags, unread/ambiguous/single-view label
+lists, and `motionFlagged`. This is an advisory snapshot, not a release or accuracy
+certificate. New evidence invalidates it. Legacy captures omit these optional fields.
+
+H1/H2 add optional `captureReview.geometry`: observation/depth/confidence counts,
+blur-warning and unknown-sharpness counts, consistent/unknown/suspect motion counts,
+head-region presence, recorded head-crop/full-mesh references, and optional
+`viewSectorCount` (unknown when no head region exists). View sectors describe camera
+positions around the chosen head center in capture-world axes, not surface area or
+anatomical completeness. Recorded files require separate receipt validation. Region
+edits invalidate prior review/crop/export references; raw frames and the full mesh
+remain intact. GeoScan-related legacy acquisition fields stay readable/exportable,
+but no GeoScan controls or reminders appear in iPad collection.
+
+### Optional A6 derived segment correction
+
+`quality.motionCorrection` records `runID`, `sourceBundleID`, `sourceSegmentID`,
+`referenceSegmentID`, `referenceFromSource`, `sourceFromReference`,
+`originalCameraToWorld`, and `method`. Matrices are column-major 4×4; coordinates
+use meters. Direction is explicit:
+
+```
+derivedCameraToWorld = referenceFromSource * originalCameraToWorld
+sourcePoint = sourceFromReference * referencePoint
+```
+
+The current method is `reviewed-stable-segment-rigid-v1-uncalibrated`. The original
+`motionAssessment`, including a suspect flag, stays unchanged. Processing accepts
+corrections only when all frames have valid correction records from one run/reference
+and each source segment has one consistent rigid transform. Structural validation
+checks that the actual camera pose agrees with the recorded original and transform.
+Missing, partial, or malformed corrections do not clear the movement guard.
+Object Capture has a separate guard: corrected captures remain ineligible until
+foreground masking and pose handling are validated.
+
+`recovery/registration.json` stores acceptance, residuals/overlap, rejected frame IDs,
+source capture/manifest hashes, integrity warnings, and explicitly uncalibrated
+confidence. `recovery/request.json` stores the reviewed selection, bounds, and matched
+landmarks. The first source is `parentBundleID`; the report identifies every source.
+The canonical reference-head frame uses `arkit-world` in the derived document for
+compatibility, with its definition in the coordinate-system description. Original
+metadata and selected raw assets are copied under `sources/`; source meshes,
+fiducials, electrode solutions, and coverage are not implicitly transformed/reused.
+See [recovery workflow and limitations](SEGMENT_RECOVERY.md).
+
+### Optional live motion correction
+
+`quality.liveMotionCorrection` records `referenceSegmentID`,
+`referenceFromWorld`, `originalCameraToWorld`, `validatedFrameCount`, and `method`
+(`automatic-rigid-withheld-frames-v1`). Matrices are column-major 4×4, in meters.
+The observation camera pose is already corrected:
+
+```
+cameraToWorld = referenceFromWorld * originalCameraToWorld
+```
+
+Consumers must not apply the transform a second time. RGB and depth remain in
+original camera-local coordinates; image orientation uses the original pose.
+Bundle validation checks rigid matrices, at least three validation frames, matching
+segment identity, and consistency between the stored pose and correction.
+Live and reviewed-segment correction records cannot coexist on one observation.
+
+Accepted live frames have `motionAssessment.state = consistent`. A later explicit
+movement flag can withdraw trust without deleting the correction provenance.
+Held frames remain in raw capture with their original poses and are not relabeled
+retroactively. Metric processing may omit held frames from a segment containing
+valid live recovery; unrelated segments still require their own registration.
+Live corrections require independent masked image reconstruction for Object
+Capture. Older captures without this optional field retain existing behavior.
+
+The live correction method `net-anchored-continuous-rigid-v1` additionally records
+`trackedLabelCount` (at least four) and `landmarkTimestamp` (AR monotonic seconds).
+The landmark timestamp must be no later than `quality.arFrameTimestamp` and at most
+three seconds earlier. Three pose observations establish continuous tracking;
+subsequent frames have individually checked rigid corrections, so transforms may
+vary within a segment. The original pose remains in `originalCameraToWorld` and
+pixels remain unchanged. Validators and metric processing reject expired or
+malformed identity support. Acquisition events mark entry into continuous tracking;
+existing saved live-label sightings provide the underlying OCR identity evidence.

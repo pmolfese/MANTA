@@ -21,37 +21,15 @@ final class MANTAReceiverAppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.applicationIconImage = icon
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        do {
-            try MANTAReceiverApplicationSupport.removeAll()
-        } catch {
-            NSLog("MANTA Receiver could not clear Application Support: %@", error.localizedDescription)
-        }
-    }
 }
 
-nonisolated enum MANTAReceiverApplicationSupport {
-    static let directoryName = "MANTA Receiver"
-
-    static func removeAll(fileManager: FileManager = .default) throws {
-        let applicationSupport = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false)
-            .standardizedFileURL
-        let receiverDirectory = applicationSupport
-            .appendingPathComponent(directoryName, isDirectory: true)
-            .standardizedFileURL
-
-        // Keep the deletion rigidly scoped to this application's own support
-        // directory. Never remove the shared Application Support directory.
-        guard receiverDirectory.deletingLastPathComponent() == applicationSupport,
-              receiverDirectory.lastPathComponent == directoryName,
-              fileManager.fileExists(atPath: receiverDirectory.path) else { return }
-        try fileManager.removeItem(at: receiverDirectory)
-    }
-}
+// Application Support is no longer used as scratch space: every capture lives
+// entirely in its own package folder, wherever the user keeps it, and edits
+// happen in place there. Nothing is written to Application Support during
+// normal operation, so there is nothing to wipe on quit. Application Support
+// is reserved for state that should persist across every capture - e.g. a
+// future trained CoreML model - which must survive app quits, not be erased
+// by them.
 
 @main
 struct MANTAReceiverApp: App {

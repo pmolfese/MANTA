@@ -219,7 +219,7 @@ public enum ElectrodeTemplateFitter {
                 label: electrode.label, role: electrode.role,
                 coordinate: Coordinate3D(
                     x: Double(predicted.x), y: Double(predicted.y), z: Double(predicted.z)),
-                confidence: 0, state: .needsReview))
+                confidence: 0, state: .needsReview, provenance: .templateInferred))
         }
         return output
     }

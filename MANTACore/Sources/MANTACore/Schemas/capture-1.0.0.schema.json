@@ -25,6 +25,18 @@
         "additionalProperties": true
       }
     },
+    "capturePasses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["segmentID", "artifactPaths"],
+        "properties": {
+          "segmentID": { "type": "string", "format": "uuid" },
+          "artifactPaths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        },
+        "additionalProperties": true
+      }
+    },
     "reconstruction": {
       "type": "object",
       "required": ["worldCoordinateSystem"],

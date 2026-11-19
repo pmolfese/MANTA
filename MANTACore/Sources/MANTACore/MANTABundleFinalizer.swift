@@ -101,6 +101,7 @@ public struct MANTABundleFinalizer {
     public func finalize(
         _ request: MANTABundleFinalizationRequest,
         in outputDirectory: URL,
+        preferDirectoryPackage: Bool = false,
         progress: (@Sendable (Double, String) -> Void)? = nil
     ) throws -> MANTAFinalizedBundle {
         progress?(0.01, "Preparing archive")
@@ -216,8 +217,16 @@ public struct MANTABundleFinalizer {
         // SHA-256 was just computed from every staged byte above. Repeating the
         // hashes here adds a full payload pass without increasing assurance.
         _ = try MANTABundleValidator(fileManager: fileManager).validate(
-            directory: staging, verifyFileHashes: false)
+            directory: staging, verifyIntegrity: false)
         progress?(0.76, "Creating archive")
+        if preferDirectoryPackage {
+            progress?(0.90, "Saving package folder")
+            try fileManager.moveItem(at: staging, to: archiveURL)
+            shouldRemoveStaging = false
+            progress?(1.0, "Package folder created")
+            return MANTAFinalizedBundle(
+                archiveURL: archiveURL, manifest: manifest, container: .directoryPackage)
+        }
         do {
             try MANTADeterministicZIP(fileManager: fileManager).write(
                 directory: staging, to: archiveURL, precomputedCRC32: crc32ByPath)

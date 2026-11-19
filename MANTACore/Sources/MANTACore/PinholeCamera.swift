@@ -55,7 +55,8 @@ public struct PinholeCamera: Equatable, Sendable {
         let fy = intrinsics[4]      // col1.row1
         let cx = intrinsics[6]      // col2.row0
         let cy = intrinsics[7]      // col2.row1
-        guard fx != 0, fy != 0 else { return nil }
+        guard fx > 0, fy > 0, intrinsics.allSatisfy(\.isFinite),
+              transform.allSatisfy(\.isFinite) else { return nil }
 
         let cameraToWorld = simd_float4x4(
             SIMD4<Float>(transform[0], transform[1], transform[2], transform[3]),

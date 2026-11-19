@@ -1,11 +1,22 @@
 import Foundation
+import AppKit
 import MANTACore
 
 @MainActor
 final class ReceiverStore: ObservableObject {
     @Published private(set) var bundle: MANTAValidatedBundle?
+    @Published private(set) var importIntegrityWarnings = [MANTABundleIntegrityWarning]()
     @Published private(set) var importedArchiveURL: URL?
+    @Published var isCorrectingMotion = false
+    @Published private(set) var motionOriginalURL: URL?
+    @Published private(set) var motionCorrectedURL: URL?
+    private var motionAccessURLs: [URL] = []
     @Published private(set) var isImporting = false
+    @Published private(set) var importProgress: Double?
+    @Published private(set) var importStage = ""
+    @Published private(set) var importDetail: String?
+    @Published private(set) var importStartedAt: Date?
+    @Published private(set) var importingName = ""
     @Published private(set) var isReconstructing = false
     @Published private(set) var reconstructionCanCancel = false
     @Published private(set) var reconstructionProgress = 0.0
@@ -33,8 +44,12 @@ final class ReceiverStore: ObservableObject {
     private var electrodeGuessGeneration: UUID?
     private var electrodeModelMesh: ReceiverTriangleMesh?
     private var ephemeralWorkspace: URL?
+    /// Keep access alive while the opened package is used by later processing.
+    private var packageAccessURL: URL?
 
     deinit {
+        packageAccessURL?.stopAccessingSecurityScopedResource()
+        for url in motionAccessURLs { url.stopAccessingSecurityScopedResource() }
         electrodeDetectionTask?.cancel()
         electrodeGuessTask?.cancel()
         if let ephemeralWorkspace {
@@ -42,29 +57,103 @@ final class ReceiverStore: ObservableObject {
         }
     }
 
+    func rememberMotionCorrection(original: URL, corrected: URL, outputAccess: URL) {
+        for url in motionAccessURLs { url.stopAccessingSecurityScopedResource() }
+        motionAccessURLs = [original, outputAccess].filter { $0.startAccessingSecurityScopedResource() }
+        motionOriginalURL = original
+        motionCorrectedURL = corrected
+    }
+
+    var hasMotionComparison: Bool {
+        guard let root = bundle?.rootDirectory.standardizedFileURL.resolvingSymlinksInPath() else { return false }
+        return [motionOriginalURL, motionCorrectedURL].compactMap { $0?.standardizedFileURL.resolvingSymlinksInPath() }.contains(root)
+    }
+
     var supportsPhotogrammetryReconstruction: Bool {
         reconstructionRunner.isSupported
     }
 
     func importArchive(from sourceURL: URL) async {
-        guard !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
+        guard !isCorrectingMotion, !isImporting, !isReconstructing, !isApplyingAlignment, !isDetectingElectrodes,
               !isSavingElectrodes else { return }
-        let previousRoot = bundle?.rootDirectory
         isImporting = true
+        importProgress = nil
+        importStage = "Opening capture"
+        importDetail = nil
+        importStartedAt = Date()
+        importingName = sourceURL.lastPathComponent
         errorMessage = nil
 
-        let accessing = sourceURL.startAccessingSecurityScopedResource()
+        var sourceAccess = sourceURL.startAccessingSecurityScopedResource()
+        var destinationAccess = false
+        var conversionParent: URL?
         defer {
-            if accessing { sourceURL.stopAccessingSecurityScopedResource() }
+            if sourceAccess { sourceURL.stopAccessingSecurityScopedResource() }
+            if destinationAccess { conversionParent?.stopAccessingSecurityScopedResource() }
             isImporting = false
+            importProgress = nil
+            importStage = ""
+            importDetail = nil
+            importStartedAt = nil
         }
 
         do {
+            if Self.requiresConversion(sourceURL) {
+                // A dropped item grants access to itself, not to its parent.
+                // Choose the destination explicitly before creating any files.
+                importStage = "Choose a destination for archive extraction"
+                let panel = NSOpenPanel()
+                panel.title = "Save Converted MANTA Capture"
+                panel.message = "Choose a folder for the converted capture package. The original capture will stay unchanged."
+                panel.prompt = "Save Here"
+                panel.canChooseDirectories = true
+                panel.canChooseFiles = false
+                panel.canCreateDirectories = true
+                panel.allowsMultipleSelection = false
+                panel.directoryURL = sourceURL.deletingLastPathComponent()
+                guard await panel.begin() == .OK, let parent = panel.url else { return }
+                conversionParent = parent
+                destinationAccess = parent.startAccessingSecurityScopedResource()
+            }
+            let destinationParent = conversionParent
+            let updates = AsyncStream<MANTACaptureReadProgress>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let relay = Task { @MainActor in
+                for await update in updates.stream {
+                    importProgress = update.fraction
+                    importStage = update.stage
+                    importDetail = update.detail
+                }
+            }
+            let worker = Task.detached(priority: .userInitiated) {
+                defer { updates.continuation.finish() }
+                let opened = try Self.persistAndValidate(sourceURL, conversionParent: destinationParent) {
+                    updates.continuation.yield($0)
+                }
+                return (bundle: ReceiverAlignmentPolicy.applying(to: opened.bundle), archiveURL: opened.archiveURL)
+            }
+            let result: (bundle: MANTAValidatedBundle, archiveURL: URL)
+            do {
+                result = try await worker.value
+                await relay.value
+            } catch {
+                await relay.value
+                throw error
+            }
+            importProgress = nil
+            importStage = "Preparing capture viewer"
+            await Task.yield()
             clearEphemeralReconstruction()
-            let result = try await Task.detached(priority: .userInitiated) {
-                try Self.persistAndValidate(sourceURL)
-            }.value
+            packageAccessURL?.stopAccessingSecurityScopedResource()
+            packageAccessURL = nil
+            if destinationAccess {
+                packageAccessURL = conversionParent
+                destinationAccess = false
+            } else if conversionParent == nil, sourceAccess {
+                packageAccessURL = sourceURL
+                sourceAccess = false
+            }
             bundle = result.bundle
+            importIntegrityWarnings = result.bundle.integrityWarnings
             importedArchiveURL = result.archiveURL
             processedPackageURL = ReceiverProcessedPackage.isPackage(result.bundle.rootDirectory)
                 ? result.bundle.rootDirectory : nil
@@ -74,9 +163,6 @@ final class ReceiverStore: ObservableObject {
             electrodeModelMesh = nil
             electrodeDetectionProgress = 0
             electrodeDetectionStage = ""
-            if let previousRoot {
-                Self.removeImportedWorkspace(containing: previousRoot)
-            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -91,18 +177,20 @@ final class ReceiverStore: ObservableObject {
 
     func startReconstruction(
         detail: ReceiverPhotogrammetryDetail,
-        outputMode: ReceiverReconstructionOutputMode
+        outputMode: ReceiverReconstructionOutputMode,
+        inputMode: ReceiverPhotogrammetryInputMode = .imagesOnly
     ) {
-        guard !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
+        guard !isCorrectingMotion, !isImporting, !isReconstructing, !isDetectingElectrodes, !isSavingElectrodes,
               let sourceBundle = bundle else { return }
         clearEphemeralReconstruction()
         reconstructionLog.removeAll(keepingCapacity: true)
         appendReconstructionLog(
             .info,
-            "Requested \(detail.title) reconstruction · \(outputMode.rawValue).")
+            "Requested \(detail.title) reconstruction · \(outputMode.rawValue) · \(inputMode.title).")
         reconstructionTask = Task { [weak self] in
             await self?.performReconstruction(
-                bundle: sourceBundle, detail: detail, outputMode: outputMode)
+                bundle: sourceBundle, detail: detail,
+                outputMode: outputMode, inputMode: inputMode)
         }
     }
 
@@ -175,6 +263,27 @@ final class ReceiverStore: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
             alignmentStage = "Alignment export failed"
+        }
+    }
+
+    /// Saves an edited head bounding box in place. Returns whether it succeeded
+    /// so the sidebar can clear its "modified" state only on success.
+    @discardableResult
+    func updateHeadBoundingBox(_ boundingBox: HeadBoundingBox) async -> Bool {
+        guard !isApplyingAlignment, !isReconstructing, !isDetectingElectrodes,
+              !isSavingElectrodes, let sourceBundle = bundle else { return false }
+        do {
+            let updated = try await Task.detached(priority: .userInitiated) {
+                try ReceiverProcessedPackage.updateHeadBoundingBox(
+                    bundle: sourceBundle, boundingBox: boundingBox)
+            }.value
+            bundle = updated.bundle
+            importedArchiveURL = updated.packageURL
+            processedPackageURL = updated.packageURL
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -329,7 +438,8 @@ final class ReceiverStore: ObservableObject {
     private func performReconstruction(
         bundle sourceBundle: MANTAValidatedBundle,
         detail: ReceiverPhotogrammetryDetail,
-        outputMode: ReceiverReconstructionOutputMode
+        outputMode: ReceiverReconstructionOutputMode,
+        inputMode: ReceiverPhotogrammetryInputMode
     ) async {
         isReconstructing = true
         reconstructionCanCancel = true
@@ -356,8 +466,13 @@ final class ReceiverStore: ObservableObject {
         do {
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try ReceiverReconstructionWorkflow.prepare(
-                    bundle: sourceBundle, detail: detail)
+                    bundle: sourceBundle, detail: detail, inputMode: inputMode)
             }.value
+            if inputMode.usesDepth, prepared.inputMode != .depthGuided {
+                appendReconstructionLog(
+                    .warning,
+                    "Depth-guided reconstruction was requested, but no frames carried usable depth. Falling back to images-only.")
+            }
             preparation = prepared
             try Task.checkCancellation()
             updateReconstructionProgress(0.03, stage: "Prepared reconstruction inputs")
@@ -402,7 +517,7 @@ final class ReceiverStore: ObservableObject {
                 appendReconstructionLog(
                     preview.alignmentAccepted ? .success : .warning,
                     preview.alignmentAccepted
-                        ? "Preview alignment accepted."
+                        ? "Preview alignment passes the 10 mm screening limit; inspect placement."
                         : "Preview created, but automatic ARKit-world alignment was not accepted.")
                 return
             }
@@ -441,7 +556,7 @@ final class ReceiverStore: ObservableObject {
             appendReconstructionLog(
                 updated.alignmentAccepted ? .success : .warning,
                 updated.alignmentAccepted
-                    ? "Reconstruction saved and automatic alignment accepted."
+                    ? "Reconstruction saved; automatic alignment passes the 10 mm screening limit. Inspect placement."
                     : "Reconstruction saved, but automatic ARKit-world alignment was not accepted.")
         } catch let error as ReceiverReconstructionError {
             if case .cancelled = error {
@@ -487,9 +602,11 @@ final class ReceiverStore: ObservableObject {
             modelToWorld: transform)
     }
 
+    /// Capture folders open in place. Only legacy archives need a user-selected
+    /// extraction destination; drag access never implies parent write access.
     private nonisolated static func persistAndValidate(
-        _ sourceURL: URL,
-        copyArchive: Bool = true
+        _ sourceURL: URL, conversionParent: URL?,
+        progress: @escaping @Sendable (MANTACaptureReadProgress) -> Void
     ) throws -> (bundle: MANTAValidatedBundle, archiveURL: URL) {
         let fileManager = FileManager.default
         var isDirectory: ObjCBool = false
@@ -497,83 +614,61 @@ final class ReceiverStore: ObservableObject {
             throw ReceiverImportError.unsupportedExtension
         }
 
-        let isRawSessionDirectory = isDirectory.boolValue
-            && fileManager.fileExists(atPath: sourceURL.appendingPathComponent("session.json").path)
-            && !fileManager.fileExists(
-                atPath: sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename).path)
         if isDirectory.boolValue {
             if ReceiverProcessedPackage.isPackage(sourceURL) {
-                return (try ReceiverProcessedPackage.load(at: sourceURL), sourceURL)
+                if fileManager.fileExists(atPath: sourceURL.appendingPathComponent("session.json").path),
+                   !fileManager.fileExists(atPath: sourceURL.appendingPathComponent("manifest.json").path) {
+                    _ = try MANTARawSessionRecovery().openDirectoryInPlace(sourceURL, producer: recoveryProducer(),
+                        verifyExistingIntegrity: false, progress: progress)
+                }
+                return (try ReceiverProcessedPackage.load(at: sourceURL, verifyIntegrity: true, progress: progress), sourceURL)
             }
             let manifestURL = sourceURL.appendingPathComponent(MANTABundleFormat.manifestFilename)
-            if !fileManager.fileExists(atPath: manifestURL.path) && !isRawSessionDirectory {
+            let isRawSessionDirectory = fileManager.fileExists(
+                atPath: sourceURL.appendingPathComponent("session.json").path)
+                && !fileManager.fileExists(atPath: manifestURL.path)
+            if isRawSessionDirectory {
+                let bundle = try MANTARawSessionRecovery().openDirectoryInPlace(sourceURL, producer: recoveryProducer(), progress: progress)
+                return (bundle, sourceURL)
+            }
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
                 throw ReceiverImportError.notALogicalBundle
             }
-        } else {
-            guard sourceURL.pathExtension.lowercased() == "manta" ||
-                    sourceURL.lastPathComponent.lowercased().hasSuffix(".manta.zip") else {
-                throw ReceiverImportError.unsupportedExtension
-            }
+            let bundle = try MANTABundleValidator().validate(directory: sourceURL, progress: progress)
+            return (bundle, sourceURL)
         }
 
-        let applicationSupport = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let imports = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Imports", isDirectory: true)
-        try fileManager.createDirectory(at: imports, withIntermediateDirectories: true)
-
-        let receipt = imports.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
-        try fileManager.createDirectory(at: receipt, withIntermediateDirectories: false)
-        do {
-            let contents = receipt.appendingPathComponent("Contents", isDirectory: true)
-            if isDirectory.boolValue {
-                if isRawSessionDirectory {
-                    let recovered = try MANTARawSessionRecovery().recoverDirectoryPackage(
-                        from: sourceURL,
-                        to: contents,
-                        producer: recoveryProducer())
-                    return (recovered.bundle, recovered.packageURL)
-                }
-                // Copy the extracted bundle in, then validate the copy in place so
-                // the imported record survives if the source folder is later moved.
-                try fileManager.copyItem(at: sourceURL, to: contents)
-                let bundle = try MANTABundleValidator().validate(directory: contents)
-                return (bundle, contents)
-            }
-            let archive: URL
-            if copyArchive {
-                archive = receipt.appendingPathComponent("capture.manta")
-                try fileManager.copyItem(at: sourceURL, to: archive)
-            } else {
-                archive = sourceURL
-            }
-            let bundle = try MANTAArchiveImporter().importBundle(at: archive, to: contents)
-            return (bundle, archive)
-        } catch {
-            try? fileManager.removeItem(at: receipt)
-            throw error
+        guard sourceURL.pathExtension.lowercased() == "manta" ||
+                sourceURL.lastPathComponent.lowercased().hasSuffix(".manta.zip") else {
+            throw ReceiverImportError.unsupportedExtension
         }
+        guard let conversionParent else { throw ReceiverImportError.destinationRequired }
+        let destination = conversionDestination(for: sourceURL, in: conversionParent, tag: nil)
+        let bundle = try MANTAArchiveImporter().importBundle(at: sourceURL, to: destination, progress: progress)
+        return (bundle, destination)
     }
 
-    private nonisolated static func removeImportedWorkspace(containing root: URL) {
+    private nonisolated static func requiresConversion(_ source: URL) -> Bool {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: source.path, isDirectory: &isDirectory) else { return false }
+        if isDirectory.boolValue { return false }
+        return source.pathExtension.lowercased() == "manta"
+            || source.lastPathComponent.lowercased().hasSuffix(".manta.zip")
+    }
+
+    /// Never overwrite a prior conversion, even when the same source is dropped again.
+    private nonisolated static func conversionDestination(for source: URL, in parent: URL, tag: String?) -> URL {
         let fileManager = FileManager.default
-        guard let applicationSupport = try? fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false) else { return }
-        let imports = applicationSupport
-            .appendingPathComponent("MANTA Receiver", isDirectory: true)
-            .appendingPathComponent("Imports", isDirectory: true)
-            .standardizedFileURL
-        let receipt = root.standardizedFileURL.deletingLastPathComponent()
-        guard receipt.deletingLastPathComponent() == imports else { return }
-        try? fileManager.removeItem(at: receipt)
+        let base = source.deletingPathExtension().lastPathComponent
+        let name = tag.map { "\(base)-\($0)" } ?? base
+        var candidate = parent.appendingPathComponent("\(name).manta", isDirectory: true)
+        var suffix = 2
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = parent.appendingPathComponent("\(name)-\(suffix).manta", isDirectory: true)
+            suffix += 1
+        }
+        return candidate
     }
 
     private nonisolated static func recoveryProducer() -> MANTAProducer {
@@ -590,11 +685,14 @@ final class ReceiverStore: ObservableObject {
 }
 
 private enum ReceiverImportError: LocalizedError {
+    case destinationRequired
     case unsupportedExtension
     case notALogicalBundle
 
     var errorDescription: String? {
         switch self {
+        case .destinationRequired:
+            return "Choose a destination folder for the converted capture."
         case .unsupportedExtension:
             return "Choose a .manta archive, a recovered .manta package, or a MANTA working-session folder."
         case .notALogicalBundle:

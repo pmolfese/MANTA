@@ -32,7 +32,7 @@ nonisolated struct MockElectrodeDetectionPipeline: ElectrodeDetectionPipeline {
                     z: 85.0 - ring * 5.0
                 ),
                 confidence: isCardinal ? 0.92 : 0.74,
-                state: isCardinal ? .reviewed : .detected
+                state: isCardinal ? .reviewed : .detected, provenance: .synthetic
             )
         }
     }

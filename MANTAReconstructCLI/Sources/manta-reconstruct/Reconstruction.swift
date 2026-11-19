@@ -1,0 +1,588 @@
+import Foundation
+import MANTACore
+import MANTAProcessing
+import RealityKit
+import simd
+
+// Photogrammetry reconstruction driver, ported from the MANTA receiver's
+// ReceiverPhotogrammetryReconstruction so it can run from the command line.
+// It depends only on Foundation / RealityKit / simd / MANTACore — no SwiftUI —
+// so the same Object Capture pipeline the app uses is reproduced here.
+
+enum ReconstructionLogLevel: String, Codable, Sendable {
+    case info
+    case warning
+    case error
+    case success
+}
+
+enum PhotogrammetryInputMode: String, CaseIterable, Identifiable, Sendable {
+    case imagesOnly = "images"
+    case depthGuided = "depth"
+
+    var id: String { rawValue }
+    var title: String { self == .depthGuided ? "Depth-guided" : "Images only" }
+    var usesDepth: Bool { self == .depthGuided }
+}
+
+struct ReconstructionSampleDescriptor: Sendable {
+    var sampleID: Int
+    var imageURL: URL
+    var depthURL: URL?
+    var depthWidth: Int
+    var depthHeight: Int
+    var depthCompression: String
+    var cameraToWorld: [Double]
+    var includeGravity: Bool = true
+}
+
+enum PhotogrammetryDetail: String, CaseIterable, Identifiable, Sendable {
+    case medium
+    case full
+    case raw
+
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+
+    var requestDetail: PhotogrammetrySession.Request.Detail {
+        switch self {
+        case .medium: .medium
+        case .full: .full
+        case .raw: .raw
+        }
+    }
+
+    func conservativeWorkingBytes(sourceImageBytes: Int64) -> Int64 {
+        switch self {
+        case .medium: max(2_000_000_000, sourceImageBytes * 2)
+        case .full: max(5_000_000_000, sourceImageBytes * 4)
+        case .raw: max(20_000_000_000, sourceImageBytes * 12)
+        }
+    }
+}
+
+struct ReconstructionEstimate: Sendable {
+    var imageCount: Int
+    var sourceImageBytes: Int64
+    var requiredWorkingBytes: Int64
+    var availableBytes: Int64?
+
+    var hasEnoughSpace: Bool {
+        guard let availableBytes else { return true }
+        return availableBytes >= requiredWorkingBytes
+    }
+}
+
+struct ReconstructionPreparation: Sendable {
+    var workspace: URL
+    var inputDirectory: URL
+    var modelURL: URL
+    var posesURL: URL
+    var diagnosticsURL: URL
+    var detail: PhotogrammetryDetail
+    var imageCount: Int
+    var sourceImageBytes: Int64
+    var inputMode: PhotogrammetryInputMode = .imagesOnly
+    var independentPasses: Bool = false
+    var sampleDescriptors: [ReconstructionSampleDescriptor] = []
+}
+
+struct PhotogrammetryRun: Sendable {
+    var startedAt: Date
+    var completedAt: Date
+    var skippedSampleIDs: [String]
+    var automaticDownsampling: Bool
+}
+
+struct EphemeralReconstruction: Sendable {
+    var modelURL: URL
+    var posesURL: URL
+    var diagnosticsURL: URL
+    var detail: PhotogrammetryDetail
+    var modelToWorld: simd_float4x4?
+    var alignmentRMSMeters: Float?
+    var alignmentAccepted: Bool
+}
+
+struct MacReconstructionDiagnostics: Codable, Sendable {
+    var detail: String
+    var inputMode: String = PhotogrammetryInputMode.imagesOnly.rawValue
+    var depthGuidedSampleCount: Int = 0
+    var inputImageCount: Int
+    var sourceImageBytes: Int64
+    var startedAt: Date
+    var completedAt: Date
+    var elapsedSeconds: Double
+    var skippedSampleIDs: [String]
+    var automaticDownsampling: Bool
+    var modelBytes: Int64
+    var alignmentSourcePoints: Int
+    var alignmentTargetPoints: Int
+    var alignmentRMSMeters: Float?
+    var alignmentScale: Float?
+    var alignmentSymmetricRMSMeters: Float?
+    var alignmentAccepted: Bool
+    var alignmentMethod: String
+    var run: ProcessingRunMetadata? = nil
+}
+
+enum ReconstructionError: LocalizedError {
+    case unsupported
+    case noImages
+    case insufficientStorage(required: Int64, available: Int64)
+    case processing(String)
+    case cancelled
+    case missingOutput
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupported:
+            "Object Capture is not supported on this Mac."
+        case .noImages:
+            "The capture contains no source RGB images for photogrammetry."
+        case .insufficientStorage(let required, let available):
+            "Reconstruction needs approximately \(Self.bytes(required)) free; \(Self.bytes(available)) is available."
+        case .processing(let message):
+            "macOS photogrammetry failed: \(message)"
+        case .cancelled:
+            "Reconstruction was cancelled."
+        case .missingOutput:
+            "Object Capture completed without producing the requested model."
+        }
+    }
+
+    private static func bytes(_ value: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+}
+
+final class PhotogrammetryRunner {
+    private var session: PhotogrammetrySession?
+
+    var isSupported: Bool { PhotogrammetrySession.isSupported }
+
+    func cancel() {
+        session?.cancel()
+    }
+
+    func reconstruct(
+        preparation: ReconstructionPreparation,
+        progress: @escaping (Double, String) -> Void,
+        log: @escaping (ReconstructionLogLevel, String) -> Void
+    ) async throws -> PhotogrammetryRun {
+        guard PhotogrammetrySession.isSupported else {
+            throw ReconstructionError.unsupported
+        }
+        var configuration = PhotogrammetrySession.Configuration()
+        configuration.sampleOrdering = preparation.inputMode.usesDepth && !preparation.independentPasses ? .sequential : .unordered
+        configuration.isObjectMaskingEnabled = !preparation.inputMode.usesDepth || preparation.independentPasses
+        if !preparation.inputMode.usesDepth {
+            log(.info, "Foreground-masked RGB solve: camera poses are estimated from images across all saved passes. AR poses and depth are not supplied.")
+        }
+        if preparation.inputMode.usesDepth && preparation.independentPasses {
+            log(.info, "Masked depth-guided solve across passes: per-frame depth assists scale; AR poses and gravity are omitted. Inspect geometry and alignment before metric use.")
+        }
+        configuration.featureSensitivity = .high
+        let active: PhotogrammetrySession
+        if preparation.inputMode.usesDepth, !preparation.sampleDescriptors.isEmpty {
+            let withDepth = preparation.sampleDescriptors.count(where: { $0.depthURL != nil })
+            active = try PhotogrammetrySession(
+                input: PhotogrammetrySampleSequence(
+                    descriptors: preparation.sampleDescriptors),
+                configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.sampleDescriptors.count) depth-guided samples (\(withDepth) carrying LiDAR depth) at \(preparation.detail.title) detail.")
+        } else {
+            // Explicit sample IDs keep estimated calibration paired with the
+            // original observations in images-only and depth-guided modes.
+            let records = try JSONDecoder().decode(
+                [ReconstructionCameraRecord].self,
+                from: Data(contentsOf: preparation.posesURL))
+            active = try PhotogrammetrySession(
+                input: ObjectCaptureImages(directory: preparation.inputDirectory, records: records),
+                configuration: configuration)
+            log(.info, "Object Capture started with \(preparation.imageCount) input images at \(preparation.detail.title) detail.")
+        }
+        session = active
+        defer { session = nil }
+
+        let request = PhotogrammetrySession.Request.modelFile(
+            url: preparation.modelURL,
+            detail: preparation.detail.requestDetail)
+        let startedAt = Date()
+        var skipped = [String]()
+        var rejected = [Int: String]()
+        var estimatedPoses: PhotogrammetrySession.Poses?
+        var posesError: String?
+        var automaticDownsampling = false
+        var currentProgress = 0.0
+        progress(0, "Starting Object Capture")
+        try active.process(requests: [request, .poses])
+
+        do {
+            for try await output in active.outputs {
+                if Task.isCancelled {
+                    active.cancel()
+                    throw ReconstructionError.cancelled
+                }
+                switch output {
+                case .requestProgress(_, let fraction):
+                    currentProgress = fraction
+                    progress(fraction, "Reconstructing \(preparation.detail.title) model")
+                case .requestComplete(_, let result):
+                    if case .poses(let poses) = result { estimatedPoses = poses }
+                case .invalidSample(let id, let reason):
+                    rejected[id] = reason
+                    log(.warning, "Invalid sample \(id): \(reason)")
+                case .skippedSample(let id):
+                    rejected[id] = "Skipped by Object Capture"
+                    let sample = String(describing: id)
+                    skipped.append(sample)
+                    log(.warning, "Object Capture skipped input sample \(sample).")
+                case .automaticDownsampling:
+                    automaticDownsampling = true
+                    log(.warning, "Object Capture enabled automatic image downsampling.")
+                case .requestError(let failedRequest, let error):
+                    if case .poses = failedRequest {
+                        posesError = error.localizedDescription
+                        log(.warning, "Estimated calibration unavailable: \(error.localizedDescription)")
+                        continue
+                    }
+                    log(.error, "Object Capture request failed: \(error.localizedDescription)")
+                    throw ReconstructionError.processing(error.localizedDescription)
+                case .processingCancelled:
+                    log(.warning, "Object Capture reported cancellation at \(Int(currentProgress * 100))%.")
+                    throw ReconstructionError.cancelled
+                case .processingComplete:
+                    try ObjectCaptureCalibration.write(poses: estimatedPoses, to: preparation.posesURL,
+                                                       rejected: rejected, requestError: posesError)
+                    guard FileManager.default.fileExists(atPath: preparation.modelURL.path) else {
+                        log(.error, "Object Capture completed but did not produce a model file.")
+                        throw ReconstructionError.missingOutput
+                    }
+                    log(.success, "Object Capture model generation completed.")
+                    return PhotogrammetryRun(
+                        startedAt: startedAt,
+                        completedAt: Date(),
+                        skippedSampleIDs: skipped,
+                        automaticDownsampling: automaticDownsampling)
+                default:
+                    continue
+                }
+            }
+        } catch is CancellationError {
+            throw ReconstructionError.cancelled
+        }
+        throw ReconstructionError.missingOutput
+    }
+}
+
+enum ReconstructionWorkflow {
+    private typealias PoseRecord = ReconstructionCameraRecord
+
+    static func estimate(
+        bundle: MANTAValidatedBundle,
+        detail: PhotogrammetryDetail
+    ) -> ReconstructionEstimate {
+        let sources = imageSources(bundle: bundle)
+        let bytes = sources.reduce(Int64(0)) { partial, item in
+            partial + Int64((try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        let available = try? bundle.rootDirectory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage
+        return ReconstructionEstimate(
+            imageCount: sources.count,
+            sourceImageBytes: bytes,
+            requiredWorkingBytes: detail.conservativeWorkingBytes(sourceImageBytes: bytes),
+            availableBytes: available ?? nil)
+    }
+
+    static func prepare(
+        bundle: MANTAValidatedBundle,
+        detail: PhotogrammetryDetail,
+        inputMode: PhotogrammetryInputMode = .imagesOnly
+    ) throws -> ReconstructionPreparation {
+        let independentPasses = CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality))
+        try CaptureMotionPolicy.requireObjectCaptureCompatible(bundle.capture.observations.map(\.quality),
+            maskedIndependentSamples: !inputMode.usesDepth || independentPasses)
+        let estimate = estimate(bundle: bundle, detail: detail)
+        guard estimate.imageCount > 0 else { throw ReconstructionError.noImages }
+        if let available = estimate.availableBytes, !estimate.hasEnoughSpace {
+            throw ReconstructionError.insufficientStorage(
+                required: estimate.requiredWorkingBytes, available: available)
+        }
+
+        let fileManager = FileManager.default
+        let support = try fileManager.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let workspace = support
+            .appendingPathComponent("MANTA Reconstruct CLI", isDirectory: true)
+            .appendingPathComponent("Reconstruction Workspaces", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+        let input = workspace.appendingPathComponent("Input", isDirectory: true)
+        try fileManager.createDirectory(at: input, withIntermediateDirectories: true)
+
+        var poses = [PoseRecord]()
+        var sampleDescriptors = [ReconstructionSampleDescriptor]()
+        do {
+            for (index, item) in imageSources(bundle: bundle).enumerated() {
+                let extensionName = item.url.pathExtension.lowercased()
+                let filename = "\(item.observation.id.uuidString.lowercased()).\(extensionName)"
+                let destination = input.appendingPathComponent(filename)
+                do {
+                    try fileManager.linkItem(at: item.url, to: destination)
+                } catch {
+                    try fileManager.copyItem(at: item.url, to: destination)
+                }
+                poses.append(PoseRecord(
+                    sampleID: index, imageFilename: filename,
+                    observationID: item.observation.id,
+                    cameraToWorld: item.observation.cameraToWorld,
+                    intrinsics: item.observation.intrinsics,
+                    imageOrientation: item.observation.imageOrientation))
+
+                guard inputMode.usesDepth else { continue }
+                // Link the frame's depth alongside its image so the runner is
+                // self-contained. A frame missing usable depth still yields an
+                // RGB+gravity sample, so record it with a nil depth URL.
+                var depthURL: URL?
+                var depthWidth = 0
+                var depthHeight = 0
+                var depthCompression = "none"
+                if let depth = item.observation.depth,
+                   depth.scalarType.lowercased() == "float32",
+                   depth.units == .meters,
+                   depth.byteOrder.lowercased() == "little-endian",
+                   depth.layout.lowercased().replacingOccurrences(of: "-", with: "")
+                       .hasPrefix("rowmajor"),
+                   depth.imageMapping.lowercased() == "resolution-scale" {
+                    let source = bundle.rootDirectory.appendingPathComponent(depth.path)
+                    if fileManager.fileExists(atPath: source.path) {
+                        let depthFilename = "\(item.observation.id.uuidString.lowercased()).depth"
+                        let depthDestination = input.appendingPathComponent(depthFilename)
+                        do {
+                            try fileManager.linkItem(at: source, to: depthDestination)
+                        } catch {
+                            try? fileManager.copyItem(at: source, to: depthDestination)
+                        }
+                        if fileManager.fileExists(atPath: depthDestination.path) {
+                            depthURL = depthDestination
+                            depthWidth = depth.dimensions.width
+                            depthHeight = depth.dimensions.height
+                            depthCompression = depth.compression
+                        }
+                    }
+                }
+                sampleDescriptors.append(ReconstructionSampleDescriptor(
+                    sampleID: index,
+                    imageURL: destination,
+                    depthURL: depthURL,
+                    depthWidth: depthWidth,
+                    depthHeight: depthHeight,
+                    depthCompression: depthCompression,
+                    cameraToWorld: item.observation.cameraToWorld,
+                    includeGravity: !independentPasses))
+            }
+            let posesURL = workspace.appendingPathComponent("macos-poses.json")
+            let encoder = MANTAJSON.makeEncoder()
+            try encoder.encode(poses).write(to: posesURL, options: .atomic)
+            // A depth-guided run with no frame carrying usable depth would be
+            // identical to images-only but mislabeled; fall back explicitly.
+            let resolvedMode: PhotogrammetryInputMode =
+                inputMode.usesDepth && sampleDescriptors.contains { $0.depthURL != nil }
+                    ? .depthGuided : .imagesOnly
+            let stem = "macos_\(detail.rawValue)"
+                + (resolvedMode.usesDepth ? "_depthguided" : "")
+            return ReconstructionPreparation(
+                workspace: workspace,
+                inputDirectory: input,
+                modelURL: workspace.appendingPathComponent("\(stem).usdz"),
+                posesURL: posesURL,
+                diagnosticsURL: workspace.appendingPathComponent("\(stem)_diagnostics.json"),
+                detail: detail,
+                imageCount: poses.count,
+                sourceImageBytes: estimate.sourceImageBytes,
+                inputMode: resolvedMode,
+                independentPasses: independentPasses,
+                sampleDescriptors: resolvedMode.usesDepth ? sampleDescriptors : [])
+        } catch {
+            try? fileManager.removeItem(at: workspace)
+            throw error
+        }
+    }
+
+    static func makePreview(
+        bundle: MANTAValidatedBundle,
+        preparation: ReconstructionPreparation,
+        run: PhotogrammetryRun,
+        progress: ((Double, String) -> Void)? = nil,
+        log: ((ReconstructionLogLevel, String) -> Void)? = nil
+    ) throws -> EphemeralReconstruction {
+        progress?(0.01, "Loading reconstruction geometry")
+        let source = ModelPointCloudLoader.load(url: preparation.modelURL, maxPoints: 8_000)
+        let target = alignmentTarget(bundle: bundle, maxPoints: 8_000)
+        log?(.info, "Loaded \(source.count) photogrammetry alignment points.")
+        log?(.info, "Loaded \(target.count) LiDAR/fused-depth alignment target points.")
+        var alignment: WorldAlignmentResult?
+        if source.count >= 100, target.count >= 100 {
+            var input = WorldAlignmentInput()
+            input.seed = .coarsePCA
+            input.sourceCloud = source
+            input.targetCloud = target
+            input.icpMaxIterations = 40
+            alignment = WorldAlignmentSolver.solve(strategy: .icp, input: input)
+        } else {
+            if source.count < 100 {
+                log?(.warning, "Photogrammetry model supplied only \(source.count) usable points; at least 100 are required for automatic alignment.")
+            }
+            if target.count < 100 {
+                log?(.warning, "Only \(target.count) usable LiDAR/fused-depth points were found; at least 100 are required for automatic alignment.")
+            }
+        }
+        let alignmentScale = alignment.map { uniformScale($0.transform) }
+        let symmetricRMS = alignment.map {
+            bidirectionalRMS(
+                transform: $0.transform, source: source, target: target,
+                maximumPointsPerDirection: 800)
+        }
+        // A one-way source-to-target RMS rewards degenerate scale collapse: a
+        // tiny model near the target centroid can be close to some target points
+        // while explaining almost none of the target surface. Require both
+        // directions to agree before declaring an automatic alignment usable.
+        let alignmentAccepted = symmetricRMS?.isFinite == true
+            && (symmetricRMS ?? .greatestFiniteMagnitude) <= 0.05
+        if let symmetricRMS, symmetricRMS.isFinite {
+            log?(
+                alignmentAccepted ? .success : .warning,
+                String(
+                    format: "Automatic alignment symmetric RMS: %.1f mm%@.",
+                    symmetricRMS * 1_000,
+                    alignmentAccepted ? " (accepted)" : " (not accepted)"))
+        } else {
+            log?(.warning, "Automatic alignment did not produce a finite RMS value.")
+        }
+
+        let modelBytes = Int64((try? preparation.modelURL.resourceValues(
+            forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        let diagnostics = MacReconstructionDiagnostics(
+            detail: preparation.detail.rawValue,
+            inputMode: preparation.inputMode.rawValue,
+            depthGuidedSampleCount: preparation.sampleDescriptors.count(where: { $0.depthURL != nil }),
+            inputImageCount: preparation.imageCount,
+            sourceImageBytes: preparation.sourceImageBytes,
+            startedAt: run.startedAt,
+            completedAt: run.completedAt,
+            elapsedSeconds: run.completedAt.timeIntervalSince(run.startedAt),
+            skippedSampleIDs: run.skippedSampleIDs,
+            automaticDownsampling: run.automaticDownsampling,
+            modelBytes: modelBytes,
+            alignmentSourcePoints: source.count,
+            alignmentTargetPoints: target.count,
+            alignmentRMSMeters: symmetricRMS?.isFinite == true ? symmetricRMS : nil,
+            alignmentScale: alignmentScale,
+            alignmentSymmetricRMSMeters: symmetricRMS?.isFinite == true ? symmetricRMS : nil,
+            alignmentAccepted: alignmentAccepted,
+            alignmentMethod: "scale-locked-coarse-pca-seeded-symmetric-icp",
+            run: ProcessingRunMetadata(
+                sourceBundleID: bundle.manifest.bundleID, files: bundle.manifest.files))
+        try MANTAJSON.makeEncoder().encode(diagnostics).write(
+            to: preparation.diagnosticsURL, options: .atomic)
+        log?(.info, "Wrote reconstruction diagnostics.")
+        return EphemeralReconstruction(
+            modelURL: preparation.modelURL,
+            posesURL: preparation.posesURL,
+            diagnosticsURL: preparation.diagnosticsURL,
+            detail: preparation.detail,
+            modelToWorld: alignmentAccepted ? alignment?.transform : nil,
+            alignmentRMSMeters: diagnostics.alignmentRMSMeters,
+            alignmentAccepted: alignmentAccepted)
+    }
+
+    static func removeWorkspace(_ preparation: ReconstructionPreparation) {
+        try? FileManager.default.removeItem(at: preparation.workspace)
+    }
+
+    private static func imageSources(
+        bundle: MANTAValidatedBundle
+    ) -> [(observation: MANTACaptureObservation, url: URL)] {
+        bundle.capture.observations.compactMap { observation in
+            guard let path = observation.losslessImagePath ?? observation.imagePath else { return nil }
+            let url = bundle.rootDirectory.appendingPathComponent(path)
+            guard FileManager.default.fileExists(atPath: url.path),
+                  ["png", "heic", "jpg", "jpeg"].contains(url.pathExtension.lowercased()) else {
+                return nil
+            }
+            return (observation, url)
+        }
+    }
+
+    private static func alignmentTarget(
+        bundle: MANTAValidatedBundle, maxPoints: Int
+    ) -> [SIMD3<Float>] {
+        // A multi-pass RGB model has no shared AR world until reviewed alignment.
+        guard !CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality)) else { return [] }
+        guard let reconstruction = bundle.capture.reconstruction,
+              let path = reconstruction.headCroppedLidarMeshPath
+                ?? reconstruction.lidarMeshPath else { return [] }
+        var points = ModelPointCloudLoader.load(
+            url: bundle.rootDirectory.appendingPathComponent(path), maxPoints: maxPoints)
+        if reconstruction.headCroppedLidarMeshPath == nil,
+           let bounds = reconstruction.headBoundingBox {
+            let center = SIMD3<Float>(
+                Float(bounds.center.x), Float(bounds.center.y), Float(bounds.center.z))
+            let half = SIMD3<Float>(
+                Float(bounds.widthMeters / 2), Float(bounds.heightMeters / 2),
+                Float(bounds.depthMeters / 2))
+            points = points.filter {
+                let delta = abs($0 - center)
+                return delta.x <= half.x && delta.y <= half.y && delta.z <= half.z
+            }
+        }
+        return points
+    }
+
+    private static func uniformScale(_ transform: simd_float4x4) -> Float {
+        let axes = [transform.columns.0, transform.columns.1, transform.columns.2]
+        return axes.reduce(Float.zero) { partial, column in
+            partial + simd_length(SIMD3(column.x, column.y, column.z))
+        } / 3
+    }
+
+    private static func bidirectionalRMS(
+        transform: simd_float4x4,
+        source: [SIMD3<Float>],
+        target: [SIMD3<Float>],
+        maximumPointsPerDirection: Int
+    ) -> Float {
+        let moved = sampled(source, maximum: maximumPointsPerDirection).map { point -> SIMD3<Float> in
+            let value = transform * SIMD4<Float>(point, 1)
+            return SIMD3(value.x, value.y, value.z)
+        }
+        let sampledTarget = sampled(target, maximum: maximumPointsPerDirection)
+        guard !moved.isEmpty, !sampledTarget.isEmpty else { return .nan }
+        let forward = nearestNeighborRMS(source: moved, target: sampledTarget)
+        let reverse = nearestNeighborRMS(source: sampledTarget, target: moved)
+        return max(forward, reverse)
+    }
+
+    private static func sampled(
+        _ points: [SIMD3<Float>], maximum: Int
+    ) -> [SIMD3<Float>] {
+        guard points.count > maximum else { return points }
+        let step = Double(points.count) / Double(maximum)
+        return (0..<maximum).map { points[min(points.count - 1, Int(Double($0) * step))] }
+    }
+
+    private static func nearestNeighborRMS(
+        source: [SIMD3<Float>], target: [SIMD3<Float>]
+    ) -> Float {
+        let sum = source.reduce(Float.zero) { partial, point in
+            let nearest = target.reduce(Float.greatestFiniteMagnitude) {
+                min($0, simd_length_squared($1 - point))
+            }
+            return partial + nearest
+        }
+        return (sum / Float(source.count)).squareRoot()
+    }
+}

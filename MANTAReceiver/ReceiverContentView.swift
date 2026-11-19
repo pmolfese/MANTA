@@ -5,12 +5,19 @@ import UniformTypeIdentifiers
 
 struct ReceiverContentView: View {
     @StateObject private var store = ReceiverStore()
+    @StateObject private var display = ReceiverDisplaySettings()
     @State private var showsImporter = false
+    @State private var showsComparison = false
     @State private var isDropTargeted = false
 
     var body: some View {
         NavigationSplitView {
             List {
+                Section("Validation") {
+                    Button("Compare GeoScan…", systemImage: "chart.xyaxis.line") {
+                        showsComparison = true
+                    }
+                }
                 Section("Transfer") {
                     Button("Import MANTA Capture…", systemImage: "square.and.arrow.down") {
                         showsImporter = true
@@ -22,9 +29,22 @@ struct ReceiverContentView: View {
 
                 if let bundle = store.bundle {
                     Section("Imported Capture") {
-                        Label("Validated", systemImage: "checkmark.seal.fill")
-                            .foregroundStyle(.green)
+                        Label("Imported", systemImage: "checkmark.circle")
+                        if !store.importIntegrityWarnings.isEmpty {
+                            DisclosureGroup("Import integrity: \(store.importIntegrityWarnings.count) warnings") {
+                                Text("Import succeeded. These warnings do not block processing or export.")
+                                    .font(.caption)
+                                ForEach(Array(store.importIntegrityWarnings.enumerated()), id: \.offset) { _, warning in
+                                    Text(warning.message).font(.caption).textSelection(.enabled)
+                                }
+                            }
+                            .foregroundStyle(.orange)
+                        }
                         LabeledContent("Observations", value: "\(bundle.capture.observations.count)")
+                        if CaptureMotionPolicy.needsIndependentImageSolve(bundle.capture.observations.map(\.quality)) {
+                            Text("Multiple passes or movement recorded. Both reconstruction modes use foreground masking and estimate new camera poses. Depth-guided uses each frame’s depth without gravity constraints. Inspect and align the result; direct depth fusion still requires registration.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         LabeledContent("Files", value: "\(bundle.manifest.files.count)")
                         LabeledContent(
                             "LiDAR",
@@ -33,8 +53,8 @@ struct ReceiverContentView: View {
                             "Head crop",
                             value: bundle.capture.reconstruction?.headCroppedLidarMeshPath == nil ? "None" : "Available")
                         LabeledContent(
-                            "Photogrammetry",
-                            value: bundle.capture.reconstruction?.objectCaptureModelPath == nil ? "None" : "Available")
+                            "Photo model",
+                            value: bundle.capture.reconstruction?.objectCaptureModelPath == nil ? "Not built" : "Available")
                         LabeledContent(
                             "RGB-D frames",
                             value: "\(bundle.capture.observations.filter { $0.depth != nil }.count)")
@@ -47,10 +67,35 @@ struct ReceiverContentView: View {
                         if bundle.capture.reconstruction?.objectCaptureModelPath != nil {
                             LabeledContent(
                                 "3D alignment",
-                                value: bundle.capture.reconstruction?.modelToWorld == nil
-                                    ? "Not declared" : "ARKit world")
+                                value: ReceiverAlignmentPolicy.assessment(for: bundle).message)
                         }
                     }
+                }
+
+                if let bundle = store.bundle {
+                    Section {
+                        ReceiverDisplayControls(display: display)
+                    } header: {
+                        Text("Display")
+                    }
+
+                    Section {
+                        if display.isViewingArchivedPass {
+                            Text("Viewing an archived LiDAR pass. Its saved bounds and surface are preserved; switch to the current capture to edit.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            ReceiverHeadBoundingBoxControls(store: store, display: display)
+                        }
+                    } header: {
+                        HStack(spacing: 4) {
+                            Text("Head Bounding Box")
+                            ReceiverInfoButton(text: ReceiverGlossary.headBoundingBox)
+                        }
+                    }
+
+                    ReconstructionSidebarSection(store: store, bundle: bundle)
+
+                    MetadataSidebarSection(bundle: bundle, archiveURL: store.importedArchiveURL)
                 }
 
                 if store.isReconstructing {
@@ -70,12 +115,13 @@ struct ReceiverContentView: View {
                     }
                 }
             }
+            .disabled(store.isImporting || store.isCorrectingMotion)
             .navigationTitle("MANTA Receiver")
         } detail: {
             if store.isImporting {
-                ProgressView("Copying and validating capture…")
+                ReceiverOpeningProgressView(store: store)
             } else if let bundle = store.bundle {
-                BundleInspector(store: store, bundle: bundle, archiveURL: store.importedArchiveURL)
+                BundleInspector(store: store, display: display, bundle: bundle)
             } else {
                 ContentUnavailableView(
                     "Import a Capture",
@@ -83,6 +129,16 @@ struct ReceiverContentView: View {
                     description: Text("Drop a RAW .manta archive, recovered .manta package, PROCESSED package, or iPad session folder here.")
                 )
             }
+        }
+        .sheet(isPresented: $showsComparison) {
+            VStack {
+                HStack {
+                    Text("GeoScan Comparison").font(.headline)
+                    Spacer()
+                    Button("Done") { showsComparison = false }
+                }.padding()
+                ReceiverComparisonView(bundle: store.bundle)
+            }.frame(minWidth: 850, minHeight: 650)
         }
         .dropDestination(for: URL.self) { urls, _ in
             handleDrop(urls)
@@ -150,32 +206,68 @@ struct ReceiverContentView: View {
     }
 }
 
+private struct ReceiverOpeningProgressView: View {
+    @ObservedObject var store: ReceiverStore
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Opening capture").font(.title2.weight(.semibold))
+            Text(store.importingName).font(.headline).textSelection(.enabled)
+            if let fraction = store.importProgress {
+                ProgressView(value: fraction)
+                Text("\(Int((fraction * 100).rounded()))% of this stage")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text(store.importStage)
+            if let detail = store.importDetail {
+                Text(detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .lineLimit(3).textSelection(.enabled)
+            }
+            if let started = store.importStartedAt {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text("\(max(0, Int(context.date.timeIntervalSince(started)))) seconds elapsed")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+            Text("Folders are opened in place. Original images, depth, and meshes stay where they are; Receiver results are stored under derivatives/.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(28)
+        .frame(maxWidth: 560)
+    }
+}
+
 private struct BundleInspector: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
-    let archiveURL: URL?
 
     var body: some View {
         TabView {
-            CaptureVisualizationView(store: store, bundle: bundle)
+            CaptureVisualizationView(store: store, display: display, bundle: bundle)
                 .tabItem { Label("Viewer", systemImage: "viewfinder") }
-            ReceiverReconstructionView(store: store, bundle: bundle)
-                .tabItem { Label("Reconstruct", systemImage: "camera.metering.matrix") }
             ReceiverAlignmentWorkspace(
                 store: store,
+                display: display,
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .id(alignmentWorkspaceID)
                 .tabItem { Label("Align", systemImage: "point.3.connected.trianglepath.dotted") }
-            ReceiverElectrodeWorkspace(store: store, bundle: bundle)
+            ReceiverMotionCorrectionWorkspace(store: store, bundle: bundle)
+                .id(bundle.manifest.bundleID)
+                .tabItem { Label("Motion Correction", systemImage: "arrow.triangle.2.circlepath") }
+            ReceiverElectrodeWorkspace(store: store, display: display, bundle: bundle)
                 .tabItem { Label("EEG Sensors", systemImage: "dot.scope") }
+            ReceiverComparisonView(bundle: bundle)
+                .id(bundle.manifest.bundleID)
+                .tabItem { Label("Compare", systemImage: "chart.xyaxis.line") }
             ReceiverExportView(
                 bundle: bundle,
                 ephemeralReconstruction: store.ephemeralReconstruction)
                 .tabItem { Label("Export", systemImage: "square.and.arrow.up") }
-            metadata
-                .tabItem { Label("Metadata", systemImage: "list.bullet.rectangle") }
         }
+        .disabled(store.isCorrectingMotion)
         .navigationTitle("Capture Inspector")
     }
 
@@ -190,61 +282,6 @@ private struct BundleInspector: View {
         return "\(bundle.manifest.bundleID.uuidString)|\(modelIdentity)"
     }
 
-    private var metadata: some View {
-        Form {
-            Section("Identity") {
-                LabeledContent(
-                    "Package",
-                    value: bundle.manifest.parentBundleID == nil ? "RAW" : "PROCESSED")
-                LabeledContent("Bundle ID", value: bundle.manifest.bundleID.uuidString.lowercased())
-                LabeledContent("Session ID", value: bundle.manifest.sessionID.uuidString.lowercased())
-                LabeledContent("Schema", value: bundle.manifest.schemaVersion)
-                LabeledContent("Finalized", value: bundle.manifest.finalizedAt.formatted())
-                if let parent = bundle.manifest.parentBundleID {
-                    LabeledContent("Parent bundle", value: parent.uuidString.lowercased())
-                }
-            }
-
-            Section("Capture") {
-                LabeledContent("Mode", value: bundle.capture.captureMode)
-                LabeledContent("Layout", value: bundle.capture.layoutID)
-                LabeledContent("Observations", value: "\(bundle.capture.observations.count)")
-                LabeledContent("Electrodes", value: "\(bundle.capture.electrodes?.count ?? 0)")
-                LabeledContent("Fiducials", value: "\(bundle.capture.fiducials?.count ?? 0)")
-            }
-
-            Section("Producer") {
-                LabeledContent("Application", value: bundle.manifest.producer.application)
-                LabeledContent("Version", value: "\(bundle.manifest.producer.version) (\(bundle.manifest.producer.build))")
-                LabeledContent("Platform", value: bundle.manifest.producer.platform)
-                LabeledContent("Device", value: bundle.manifest.producer.deviceModel)
-                LabeledContent("Operating system", value: bundle.manifest.producer.operatingSystemVersion)
-            }
-
-            Section("Files") {
-                ForEach(bundle.manifest.files, id: \.path) { file in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(file.path).font(.system(.body, design: .monospaced))
-                            Text(file.role).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            if let archiveURL {
-                Section("Stored Copy") {
-                    Text(archiveURL.path)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
-        }
-        .formStyle(.grouped)
-    }
 }
 
 private struct ReceiverReconstructionView: View {
@@ -252,13 +289,22 @@ private struct ReceiverReconstructionView: View {
     let bundle: MANTAValidatedBundle
     @State private var detail: ReceiverPhotogrammetryDetail = .full
     @State private var outputMode = ReceiverReconstructionOutputMode.derivedBundle
+    @State private var inputMode = ReceiverPhotogrammetryInputMode.imagesOnly
 
     private var estimate: ReceiverReconstructionEstimate? {
         store.reconstructionEstimate(for: detail)
     }
 
+    /// Depth-guided reconstruction is only offered when at least one frame has a
+    /// saved depth map to hand Object Capture.
+    private var hasDepthObservations: Bool {
+        bundle.capture.observations.contains { $0.depth != nil }
+    }
+
     var body: some View {
-        Form {
+        // The sidebar List owns scrolling. A grouped Form here creates a nested
+        // scroll view inside its disclosure row and traps wheel/trackpad input.
+        Group {
             Section("Offline Object Capture") {
                 Picker("Detail", selection: $detail) {
                     ForEach(ReceiverPhotogrammetryDetail.allCases) { option in
@@ -288,9 +334,26 @@ private struct ReceiverReconstructionView: View {
 
                 Text(outputMode == .preview
                      ? "Keeps the USDZ in temporary app storage for interactive inspection. PROCESSED is not changed."
-                     : "Creates a mutable PROCESSED package from RAW, then writes only files changed by later edits.")
+                     : "Saves models and edits under derivatives/receiver in the capture folder.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Picker("Inputs", selection: $inputMode) {
+                    ForEach(ReceiverPhotogrammetryInputMode.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(store.isReconstructing || !hasDepthObservations)
+
+                Text(hasDepthObservations
+                     ? inputMode.explanation
+                     : "This capture has no saved depth frames, so only images-only reconstruction is available.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onChange(of: hasDepthObservations) { _, hasDepth in
+                if !hasDepth { inputMode = .imagesOnly }
             }
 
             Section("Preflight") {
@@ -352,12 +415,13 @@ private struct ReceiverReconstructionView: View {
                             : "Reconstruct \(detail.title) Model",
                         systemImage: "cube.transparent"
                     ) {
-                        store.startReconstruction(detail: detail, outputMode: outputMode)
+                        store.startReconstruction(
+                            detail: detail, outputMode: outputMode, inputMode: inputMode)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canStart)
 
-                    Text("Full is the recommended first pass. RAW is never modified; saved edits update individual files in one PROCESSED package.")
+                    Text("Full is the recommended first pass. Original capture files stay unchanged; models and edits are saved under derivatives/receiver.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -434,12 +498,9 @@ private struct ReceiverReconstructionView: View {
             if let archive = store.processedPackageURL {
                 Section("PROCESSED Package") {
                     Label(
-                        store.reconstructionAlignmentAccepted
-                            ? "Photogrammetry aligned to the ARKit head geometry"
-                            : "Model saved; automatic ARKit-world alignment was not accepted",
-                        systemImage: store.reconstructionAlignmentAccepted
-                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(store.reconstructionAlignmentAccepted ? .green : .orange)
+                        ReceiverAlignmentPolicy.assessment(for: bundle).message,
+                        systemImage: "info.circle")
+                        .foregroundStyle(.orange)
                     if let rms = store.reconstructionAlignmentRMSMeters {
                         LabeledContent(
                             "Alignment RMS",
@@ -456,7 +517,6 @@ private struct ReceiverReconstructionView: View {
                 }
             }
         }
-        .formStyle(.grouped)
     }
 
     private var canStart: Bool {
@@ -498,6 +558,134 @@ private struct ReceiverReconstructionView: View {
     private func elapsed(from start: Date, to end: Date) -> String {
         let seconds = max(0, Int(end.timeIntervalSince(start)))
         return String(format: "%02d:%02d:%02d", seconds / 3_600, (seconds / 60) % 60, seconds % 60)
+    }
+}
+
+/// Reconstruction controls, folded into the sidebar. Collapsed by default once a
+/// reconstruction already exists in the package (or a session preview is loaded).
+private struct ReconstructionSidebarSection: View {
+    @ObservedObject var store: ReceiverStore
+    let bundle: MANTAValidatedBundle
+    @State private var isExpanded: Bool?
+
+    private var hasReconstruction: Bool {
+        bundle.capture.reconstruction?.objectCaptureModelPath != nil
+            || store.ephemeralReconstruction != nil
+    }
+
+    var body: some View {
+        Section {
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { isExpanded ?? !hasReconstruction },
+                    set: { isExpanded = $0 })
+            ) {
+                ReceiverReconstructionView(store: store, bundle: bundle)
+                    .padding(.top, 4)
+            } label: {
+                HStack(spacing: 4) {
+                    Label("Reconstruct", systemImage: "camera.metering.matrix")
+                    ReceiverInfoButton(text: ReceiverGlossary.reconstruct)
+                }
+            }
+        }
+    }
+}
+
+/// Bundle metadata, folded into the sidebar as collapsible groups. Any group with
+/// more than six rows (e.g. the file manifest) starts collapsed.
+private struct MetadataSidebarSection: View {
+    let bundle: MANTAValidatedBundle
+    let archiveURL: URL?
+
+    var body: some View {
+        Section {
+            metadataContent
+        } header: {
+            HStack(spacing: 4) {
+                Text("Metadata")
+                ReceiverInfoButton(text: ReceiverGlossary.metadata)
+            }
+        }
+    }
+
+    @ViewBuilder private var metadataContent: some View {
+            group("Identity", count: bundle.manifest.parentBundleID == nil ? 5 : 6) {
+                row("Package", bundle.manifest.parentBundleID == nil ? "RAW" : "PROCESSED")
+                row("Bundle ID", bundle.manifest.bundleID.uuidString.lowercased())
+                row("Session ID", bundle.manifest.sessionID.uuidString.lowercased())
+                row("Schema", bundle.manifest.schemaVersion)
+                row("Finalized", bundle.manifest.finalizedAt.formatted())
+                if let parent = bundle.manifest.parentBundleID {
+                    row("Parent", parent.uuidString.lowercased())
+                }
+            }
+            group("Capture", count: 5) {
+                row("Mode", bundle.capture.captureMode)
+                row("Layout", bundle.capture.layoutID)
+                row("Observations", "\(bundle.capture.observations.count)")
+                row("Electrodes", "\(bundle.capture.electrodes?.count ?? 0)")
+                row("Fiducials", "\(bundle.capture.fiducials?.count ?? 0)")
+            }
+            group("Producer", count: 5) {
+                row("Application", bundle.manifest.producer.application)
+                row("Version", "\(bundle.manifest.producer.version) (\(bundle.manifest.producer.build))")
+                row("Platform", bundle.manifest.producer.platform)
+                row("Device", bundle.manifest.producer.deviceModel)
+                row("OS", bundle.manifest.producer.operatingSystemVersion)
+            }
+            group("Files", count: bundle.manifest.files.count) {
+                ForEach(bundle.manifest.files, id: \.path) { file in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(file.path).font(.system(.caption, design: .monospaced))
+                        HStack {
+                            Text(file.role).font(.caption2).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            if let archiveURL {
+                group("Capture Folder", count: 1) {
+                    Text(archiveURL.path)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+    }
+
+    /// A collapsible metadata group; collapsed initially when it has >6 rows.
+    private func group(
+        _ title: String, count: Int, @ViewBuilder content: @escaping () -> some View
+    ) -> some View {
+        CollapsibleGroup(title: title, initiallyExpanded: count <= 6, content: content)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        LabeledContent(label) {
+            Text(value).font(.caption).foregroundStyle(.secondary)
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+        }
+        .font(.caption)
+    }
+}
+
+/// DisclosureGroup with its own remembered expand state, seeded once.
+private struct CollapsibleGroup<Content: View>: View {
+    let title: String
+    @State private var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    init(title: String, initiallyExpanded: Bool, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        _isExpanded = State(initialValue: initiallyExpanded)
+        self.content = content
+    }
+
+    var body: some View {
+        DisclosureGroup(title, isExpanded: $isExpanded) { content() }
     }
 }
 

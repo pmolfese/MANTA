@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 import MANTACore
 
-struct CaptureReceipt: Codable, Equatable, Sendable {
+nonisolated struct CaptureReceipt: Codable, Equatable, Sendable {
     enum Status: String, Codable, Sendable { case passed, warning, failed }
 
     struct Check: Codable, Equatable, Sendable {
@@ -26,7 +26,7 @@ struct CaptureReceipt: Codable, Equatable, Sendable {
     var checks: [Check]
 }
 
-enum CaptureReceiptBuilder {
+nonisolated enum CaptureReceiptBuilder {
     static func build(session: ScanSession, sessionDirectory: URL) -> CaptureReceipt {
         var checks = [CaptureReceipt.Check]()
         var imageCount = 0

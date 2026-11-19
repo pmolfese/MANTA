@@ -10,6 +10,7 @@ import MANTACore
 import Testing
 @testable import MANTA
 
+@MainActor
 struct HydroCelLayoutLoaderTests {
     @Test func loadsHydroCel128FromCoordinatesSensorLayoutAndMetadata() throws {
         let layouts = try makeLoader().loadLayouts()

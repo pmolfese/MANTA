@@ -4,6 +4,33 @@ import Testing
 @testable import MANTACore
 
 struct MANTARawSessionRecoveryTests {
+    @Test func opensInPlacePreservesSourcesAndReopensStableIndex() throws {
+        let root = temporaryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var session = ScanSession.newSession(layout: .headMeshOnly)
+        session.createdAt = Date(timeIntervalSince1970: 1_784_035_954.123456)
+        let original = try JSONEncoder().encode(session)
+        try original.write(to: root.appendingPathComponent("session.json"))
+        let producer = MANTAProducer(application: "test", version: "1", build: "1",
+            platform: "test", operatingSystemVersion: "test", deviceModel: "test")
+        var progress: [MANTACaptureReadProgress] = []
+        let first = try MANTARawSessionRecovery().openDirectoryInPlace(root, producer: producer) { progress.append($0) }
+        let second = try MANTARawSessionRecovery().openDirectoryInPlace(root, producer: producer)
+        #expect(first.manifest.bundleID == second.manifest.bundleID)
+        #expect(first.rootDirectory == root.resolvingSymlinksInPath())
+        #expect(second.integrityWarnings.isEmpty)
+        #expect(try Data(contentsOf: root.appendingPathComponent("session.json")) == original)
+        #expect(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)) == ["session.json", "derivatives"])
+        #expect(first.manifest.content.capture == "derivatives/acquisition/capture.json")
+        #expect(progress.contains { $0.fraction == 1 })
+        session.captureMode = .photogrammetry
+        try JSONEncoder().encode(session).write(to: root.appendingPathComponent("session.json"))
+        #expect(throws: MANTABundleValidationError.self) {
+            try MANTARawSessionRecovery().openDirectoryInPlace(root, producer: producer)
+        }
+    }
+
     @Test func recoversWorkingSessionDirectoryAsValidatedRawPackage() throws {
         let root = temporaryURL()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -34,7 +61,19 @@ struct MANTARawSessionRecoveryTests {
                 trackingSummary: "Normal",
                 cameraSnapshotFilename: "assets/camera-one.jpg")
         ]
-        try JSONEncoder().encode(session).write(
+        // Simulate termination after the completed observation checkpoint but
+        // before session.json is refreshed. Mac recovery must retain the frame.
+        let checkpoints = acquisition.appendingPathComponent("observations", isDirectory: true)
+        try FileManager.default.createDirectory(at: checkpoints, withIntermediateDirectories: true)
+        let completed = session.captureObservations[0]
+        let labels = acquisition.appendingPathComponent("live-labels")
+        try FileManager.default.createDirectory(at: labels, withIntermediateDirectories: true)
+        let labelPath = "acquisition/live-labels/\(completed.id.uuidString).json"
+        try Data("{\"sightings\":[]}".utf8).write(to: sessionDirectory.appendingPathComponent(labelPath))
+        try JSONEncoder().encode(completed).write(to: checkpoints.appendingPathComponent("completed.json"))
+        var staleSession = session
+        staleSession.captureObservations = []
+        try JSONEncoder().encode(staleSession).write(
             to: sessionDirectory.appendingPathComponent("session.json"))
 
         let destination = root.appendingPathComponent("recovered.manta", isDirectory: true)
@@ -49,6 +88,9 @@ struct MANTARawSessionRecoveryTests {
         #expect(result.bundle.rootDirectory == destination)
         #expect(result.bundle.capture.sessionID == session.id)
         #expect(result.bundle.capture.observations.count == 1)
+        #expect(result.bundle.manifest.files.contains { $0.path == labelPath && $0.role == "live-label-evidence" })
+        #expect(try JSONDecoder().decode(ScanSession.self, from: Data(
+            contentsOf: sessionDirectory.appendingPathComponent("session.json"))).captureObservations.isEmpty)
         #expect(result.bundle.capture.electrodes == nil)
         #expect(result.bundle.capture.fiducials?.first?.kind == FiducialKind.nasion.rawValue)
         #expect(result.bundle.capture.fiducials?.first?.coordinate == [0, 0.1, -0.2])

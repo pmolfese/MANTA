@@ -5,6 +5,7 @@ import simd
 
 struct ReceiverElectrodeWorkspace: View {
     @ObservedObject var store: ReceiverStore
+    @ObservedObject var display: ReceiverDisplaySettings
     let bundle: MANTAValidatedBundle
 
     @State private var selectedLabel: String? = "E1"
@@ -12,6 +13,7 @@ struct ReceiverElectrodeWorkspace: View {
     @State private var workingElectrodes = [MANTAElectrodeSolution]()
     @State private var evidence: ReceiverElectrodeEvidenceDocument?
     @State private var frameIndex = 0
+    @State private var imageZoom: CGFloat = 1
     @State private var showsAllFrames = false
     @State private var orientedImage: ReceiverOrientedFrameImage?
     @State private var isMovingIn3D = false
@@ -32,6 +34,7 @@ struct ReceiverElectrodeWorkspace: View {
                     .frame(minWidth: 390, idealWidth: 520)
                 CombinedModelViewer(
                     bundle: bundle,
+                    display: display,
                     electrodesOverride: displayedElectrodes,
                     electrodePlacementLabel: isMovingIn3D ? selectedLabel : nil,
                     onWorldElectrodePointPicked: placeFromModel,
@@ -79,10 +82,10 @@ struct ReceiverElectrodeWorkspace: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(
-                !hasAlignedModel || store.isDetectingElectrodes || store.isSavingElectrodes)
+                store.isDetectingElectrodes || store.isSavingElectrodes)
 
             if !hasAlignedModel {
-                Label("Save an alignment first", systemImage: "exclamationmark.triangle")
+                Label("No aligned mesh: retain RGB candidates for later", systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -112,6 +115,10 @@ struct ReceiverElectrodeWorkspace: View {
                     .foregroundStyle(reviewedCount > 0 ? .green : .secondary)
             }
 
+            if let count = evidence?.unlocalizedObservations?.count, count > 0 {
+                Text("\(count) pending 2D")
+                    .help("Saved image candidates/rays without valid depth or a mesh hit. Re-run after alignment to localize them.")
+            }
             Divider().frame(height: 18)
             Text("Guesses ≥ \(guessThreshold.formatted(.percent.precision(.fractionLength(0))))")
                 .font(.caption.monospacedDigit())
@@ -134,7 +141,7 @@ struct ReceiverElectrodeWorkspace: View {
                 Task { await store.saveElectrodes(workingElectrodes, evidence: evidence) }
             }
             .disabled(
-                workingElectrodes.isEmpty || evidence == nil
+                evidence == nil
                     || store.isDetectingElectrodes || store.isUpdatingElectrodeGuesses
                     || store.isSavingElectrodes)
             if store.isSavingElectrodes { ProgressView().controlSize(.small) }
@@ -222,17 +229,19 @@ struct ReceiverElectrodeWorkspace: View {
             }
             .controlSize(.small)
 
-            ReceiverElectrodeImageCanvas(
-                image: orientedImage,
-                observation: currentObservation,
-                evidence: currentFrameEvidence,
-                cupCandidates: currentFrameCupEvidence,
-                selectedLabel: selectedLabel,
-                projectedRawImagePoint: selectedReprojectionDiagnostic?.rawPoint,
-                onPlace: placeFromImage,
-                onRelabel: beginRelabel)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .frame(minHeight: 280)
+            ReceiverZoomableImageArea(zoom: $imageZoom) {
+                ReceiverElectrodeImageCanvas(
+                    image: orientedImage,
+                    observation: currentObservation,
+                    evidence: currentFrameEvidence,
+                    cupCandidates: currentFrameCupEvidence,
+                    selectedLabel: selectedLabel,
+                    projectedRawImagePoint: selectedReprojectionDiagnostic?.rawPoint,
+                    onPlace: placeFromImage,
+                    onRelabel: beginRelabel)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(minHeight: 280)
 
             if !currentFrameCupEvidence.isEmpty {
                 Label(
@@ -348,7 +357,7 @@ struct ReceiverElectrodeWorkspace: View {
 
     private var frameObservations: [MANTACaptureObservation] {
         let all = bundle.capture.observations.filter {
-            $0.depth != nil && imagePath(for: $0) != nil
+            imagePath(for: $0) != nil
         }
         guard !showsAllFrames, let selectedLabel else { return all }
         let ids = Set((evidence?.observations ?? []).filter {
@@ -570,13 +579,14 @@ struct ReceiverElectrodeWorkspace: View {
     ) {
         if let index = workingElectrodes.firstIndex(where: { $0.label == label }) {
             workingElectrodes[index].coordinate = coordinate
+            workingElectrodes[index].provenance = .manualPlacement
             workingElectrodes[index].confidence = 1
             workingElectrodes[index].state = "Reviewed"
         } else {
             workingElectrodes.append(MANTAElectrodeSolution(
                 label: label, role: cardinalLabels.contains(label) ? "Cardinal" : "Regular",
                 coordinateSystem: "arkit-world", coordinate: coordinate,
-                confidence: 1, state: "Reviewed"))
+                confidence: 1, state: "Reviewed", provenance: .manualPlacement))
             workingElectrodes.sort { electrodeNumber($0.label) < electrodeNumber($1.label) }
         }
         guard evidence != nil else {

@@ -27,6 +27,31 @@ enum ReceiverFiducialPlacementError: LocalizedError {
     }
 }
 
+/// Snaps an image click onto the LiDAR head mesh by casting the camera ray for
+/// that pixel and intersecting it with the mesh. Because it uses the click's own
+/// view ray, it lands on the surface the user pointed at rather than the globally
+/// nearest vertex, and it sidesteps the per-frame depth bias entirely - the mesh
+/// is a single consistent metric surface.
+enum ReceiverMeshSnap {
+    static func snap(
+        rawImagePoint: SIMD2<Float>,
+        observation: MANTACaptureObservation,
+        meshVertices: [SIMD3<Float>],
+        meshIndices: [UInt32]
+    ) -> SIMD3<Float>? {
+        guard !meshVertices.isEmpty, meshIndices.count >= 3,
+              let camera = PinholeCamera(
+                intrinsics: observation.intrinsics.map(Float.init),
+                transform: observation.cameraToWorld.map(Float.init)) else { return nil }
+        let column = camera.cameraToWorld.columns.3
+        let origin = SIMD3<Float>(column.x, column.y, column.z)
+        let along = camera.unproject(pixel: rawImagePoint, depth: 1)
+        return MeshRaycaster.firstHit(
+            origin: origin, direction: along - origin,
+            vertices: meshVertices, triangleIndices: meshIndices)
+    }
+}
+
 enum ReceiverImageFiducialResolver {
     static func resolve(
         rawImagePoint: SIMD2<Float>,

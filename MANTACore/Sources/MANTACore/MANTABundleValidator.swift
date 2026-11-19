@@ -2,10 +2,9 @@
 //  MANTABundleValidator.swift
 //  MANTACore
 //
-//  Strict validation of an already-extracted logical .manta bundle directory.
+//  Structural validation with nonblocking integrity warnings for a bundle directory.
 //
 
-import CryptoKit
 import Foundation
 
 public struct MANTAValidatedBundle: Sendable {
@@ -13,17 +12,20 @@ public struct MANTAValidatedBundle: Sendable {
     public let manifest: MANTABundleManifest
     public let capture: MANTACaptureDocument
     public let changeLog: MANTAChangeLogDocument?
+    public let integrityWarnings: [MANTABundleIntegrityWarning]
 
     public init(
         rootDirectory: URL,
         manifest: MANTABundleManifest,
         capture: MANTACaptureDocument,
-        changeLog: MANTAChangeLogDocument?
+        changeLog: MANTAChangeLogDocument?,
+        integrityWarnings: [MANTABundleIntegrityWarning] = []
     ) {
         self.rootDirectory = rootDirectory
         self.manifest = manifest
         self.capture = capture
         self.changeLog = changeLog
+        self.integrityWarnings = integrityWarnings
     }
 }
 
@@ -41,8 +43,6 @@ public enum MANTABundleValidationError: LocalizedError, Equatable, Sendable {
     case nonRegularFile(String)
     case invalidSize(String)
     case sizeMismatch(path: String, expected: Int64, actual: Int64)
-    case invalidHash(String)
-    case hashMismatch(String)
     case inconsistentSessionID
     case invalidLineage(String)
     case invalidCapture(String)
@@ -63,8 +63,6 @@ public enum MANTABundleValidationError: LocalizedError, Equatable, Sendable {
         case .invalidSize(let path): "Bundle entry has an invalid size: \(path)."
         case .sizeMismatch(let path, let expected, let actual):
             "Size mismatch for \(path): expected \(expected), found \(actual)."
-        case .invalidHash(let path): "Bundle entry has an invalid SHA-256 value: \(path)."
-        case .hashMismatch(let path): "SHA-256 mismatch for \(path)."
         case .inconsistentSessionID: "The manifest and capture document session IDs differ."
         case .invalidLineage(let reason): "Bundle lineage is invalid: \(reason)."
         case .invalidCapture(let reason): "Capture metadata is invalid: \(reason)."
@@ -79,21 +77,38 @@ public struct MANTABundleValidator {
         self.fileManager = fileManager
     }
 
-    public func validate(directory rootDirectory: URL) throws -> MANTAValidatedBundle {
-        try validate(directory: rootDirectory, verifyFileHashes: true)
+    public func validate(directory rootDirectory: URL,
+                         progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: true, progress: progress)
     }
 
-    /// Internal fast path for the finalizer, which has just computed every hash
-    /// while building the manifest. External callers always receive full hash
-    /// verification through the public overload above.
-    func validate(
-        directory rootDirectory: URL,
-        verifyFileHashes: Bool
-    ) throws -> MANTAValidatedBundle {
+    /// A working-session index validates referenced acquisition files in their
+    /// original root; native checkpoints and diagnostics may also be present.
+    public func validateWorkingIndex(directory rootDirectory: URL, verifyIntegrity: Bool = true,
+                                    progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: verifyIntegrity,
+            manifestPath: "derivatives/acquisition/manifest.json", progress: progress)
+    }
+
+    public func validateProcessingIndex(directory rootDirectory: URL,
+        verifyIntegrity: Bool = true, progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
+        try validate(directory: rootDirectory, verifyIntegrity: verifyIntegrity,
+            manifestPath: "derivatives/receiver/manifest.json", progress: progress)
+    }
+
+    // Finalization already streams every byte to compute hashes; avoid a second pass.
+    func validate(directory rootDirectory: URL, verifyIntegrity: Bool,
+                  manifestPath: String = MANTABundleFormat.manifestFilename,
+                  progress: ((MANTACaptureReadProgress) -> Void)? = nil) throws -> MANTAValidatedBundle {
         let root = rootDirectory.standardizedFileURL
-        let manifestURL = root.appendingPathComponent(MANTABundleFormat.manifestFilename)
+        progress?(.init(stage: "Reading capture metadata"))
+        let manifestURL = root.appendingPathComponent(manifestPath)
         guard fileManager.fileExists(atPath: manifestURL.path) else {
             throw MANTABundleValidationError.manifestMissing
+        }
+        guard manifestURL.resolvingSymlinksInPath().path.hasPrefix(root.resolvingSymlinksInPath().path + "/"),
+              try manifestURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+            throw MANTABundleValidationError.invalidPath(manifestPath)
         }
 
         let manifest: MANTABundleManifest = try decode(manifestURL, displayPath: MANTABundleFormat.manifestFilename)
@@ -102,10 +117,12 @@ public struct MANTABundleValidator {
             throw MANTABundleValidationError.unsupportedFormat(manifest.format)
         }
 
-        let declaredPaths = try validateFiles(
-            manifest.files, in: root, verifyFileHashes: verifyFileHashes)
+        let declaredPaths = try validateFiles(manifest.files, in: root)
         try validateContentReferences(manifest.content, declaredPaths: declaredPaths)
-        try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
+        progress?(.init(stage: "Checking file references"))
+        if manifestPath == MANTABundleFormat.manifestFilename {
+            try rejectUndeclaredFiles(in: root, declaredPaths: declaredPaths)
+        }
 
         let captureURL = root.appendingPathComponent(manifest.content.capture)
         let capture: MANTACaptureDocument = try decode(captureURL, displayPath: manifest.content.capture)
@@ -121,7 +138,9 @@ public struct MANTABundleValidator {
             rootDirectory: root,
             manifest: manifest,
             capture: capture,
-            changeLog: changeLog
+            changeLog: changeLog,
+            integrityWarnings: verifyIntegrity
+                ? MANTABundleIntegrity.warnings(directory: root, files: manifest.files, progress: progress) : []
         )
     }
 
@@ -149,7 +168,7 @@ public struct MANTABundleValidator {
     }
 
     private func validateFiles(
-        _ entries: [MANTAFileEntry], in root: URL, verifyFileHashes: Bool
+        _ entries: [MANTAFileEntry], in root: URL
     ) throws -> Set<String> {
         var paths = Set<String>()
         for entry in entries {
@@ -160,12 +179,11 @@ public struct MANTABundleValidator {
             guard entry.size >= 0 else {
                 throw MANTABundleValidationError.invalidSize(entry.path)
             }
-            guard entry.sha256.count == 64,
-                  entry.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-                throw MANTABundleValidationError.invalidHash(entry.path)
-            }
 
             let url = root.appendingPathComponent(entry.path)
+            guard url.resolvingSymlinksInPath().path.hasPrefix(root.resolvingSymlinksInPath().path + "/") else {
+                throw MANTABundleValidationError.invalidPath(entry.path)
+            }
             guard fileManager.fileExists(atPath: url.path) else {
                 throw MANTABundleValidationError.missingFile(entry.path)
             }
@@ -173,17 +191,8 @@ public struct MANTABundleValidator {
             guard values.isRegularFile == true, values.isSymbolicLink != true else {
                 throw MANTABundleValidationError.nonRegularFile(entry.path)
             }
-            let actualSize = Int64(values.fileSize ?? -1)
-            guard actualSize == entry.size else {
-                throw MANTABundleValidationError.sizeMismatch(
-                    path: entry.path,
-                    expected: entry.size,
-                    actual: actualSize
-                )
-            }
-            if verifyFileHashes, try sha256(of: url) != entry.sha256 {
-                throw MANTABundleValidationError.hashMismatch(entry.path)
-            }
+            // Size/checksum mismatches are advisory. Keep legacy/edited packages
+            // importable; malformed metadata and unsafe paths still fail above.
         }
         return paths
     }
@@ -244,7 +253,32 @@ public struct MANTABundleValidator {
             throw MANTABundleValidationError.invalidCapture("observation IDs must be unique")
         }
 
+        for pass in capture.capturePasses ?? [] {
+            guard pass.artifactPaths.allSatisfy({ declaredPaths.contains($0) }) else {
+                throw MANTABundleValidationError.invalidCapture("Capture pass references an undeclared artifact")
+            }
+        }
         for observation in capture.observations {
+            if let live = observation.quality?.liveMotionCorrection {
+                guard live.matches(camera: observation.cameraToWorld.map(Float.init)),
+                      live.supportsFrame(timestamp: observation.quality?.arFrameTimestamp ?? .nan),
+                      observation.quality?.motionCorrection == nil,
+                      observation.quality?.motionAssessment?.segmentID == live.referenceSegmentID else {
+                    throw MANTABundleValidationError.invalidCapture("Invalid live motion correction provenance")
+                }
+            }
+            if let correction = observation.quality?.motionCorrection {
+                guard correction.isValid,
+                      let transform = SegmentRegistration.matrix(correction.referenceFromSource),
+                      let original = SegmentRegistration.matrix(correction.originalCameraToWorld.map(Float.init)) else {
+                    throw MANTABundleValidationError.invalidCapture("Invalid segment correction provenance")
+                }
+                let expected = SegmentRegistration.flatten(SegmentRegistration.camera(original, referenceFromSource: transform))
+                guard observation.cameraToWorld.count == 16,
+                      zip(expected, observation.cameraToWorld).allSatisfy({ abs(Double($0) - $1) < 0.0001 }) else {
+                    throw MANTABundleValidationError.invalidCapture("Corrected camera does not match its original pose and segment transform")
+                }
+            }
             guard observation.imageDimensions.width > 0, observation.imageDimensions.height > 0 else {
                 throw MANTABundleValidationError.invalidCapture("image dimensions must be positive")
             }
@@ -361,6 +395,10 @@ public struct MANTABundleValidator {
             if values.isSymbolicLink == true {
                 throw MANTABundleValidationError.nonRegularFile(relative)
             }
+            if relative == "derivatives", values.isRegularFile != true {
+                enumerator.skipDescendants()
+                continue
+            }
             if values.isRegularFile == true, !allowed.contains(relative) {
                 throw MANTABundleValidationError.undeclaredFile(relative)
             }
@@ -376,25 +414,5 @@ public struct MANTABundleValidator {
             return String(path.dropFirst("/private".count))
         }
         return path
-    }
-
-    private func sha256(of url: URL) throws -> String {
-        guard let stream = InputStream(url: url) else {
-            throw MANTABundleValidationError.unreadable(url.lastPathComponent)
-        }
-        stream.open()
-        defer { stream.close() }
-
-        var hasher = SHA256()
-        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            if count < 0 {
-                throw MANTABundleValidationError.unreadable(url.lastPathComponent)
-            }
-            if count == 0 { break }
-            hasher.update(data: Data(buffer[0..<count]))
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
